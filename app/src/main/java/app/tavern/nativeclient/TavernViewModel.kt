@@ -1039,6 +1039,13 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
         persistPreferences(current.prefs.copy(visualNovel = enabled))
     }
 
+    fun setChatAppearance(appearance: ChatAppearance) = work {
+        persistPreferences(current.prefs.copy(chatAppearance = appearance.clamped()))
+    }
+
+    fun tokenCounterFor(connection: ModelConnection?): TextTokenCounter =
+        if (connection == null) estimatedTokens else loreTokenizers.counterFor(connection)
+
     fun setWelcomeAssistant(card: Card?) = work {
         val preferences = current.prefs.welcome
         persistPreferences(current.prefs.copy(welcome = preferences.copy(assistantId = card?.id)))

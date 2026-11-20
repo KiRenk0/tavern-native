@@ -285,6 +285,48 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
         HorizontalDivider()
         FormHeading("外观")
         GroupToggle("视觉小说模式", prefs.visualNovel, !state.busy, model::setVisualNovel)
+        val appearance = prefs.chatAppearance
+        Text("对话排版模式", style = MaterialTheme.typography.labelLarge)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ChatLayoutMode.entries.forEach { mode ->
+                FilterChip(
+                    selected = appearance.layoutMode == mode,
+                    onClick = { model.setChatAppearance(appearance.copy(layoutMode = mode)) },
+                    label = { Text(mode.label) },
+                    enabled = !state.busy,
+                )
+            }
+        }
+        Text("正文字号 · ${appearance.fontSizeSp.toInt()} sp", style = MaterialTheme.typography.labelLarge)
+        Slider(
+            value = appearance.fontSizeSp,
+            onValueChange = { model.setChatAppearance(appearance.copy(fontSizeSp = kotlin.math.round(it))) },
+            valueRange = 12f..24f,
+            steps = 11,
+            enabled = !state.busy,
+        )
+        Text(
+            "行距倍数 · ${String.format(java.util.Locale.US, "%.2f", appearance.lineHeightMultiplier)}×",
+            style = MaterialTheme.typography.labelLarge,
+        )
+        Slider(
+            value = appearance.lineHeightMultiplier,
+            onValueChange = {
+                val snapped = (kotlin.math.round(it * 20f) / 20f)
+                model.setChatAppearance(appearance.copy(lineHeightMultiplier = snapped))
+            },
+            valueRange = 1.15f..2.0f,
+            enabled = !state.busy,
+        )
+        GroupToggle("对话引号主题色高亮", appearance.highlightQuotes, !state.busy) {
+            model.setChatAppearance(appearance.copy(highlightQuotes = it))
+        }
+        GroupToggle("渲染角色卡 HTML/CSS 状态面板", appearance.renderHtmlCards, !state.busy) {
+            model.setChatAppearance(appearance.copy(renderHtmlCards = it))
+        }
+        GroupToggle("显示实时上下文 Token 占用条", appearance.showTokenBar, !state.busy) {
+            model.setChatAppearance(appearance.copy(showTokenBar = it))
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf("system" to "随系统", "light" to "浅色", "dark" to "深色").forEach { (value, label) ->
                 FilterChip(theme == value, onClick = { theme = value }, label = { Text(label) }, enabled = !state.busy)

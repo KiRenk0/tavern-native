@@ -335,6 +335,9 @@ internal class EmbeddedLibrary(
         val scriptVariables = oldExtensions?.optJSONObject("variables")?.optJSONObject("global").variableStrings() +
             prefs.scriptVariables
         val automation = if (prefs.replyAutomation == ReplyAutomation()) ReplyAutomation.from(power) else prefs.replyAutomation
+        val appearance = if (prefs.chatAppearance == ChatAppearance() && power?.has("tavern_native_chat_appearance") == true) {
+            ChatAppearance.from(power.optJSONObject("tavern_native_chat_appearance"))
+        } else prefs.chatAppearance
         val tags = settings?.let { settingsJson ->
             prefs.library.mergeTags(settingsJson, ownerFor = { key ->
                 avatars[key]?.let(::libraryCardId) ?: groupIds[key]?.let(::libraryGroupId)
@@ -345,12 +348,13 @@ internal class EmbeddedLibrary(
         if (profiles != prefs.personas || links != prefs.personaConnections || (defaultNote != null && prefs.defaultAuthorNote == AuthorNote()) ||
             (importedLore != null && importedLore != prefs.loreSettings) || defaultPreset != prefs.defaultPresetId ||
             regex != prefs.regex || quickReplies != quick || scriptVariables != prefs.scriptVariables ||
-            library != prefs.library || automation != prefs.replyAutomation) {
+            library != prefs.library || automation != prefs.replyAutomation || appearance != prefs.chatAppearance) {
             store.save(prefs.copy(personas = profiles, personaConnections = links,
                 defaultPersonaId = sourceDefaultId.takeIf { useSourceDefaults } ?: prefs.defaultPersonaId,
                 defaultAuthorNote = defaultNote?.takeIf { prefs.defaultAuthorNote == AuthorNote() } ?: prefs.defaultAuthorNote,
                 loreSettings = importedLore ?: prefs.loreSettings, defaultPresetId = defaultPreset, regex = regex,
-                quickReplies = quickReplies, scriptVariables = scriptVariables, library = library, replyAutomation = automation))
+                quickReplies = quickReplies, scriptVariables = scriptVariables, library = library,
+                replyAutomation = automation, chatAppearance = appearance))
         }
         return "已读取 ${avatars.size} 个角色、$groupCount 个群组、新增 $chatCount 个聊天、$bookCount 本世界书、" +
             "${profiles.size - prefs.personas.size} 个人设、$addedPresets 个提示词预设和 $addedQuickSets 个快捷回复集" +

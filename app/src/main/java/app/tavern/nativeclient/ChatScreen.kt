@@ -6,6 +6,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts.OpenDocument
 import androidx.activity.result.contract.ActivityResultContracts.OpenMultipleDocuments
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 
@@ -39,13 +40,10 @@ import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.graphics.vector.ImageVector
 import kotlinx.coroutines.launch
@@ -56,6 +54,7 @@ import java.io.File
 @Composable
 internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, configure: () -> Unit) {
     var draft by rememberSaveable { mutableStateOf("") }
+    var draftSelection by remember { mutableStateOf(TextRange.Zero) }
     LaunchedEffect(chat.id, draft.isNotBlank()) { model.reportDraft(chat.id, draft.isNotBlank()) }
     DisposableEffect(chat.id) { onDispose { model.reportDraft(chat.id, false) } }
     var editing by remember { mutableStateOf<Int?>(null) }
@@ -165,6 +164,40 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
     val currentMatch = searchMatches.getOrNull(matchPosition)
     val keyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val showStage = visualNovel && !historyExpanded && selected == null && !searchOpen && !keyboardVisible
+    val appearance = state.prefs.chatAppearance
+    val activePreset = state.presetFor(chat)
+    var tokenEstimate by remember { mutableStateOf<ContextUsageEstimate?>(null) }
+    LaunchedEffect(
+        chat,
+        state.card,
+        state.persona,
+        activePreset,
+        draft,
+        connection,
+        capturedPrompt,
+        appearance.showTokenBar,
+    ) {
+        if (!appearance.showTokenBar) {
+            tokenEstimate = null
+        } else {
+            val counter = withContext(Dispatchers.Default) { model.tokenCounterFor(connection) }
+            tokenEstimate = withContext(Dispatchers.Default) {
+                estimateConversationTokens(chat, state.card, state.persona, activePreset, draft, connection, counter, capturedPrompt)
+            }
+        }
+    }
+    var userDetached by remember(chat.id) { mutableStateOf(false) }
+    val isAtBottom by remember(count) {
+        derivedStateOf {
+            val lastVisible = list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: (count - 1)
+            lastVisible >= (count - 2).coerceAtLeast(0)
+        }
+    }
+    LaunchedEffect(list.isScrollInProgress, isAtBottom) {
+        if (list.isScrollInProgress && !isAtBottom) userDetached = true
+        else if (isAtBottom) userDetached = false
+    }
+    val scope = rememberCoroutineScope()
 
     BackHandler(enabled = selected != null || searchOpen || visualNovel && historyExpanded) {
         when {
@@ -176,18 +209,21 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
     LaunchedEffect(state.suggestedDraft) {
         state.suggestedDraft?.takeIf { it.chatId == chat.id }?.let {
             draft = it.text
+            draftSelection = TextRange(it.text.length)
             model.consumeDraft(it)
         }
     }
     LaunchedEffect(messages.size, reply?.replacedMessages, reply == null) {
-        if (count > 1 && !searchOpen) list.scrollToItem(count - 1)
+        if (count > 1 && !searchOpen && !userDetached) list.scrollToItem(count - 1)
     }
     LaunchedEffect(searchOpen, currentMatch) {
-        if (searchOpen && currentMatch != null) list.scrollToItem(currentMatch)
+        if (searchOpen && currentMatch != null) {
+            userDetached = true
+            list.scrollToItem(currentMatch)
+        }
     }
-    LaunchedEffect(reply?.text) {
-        if (reply != null && !searchOpen && !list.isScrollInProgress &&
-            (list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0) >= count - 2) {
+    LaunchedEffect(reply?.text, reply?.reasoning) {
+        if (reply != null && !searchOpen && !userDetached && !list.isScrollInProgress && isAtBottom) {
             list.scrollToItem(count - 1)
         }
     }
@@ -275,6 +311,16 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                             MenuItem(if (visualNovel) "关闭视觉小说模式" else "开启视觉小说模式", Icons.Outlined.AutoStories) {
                                 optionsMenu = false; model.setVisualNovel(!visualNovel)
                             }
+                            MenuItem(
+                                if (appearance.layoutMode == ChatLayoutMode.BUBBLE) "切换为文档小说模式" else "切换为气泡模式",
+                                Icons.AutoMirrored.Outlined.Article,
+                            ) {
+                                optionsMenu = false
+                                val nextMode = if (appearance.layoutMode == ChatLayoutMode.BUBBLE) {
+                                    ChatLayoutMode.DOCUMENT
+                                } else ChatLayoutMode.BUBBLE
+                                model.setChatAppearance(appearance.copy(layoutMode = nextMode))
+                            }
                             MenuItem("从文件设置对话背景", Icons.Outlined.AddPhotoAlternate) {
                                 optionsMenu = false; pickBackground.launch(arrayOf("image/*"))
                             }
@@ -304,17 +350,56 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                 navigate = { searchIndex = it }, close = { searchOpen = false },
             )
 
+            if (appearance.showTokenBar) tokenEstimate?.let { estimate ->
+                val scheme = MaterialTheme.colorScheme
+                val barColor = when {
+                    estimate.fraction > 0.90f -> scheme.error
+                    estimate.fraction > 0.75f -> scheme.tertiary
+                    else -> scheme.primary
+                }
+                Surface(
+                    color = scheme.surfaceContainerLow,
+                    modifier = Modifier.fillMaxWidth().clickable(enabled = capturedPrompt != null) {
+                        promptInspector = true
+                    },
+                ) {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "上下文 ~${estimate.usedTokens} / ${estimate.maxTokens} tok · ${estimate.counterLabel}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (estimate.fraction > 0.90f) scheme.error else scheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (capturedPrompt != null) {
+                                Text("查看提示词", style = MaterialTheme.typography.labelSmall, color = scheme.primary)
+                            }
+                        }
+                        Spacer(Modifier.height(2.dp))
+                        LinearProgressIndicator(
+                            progress = { estimate.fraction },
+                            color = barColor,
+                            trackColor = scheme.surfaceVariant,
+                            modifier = Modifier.fillMaxWidth().height(3.dp),
+                        )
+                    }
+                }
+            }
+
             if (!visualNovel) ExpressionStrip(state, chat, model)
 
             ConversationLayout(chat, state, model, showStage, reply?.characterId, Modifier.weight(1f)) {
-                if (messages.isEmpty() && reply == null) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("发送一条消息来开始对话。", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                } else {
-                    LazyColumn(Modifier.fillMaxSize(), state = list,
-                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                Box(Modifier.fillMaxSize()) {
+                    if (messages.isEmpty() && reply == null) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("发送一条消息来开始对话。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    } else {
+                        LazyColumn(Modifier.fillMaxSize(), state = list,
+                            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(if (appearance.layoutMode == ChatLayoutMode.DOCUMENT) 10.dp else 14.dp)) {
                         itemsIndexed(messages) { index, message ->
                             val character = state.regexCard(message)
                             val appliedPreset = state.presetFor(chat)
@@ -333,6 +418,7 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                                         onCheckedChange = { selected = if (it) selectedMessages + index else selectedMessages - index },
                                         modifier = Modifier.semantics { contentDescription = "选择第 ${index + 1} 条消息" })
                                     ChatBubble(message, avatar = avatar, regex = regex, depth = depths[index],
+                                        appearance = appearance,
                                         imageFile = model::imageFile, previewImage = { previewImage = CaptionImageTarget(it, index) },
                                         previewDocument = { previewDocument = OpenChatDocument(it, index) })
                                 }
@@ -340,6 +426,7 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                                 ChatBubble(message, enabled = !busy, swipe = { model.swipe(chat, index, it) }, avatar = avatar,
                                     openAlternatives = { alternativePicker = index },
                                     regex = regex, depth = depths[index],
+                                    appearance = appearance,
                                     imageFile = model::imageFile, previewImage = { previewImage = CaptionImageTarget(it, index) },
                                     previewDocument = { previewDocument = OpenChatDocument(it, index) },
                                     previousDrawing = { model.previousDrawing(chat.id, index) },
@@ -413,11 +500,25 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                                         state.textRules(chat, speaker)
                                     }
                                     ChatBubble(Message("assistant", reply.speaker, reply.text, reasoning = reply.reasoning),
-                                        regex = regex, depth = 0)
+                                        regex = regex, depth = 0, appearance = appearance)
                                 }
                             }
                         }
                         item { Spacer(Modifier.height(2.dp)) }
+                    }
+                    }
+                    if ((userDetached || !isAtBottom) && count > 1 && !searchOpen) {
+                        SmallFloatingActionButton(
+                            onClick = {
+                                userDetached = false
+                                scope.launch { list.animateScrollToItem(count - 1) }
+                            },
+                            modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp),
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        ) {
+                            Icon(Icons.Outlined.KeyboardArrowDown, contentDescription = "回到底部")
+                        }
                     }
                 }
             }
@@ -466,7 +567,11 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                                     val result = state.prefs.voice.dictated(recognized, draft)
                                     if (result.send && model.send(result.text, interpretCommands = result.shortcut)) {
                                         draft = ""
-                                    } else draft = result.text
+                                        draftSelection = TextRange.Zero
+                                    } else {
+                                        draft = result.text
+                                        draftSelection = TextRange(result.text.length)
+                                    }
                                 }, onError = model::notice, onProgress = { dictation = it })
                             Spacer(Modifier.weight(1f))
                             if (state.speaking) TextButton(model::stopNarration) {
@@ -498,12 +603,47 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                             LinearProgressIndicator(Modifier.fillMaxWidth())
                             Text(it, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(vertical = 4.dp))
                         }
+                        val input = generation?.text?.takeIf { impersonating && it.isNotBlank() } ?: draft
+                        val safeSelection = TextRange(
+                            draftSelection.start.coerceIn(0, input.length),
+                            draftSelection.end.coerceIn(0, input.length),
+                        )
+                        val readOnlyInput = impersonating || state.scriptRunning || state.utility != null
+                        val activeQuickItems = remember(quickConfig, chat) {
+                            if (!quickConfig.enabled) emptyList() else quickConfig.selected(chat).flatMap { it.items }
+                        }
+                        val autoQuery = remember(input, safeSelection, readOnlyInput) {
+                            if (readOnlyInput) null else detectAutocomplete(input, safeSelection.start)
+                        }
+                        val suggestions = remember(autoQuery, activeQuickItems, chat.options.variables, state.prefs.scriptVariables) {
+                            autoQuery?.let {
+                                suggestAutocomplete(it, activeQuickItems, chat.options.variables, state.prefs.scriptVariables)
+                            }.orEmpty()
+                        }
+                        if (suggestions.isNotEmpty() && autoQuery != null) {
+                            AutocompleteStrip(suggestions) { item ->
+                                val (updated, nextCursor) = applyAutocomplete(draft, autoQuery, item)
+                                draft = updated
+                                draftSelection = TextRange(nextCursor)
+                                model.stopAuto()
+                            }
+                        }
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            val input = generation?.text?.takeIf { impersonating && it.isNotBlank() } ?: draft
-                            OutlinedTextField(input, { draft = it; model.stopAuto() }, modifier = Modifier.weight(1f),
-                                readOnly = impersonating || state.scriptRunning || state.utility != null,
-                                placeholder = { Text(if (impersonating) "正在代写…" else "输入消息") },
-                                shape = RoundedCornerShape(24.dp), maxLines = 5)
+                            OutlinedTextField(
+                                value = TextFieldValue(input, safeSelection),
+                                onValueChange = { updated ->
+                                    if (!readOnlyInput) {
+                                        draft = updated.text
+                                        draftSelection = updated.selection
+                                        model.stopAuto()
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                readOnly = readOnlyInput,
+                                placeholder = { Text(if (impersonating) "正在代写…" else "输入消息（/ 命令 · {{ 宏）") },
+                                shape = RoundedCornerShape(24.dp),
+                                maxLines = 5,
+                            )
                             if (generation != null || state.scriptRunning || state.generatingImage || state.utility != null) {
                                 FilledTonalIconButton(onClick = model::stop, modifier = Modifier.size(48.dp)) {
                                     Icon(Icons.Outlined.Stop, when {
@@ -517,7 +657,14 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                                 FilledIconButton(enabled = (canSend || draft.trimStart().startsWith('/')) && !busy && dictation == null &&
                                     (draft.isNotBlank() || attachedImages.isNotEmpty() || attachedDocuments.isNotEmpty()),
                                     modifier = Modifier.size(48.dp),
-                                    onClick = { if (model.send(draft)) { draft = ""; keyboard?.hide() } }) {
+                                    onClick = {
+                                        userDetached = false
+                                        if (model.send(draft)) {
+                                            draft = ""
+                                            draftSelection = TextRange.Zero
+                                            keyboard?.hide()
+                                        }
+                                    }) {
                                     Icon(Icons.AutoMirrored.Outlined.Send, "发送")
                                 }
                             }
@@ -780,30 +927,48 @@ private fun ChatBubble(
     openAlternatives: (() -> Unit)? = null,
     generateAlternative: (() -> Unit)? = null, actions: List<MessageAction> = emptyList(), highlighted: Boolean = false,
     regex: RegexRuntime = RegexRuntime.EMPTY, depth: Int? = null,
+    appearance: ChatAppearance = ChatAppearance(),
     imageFile: ((ChatImage) -> File)? = null, previewImage: (ChatImage) -> Unit = {},
     previewDocument: (ChatDocument) -> Unit = {},
     previousDrawing: (() -> Unit)? = null, nextDrawing: (() -> Unit)? = null,
     onAction: (MessageAction) -> Unit = {},
 ) {
     val mine = message.role == "user"
+    val documentMode = appearance.layoutMode == ChatLayoutMode.DOCUMENT
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     var menu by remember { mutableStateOf(false) }
     val scheme = MaterialTheme.colorScheme
-    val background = if (mine) scheme.primaryContainer else scheme.surfaceContainer
+    val background = when {
+        documentMode && mine -> scheme.primaryContainer.copy(alpha = 0.55f)
+        documentMode -> scheme.surfaceContainerLow
+        mine -> scheme.primaryContainer
+        else -> scheme.surfaceContainer
+    }
     val foreground = if (mine) scheme.onPrimaryContainer else scheme.onSurface
-    val bubble = if (mine) RoundedCornerShape(22.dp, 22.dp, 6.dp, 22.dp)
-        else RoundedCornerShape(22.dp, 22.dp, 22.dp, 6.dp)
+    val shape = when {
+        documentMode -> RoundedCornerShape(14.dp)
+        mine -> RoundedCornerShape(22.dp, 22.dp, 6.dp, 22.dp)
+        else -> RoundedCornerShape(22.dp, 22.dp, 22.dp, 6.dp)
+    }
     val display = regexDisplay(message.displayText, message.regexSite, regex, depth)
     val reasoning = regexDisplay(message.reasoning.orEmpty(), RegexSite.REASONING, regex, depth)
-    val rendered = remember(display) { display?.let(::formatted) }
     var openReasoning by rememberSaveable { mutableStateOf(false) }
     var openTools by rememberSaveable { mutableStateOf(false) }
 
-    BoxWithConstraints(Modifier.fillMaxWidth(), contentAlignment = if (mine) Alignment.TopEnd else Alignment.TopStart) {
-        Surface(shape = bubble, color = background, contentColor = foreground,
-            border = if (highlighted) BorderStroke(2.dp, scheme.primary) else null,
-            modifier = Modifier.widthIn(max = minOf(maxWidth * 0.91f, 640.dp))) {
+    BoxWithConstraints(
+        Modifier.fillMaxWidth(),
+        contentAlignment = if (documentMode || !mine) Alignment.TopStart else Alignment.TopEnd,
+    ) {
+        val cardModifier = if (documentMode) Modifier.fillMaxWidth()
+        else Modifier.widthIn(max = minOf(maxWidth * 0.91f, 640.dp))
+        Surface(shape = shape, color = background, contentColor = foreground,
+            border = when {
+                highlighted -> BorderStroke(2.dp, scheme.primary)
+                documentMode -> BorderStroke(1.dp, scheme.outlineVariant.copy(alpha = 0.6f))
+                else -> null
+            },
+            modifier = cardModifier) {
             Column(Modifier.padding(start = 15.dp, end = 13.dp, top = 6.dp, bottom = 13.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -837,7 +1002,9 @@ private fun ChatBubble(
                     color = scheme.onSurfaceVariant)
                 if (display?.isEmpty() == true && reasoning.isNullOrBlank() && message.displayImages.isEmpty() && message.documents.isEmpty()) {
                     Text("（空消息）", style = MaterialTheme.typography.bodyMedium)
-                } else if (!rendered.isNullOrEmpty()) SelectionContainer { Text(rendered, style = MaterialTheme.typography.bodyLarge) }
+                } else if (!display.isNullOrEmpty()) {
+                    RichMessageContent(display, appearance, textColor = foreground)
+                }
                 message.toolTurn?.let { turn ->
                     TextButton({ openTools = !openTools }) { Text(if (openTools) "收起调用详情" else "查看调用详情") }
                     if (openTools) SelectionContainer {
@@ -901,24 +1068,4 @@ private fun regexDisplay(text: String, site: RegexSite?, rules: RegexRuntime, de
         }
         rendered
     }
-}
-
-private val inline = Regex("""(```[\s\S]*?```|`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*)""")
-
-private fun formatted(text: String) = buildAnnotatedString {
-    var cursor = 0
-    inline.findAll(text).forEach { match ->
-        append(text.substring(cursor, match.range.first))
-        val part = match.value
-        when {
-            part.startsWith("```") -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) {
-                append(part.removeSurrounding("```").trim('\n'))
-            }
-            part.startsWith("`") -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(part.removeSurrounding("`")) }
-            part.startsWith("**") -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(part.removeSurrounding("**")) }
-            else -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { append(part.removeSurrounding("*")) }
-        }
-        cursor = match.range.last + 1
-    }
-    append(text.substring(cursor))
 }

@@ -498,6 +498,7 @@ internal data class Preferences(
     val translationServices: TranslationServices = TranslationServices(),
     val library: LibraryPreferences = LibraryPreferences(),
     val replyAutomation: ReplyAutomation = ReplyAutomation(),
+    val chatAppearance: ChatAppearance = ChatAppearance(),
 ) {
     fun personaFor(chat: Chat? = null, subjectId: String? = chat?.cardId ?: chat?.groupId,
                    temporaryId: String? = null): PersonaProfile =

@@ -242,7 +242,8 @@ private class OriginalBackupWriter(
         val defaultPersona = personaFiles[prefs.defaultPersonaId].orEmpty()
         return jsonOf(NATIVE_BACKUP_KEY to 1, "user_avatar" to defaultPersona,
             "power_user" to jsonOf("personas" to personas, "persona_descriptions" to descriptions,
-                "default_persona" to defaultPersona, "bogus_folders" to library.folders).also(prefs.replyAutomation::applyTo),
+                "default_persona" to defaultPersona, "bogus_folders" to library.folders,
+                "tavern_native_chat_appearance" to prefs.chatAppearance.json()).also(prefs.replyAutomation::applyTo),
             "world_info_settings" to prefs.loreSettings.json().put("world_info",
                 jsonOf("globalSelect" to JSONArray(books.filter(WorldBook::enabled).map { bookNames.getValue(it.id) }))),
             "oai_settings" to jsonOf("preset_settings_openai" to presetNames[prefs.defaultPresetId].orEmpty()),
