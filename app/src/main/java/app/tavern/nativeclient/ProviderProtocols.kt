@@ -64,7 +64,7 @@ internal object ProviderProtocols {
             "anthropic-version" to ANTHROPIC_VERSION,
         )
         return request("$root/v1/models", headers = headers, readTimeout = 15_000) { input, _ ->
-            val rows = JSONObject(input.readLimited().decodeToString()).optJSONArray("data").objects()
+            val rows = JSONObject(input.readLimited().decodeToString()).optJSONArray("data")?.objects().orEmpty()
             val ids = linkedSetOf<String>()
             val contexts = linkedMapOf<String, Int>()
             for (row in rows) {
@@ -105,7 +105,7 @@ internal object ProviderProtocols {
     private suspend fun discoverOllamaModels(base: String): DiscoveredModels {
         val root = base.removeSuffix("/v1").removeSuffix("/api")
         return request("$root/api/tags", readTimeout = 12_000) { input, _ ->
-            val rows = JSONObject(input.readLimited().decodeToString()).optJSONArray("models").objects()
+            val rows = JSONObject(input.readLimited().decodeToString()).optJSONArray("models")?.objects().orEmpty()
             val ids = rows.mapNotNull { it.string("name").trim().takeIf(String::isNotBlank) }.distinct().sorted()
             DiscoveredModels(ids, emptyMap())
         }
@@ -174,7 +174,7 @@ internal object ProviderProtocols {
     // --- Anthropic Claude Native (/v1/messages) ---
 
     internal fun buildAnthropicPayload(provider: Provider, payload: JSONObject, streaming: Boolean): JSONObject {
-        val openAiMessages = payload.optJSONArray("messages").objects()
+        val openAiMessages = payload.optJSONArray("messages")?.objects().orEmpty()
         val systemTexts = mutableListOf<String>()
         val converted = mutableListOf<Pair<String, MutableList<JSONObject>>>()
 
@@ -415,7 +415,7 @@ internal object ProviderProtocols {
         json.optJSONObject("error")?.string("message")?.takeIf(String::isNotBlank)?.let {
             error(it.redactValue(apiKey.trim()))
         }
-        for (block in json.optJSONArray("content").objects()) {
+        for (block in json.optJSONArray("content")?.objects().orEmpty()) {
             when (block.string("type")) {
                 "thinking" -> result.appendReasoning(block.string("thinking"), onReasoning, explicit = true)
                 "text" -> result.appendText(block.string("text"), token)
@@ -456,7 +456,7 @@ internal object ProviderProtocols {
         payload: JSONObject,
         cachedContentName: String? = null,
     ): Pair<JSONObject, String> {
-        val openAiMessages = payload.optJSONArray("messages").objects()
+        val openAiMessages = payload.optJSONArray("messages")?.objects().orEmpty()
         val systemTexts = mutableListOf<String>()
         val contents = mutableListOf<Pair<String, MutableList<JSONObject>>>()
         val toolCallNames = mutableMapOf<String, String>()
@@ -774,7 +774,7 @@ internal object ProviderProtocols {
         if (payload.has("seed")) options.put("seed", payload.optLong("seed"))
 
         val (url, body) = if (provider.textCompletion) {
-            val flattened = flattenMessagesToPrompt(payload.optJSONArray("messages").objects())
+            val flattened = flattenMessagesToPrompt(payload.optJSONArray("messages")?.objects().orEmpty())
             val req = jsonOf(
                 "model" to payload.string("model"),
                 "prompt" to flattened.prompt,
@@ -788,7 +788,7 @@ internal object ProviderProtocols {
             "$root/api/generate" to req
         } else {
             val mapped = JSONArray()
-            for (msg in payload.optJSONArray("messages").objects()) {
+            for (msg in payload.optJSONArray("messages")?.objects().orEmpty()) {
                 val text = extractTextOnly(msg.opt("content"))
                 val imgs = extractBase64Images(msg.opt("content"))
                 val row = jsonOf("role" to msg.string("role"), "content" to text)
@@ -876,7 +876,7 @@ internal object ProviderProtocols {
     ): CompletionAccumulator {
         val base = baseAddress(provider)
         val headers = buildOpenAiHeaders(provider)
-        val flattened = flattenMessagesToPrompt(payload.optJSONArray("messages").objects())
+        val flattened = flattenMessagesToPrompt(payload.optJSONArray("messages")?.objects().orEmpty())
         val streaming = payload.optBoolean("stream", true)
         val maxLen = payload.optInt("max_tokens", 0).takeIf { it > 0 } ?: 512
 

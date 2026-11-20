@@ -22,92 +22,75 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern.db", null, 9), VectorCache {
-    private val settings = context.getSharedPreferences("tavern", Context.MODE_PRIVATE)
-    private val portraits = File(context.filesDir, "portraits")
-    private val personaAvatars = File(context.filesDir, "persona-avatars")
+internal object TavernSchema {
+    const val LATEST_VERSION = 9
 
-    override fun onConfigure(db: SQLiteDatabase) = db.setForeignKeyConstraintsEnabled(true)
+    val createLibrariesStatements = listOf(
+        "CREATE TABLE character_groups (id TEXT PRIMARY KEY, payload TEXT NOT NULL)",
+        "CREATE TABLE world_books (id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, enabled INTEGER NOT NULL, payload TEXT NOT NULL)",
+    )
 
-    override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE cards (id TEXT PRIMARY KEY, payload TEXT NOT NULL, portrait INTEGER NOT NULL)")
-        createLibraries(db)
-        createChats(db)
-        createChatIndices(db)
-        addChatWorldBindings(db)
-        createPromptPresets(db)
-        createSearchIndex(db)
-        createDataBank(db)
-        createGallery(db)
-        createComfyWorkflows(db)
-        createGlobalScriptVariables(db)
-    }
+    val createChatsTableSql = """
+        CREATE TABLE chats (
+            id TEXT PRIMARY KEY, card_id TEXT REFERENCES cards(id) ON DELETE CASCADE,
+            group_id TEXT REFERENCES character_groups(id) ON DELETE CASCADE,
+            title TEXT NOT NULL, updated INTEGER NOT NULL, payload TEXT NOT NULL,
+            CHECK ((card_id IS NULL) <> (group_id IS NULL))
+        )
+    """.trimIndent()
 
-    private fun createLibraries(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE character_groups (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
-        db.execSQL("CREATE TABLE world_books (id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, enabled INTEGER NOT NULL, payload TEXT NOT NULL)")
-    }
+    val createChatIndicesStatements = listOf(
+        "CREATE INDEX chats_per_card ON chats(card_id, updated)",
+        "CREATE INDEX chats_per_group ON chats(group_id, updated)",
+    )
 
-    private fun createChats(db: SQLiteDatabase) {
-        db.execSQL("""
-            CREATE TABLE chats (
-                id TEXT PRIMARY KEY, card_id TEXT REFERENCES cards(id) ON DELETE CASCADE,
-                group_id TEXT REFERENCES character_groups(id) ON DELETE CASCADE,
-                title TEXT NOT NULL, updated INTEGER NOT NULL, payload TEXT NOT NULL,
-                CHECK ((card_id IS NULL) <> (group_id IS NULL))
-            )
-        """.trimIndent())
-    }
+    val addChatWorldBindingsStatements = listOf(
+        "ALTER TABLE chats ADD COLUMN world_book_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE chats ADD COLUMN world_book_name TEXT NOT NULL DEFAULT ''",
+    )
 
-    private fun createChatIndices(db: SQLiteDatabase) {
-        db.execSQL("CREATE INDEX chats_per_card ON chats(card_id, updated)")
-        db.execSQL("CREATE INDEX chats_per_group ON chats(group_id, updated)")
-    }
+    val createPromptPresetsSql = "CREATE TABLE prompt_presets (id TEXT PRIMARY KEY, name TEXT NOT NULL, payload TEXT NOT NULL)"
 
-    private fun createPromptPresets(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE prompt_presets (id TEXT PRIMARY KEY, name TEXT NOT NULL, payload TEXT NOT NULL)")
-    }
-
-    private fun createSearchIndex(db: SQLiteDatabase) {
-        db.execSQL("""
+    val createSearchIndexStatements = listOf(
+        """
             CREATE TABLE vector_embeddings (
                 scope TEXT NOT NULL, model_space TEXT NOT NULL, digest TEXT NOT NULL, vector BLOB NOT NULL,
                 PRIMARY KEY (scope, model_space, digest)
             ) WITHOUT ROWID
-        """.trimIndent())
-        db.execSQL("""
+        """.trimIndent(),
+        """
             CREATE TRIGGER discard_chat_vectors AFTER DELETE ON chats BEGIN
                 DELETE FROM vector_embeddings WHERE scope = 'chat:' || OLD.id;
             END
-        """.trimIndent())
-    }
+        """.trimIndent(),
+    )
 
-    private fun createDataBank(db: SQLiteDatabase) {
-        db.execSQL("""
+    val createDataBankStatements = listOf(
+        """
             CREATE TABLE data_bank (
                 id TEXT PRIMARY KEY, title TEXT NOT NULL, enabled INTEGER NOT NULL, source TEXT NOT NULL,
                 card_id TEXT REFERENCES cards(id) ON DELETE CASCADE, chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE,
                 updated INTEGER NOT NULL, payload TEXT NOT NULL,
                 CHECK(card_id IS NULL OR chat_id IS NULL)
             )
-        """.trimIndent())
-        db.execSQL("CREATE INDEX data_bank_by_card ON data_bank(card_id)")
-        db.execSQL("CREATE INDEX data_bank_by_chat ON data_bank(chat_id)")
-        db.execSQL("""
+        """.trimIndent(),
+        "CREATE INDEX data_bank_by_card ON data_bank(card_id)",
+        "CREATE INDEX data_bank_by_chat ON data_bank(chat_id)",
+        """
             CREATE TRIGGER discard_deleted_document_vectors AFTER DELETE ON data_bank BEGIN
                 DELETE FROM vector_embeddings WHERE scope = 'document:' || OLD.id;
             END
-        """.trimIndent())
-        db.execSQL("""
+        """.trimIndent(),
+        """
             CREATE TRIGGER discard_changed_document_vectors AFTER UPDATE OF title, payload ON data_bank
             WHEN OLD.title <> NEW.title OR OLD.payload <> NEW.payload BEGIN
                 DELETE FROM vector_embeddings WHERE scope = 'document:' || OLD.id;
             END
-        """.trimIndent())
-    }
+        """.trimIndent(),
+    )
 
-    private fun createGallery(db: SQLiteDatabase) {
-        db.execSQL("""
+    val createGalleryStatements = listOf(
+        """
             CREATE TABLE drawing_gallery (
                 id TEXT PRIMARY KEY,
                 card_id TEXT REFERENCES cards(id) ON DELETE CASCADE,
@@ -115,41 +98,90 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
                 created INTEGER NOT NULL, image TEXT NOT NULL, prompt TEXT NOT NULL,
                 CHECK ((card_id IS NULL) <> (group_id IS NULL))
             )
-        """.trimIndent())
-        db.execSQL("CREATE INDEX drawings_per_card ON drawing_gallery(card_id, created)")
-        db.execSQL("CREATE INDEX drawings_per_group ON drawing_gallery(group_id, created)")
+        """.trimIndent(),
+        "CREATE INDEX drawings_per_card ON drawing_gallery(card_id, created)",
+        "CREATE INDEX drawings_per_group ON drawing_gallery(group_id, created)",
+    )
+
+    val createComfyWorkflowsSql = """
+        CREATE TABLE comfy_workflows (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            source TEXT NOT NULL, replacements TEXT NOT NULL
+        )
+    """.trimIndent()
+
+    val createGlobalScriptVariablesSql = "CREATE TABLE script_globals (id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+
+    fun createStatements(): List<String> = buildList {
+        add("CREATE TABLE cards (id TEXT PRIMARY KEY, payload TEXT NOT NULL, portrait INTEGER NOT NULL)")
+        addAll(createLibrariesStatements)
+        add(createChatsTableSql)
+        addAll(createChatIndicesStatements)
+        addAll(addChatWorldBindingsStatements)
+        add(createPromptPresetsSql)
+        addAll(createSearchIndexStatements)
+        addAll(createDataBankStatements)
+        addAll(createGalleryStatements)
+        add(createComfyWorkflowsSql)
+        add(createGlobalScriptVariablesSql)
     }
 
-    private fun createComfyWorkflows(db: SQLiteDatabase) {
-        db.execSQL("""
-            CREATE TABLE comfy_workflows (
-                id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-                source TEXT NOT NULL, replacements TEXT NOT NULL
-            )
-        """.trimIndent())
+    fun upgradeStatements(oldVersion: Int, newVersion: Int): List<String> {
+        check(oldVersion in 1 until LATEST_VERSION && newVersion == LATEST_VERSION) {
+            "未知数据库版本 $oldVersion → $newVersion"
+        }
+        return buildList {
+            if (oldVersion == 1) {
+                addAll(createLibrariesStatements)
+                add("ALTER TABLE chats RENAME TO chats_v1")
+                add(createChatsTableSql)
+                add("INSERT INTO chats (id, card_id, title, updated, payload) SELECT id, card_id, title, updated, payload FROM chats_v1")
+                add("DROP TABLE chats_v1")
+                addAll(createChatIndicesStatements)
+            }
+            if (oldVersion < 3) add(createPromptPresetsSql)
+            if (oldVersion < 4) addAll(createSearchIndexStatements)
+            if (oldVersion < 5) addAll(createDataBankStatements)
+            if (oldVersion < 6) addAll(createGalleryStatements)
+            if (oldVersion < 7) add(createComfyWorkflowsSql)
+            if (oldVersion < 8) addAll(addChatWorldBindingsStatements)
+            add(createGlobalScriptVariablesSql)
+        }
+    }
+}
+
+internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern.db", null, TavernSchema.LATEST_VERSION), VectorCache {
+    private val settings = context.getSharedPreferences("tavern", Context.MODE_PRIVATE)
+    private val portraits = File(context.filesDir, "portraits")
+    private val personaAvatars = File(context.filesDir, "persona-avatars")
+
+    override fun onConfigure(db: SQLiteDatabase) = db.setForeignKeyConstraintsEnabled(true)
+
+    override fun onCreate(db: SQLiteDatabase) {
+        TavernSchema.createStatements().forEach(db::execSQL)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        check(oldVersion in 1..8 && newVersion == 9) { "未知数据库版本 $oldVersion → $newVersion" }
+        check(oldVersion in 1..8 && newVersion == TavernSchema.LATEST_VERSION) { "未知数据库版本 $oldVersion → $newVersion" }
         if (oldVersion == 1) {
-            createLibraries(db)
+            TavernSchema.createLibrariesStatements.forEach(db::execSQL)
             db.execSQL("ALTER TABLE chats RENAME TO chats_v1")
-            createChats(db)
+            db.execSQL(TavernSchema.createChatsTableSql)
             db.execSQL("INSERT INTO chats (id, card_id, title, updated, payload) SELECT id, card_id, title, updated, payload FROM chats_v1")
             db.execSQL("DROP TABLE chats_v1")
-            createChatIndices(db)
+            TavernSchema.createChatIndicesStatements.forEach(db::execSQL)
         }
-        if (oldVersion < 3) createPromptPresets(db)
-        if (oldVersion < 4) createSearchIndex(db)
-        if (oldVersion < 5) createDataBank(db)
-        if (oldVersion < 6) createGallery(db)
-        if (oldVersion < 7) createComfyWorkflows(db)
+        if (oldVersion < 3) db.execSQL(TavernSchema.createPromptPresetsSql)
+        if (oldVersion < 4) TavernSchema.createSearchIndexStatements.forEach(db::execSQL)
+        if (oldVersion < 5) TavernSchema.createDataBankStatements.forEach(db::execSQL)
+        if (oldVersion < 6) TavernSchema.createGalleryStatements.forEach(db::execSQL)
+        if (oldVersion < 7) db.execSQL(TavernSchema.createComfyWorkflowsSql)
         if (oldVersion < 8) migrateChatWorldBindings(db)
         createGlobalScriptVariables(db)
     }
 
     private fun migrateChatWorldBindings(db: SQLiteDatabase) {
-        addChatWorldBindings(db)
+        TavernSchema.addChatWorldBindingsStatements.forEach(db::execSQL)
         db.rawQuery("SELECT id, length(payload) FROM chats ORDER BY id", null).use { rows ->
             while (rows.moveToNext()) {
                 val id = rows.getString(0)
@@ -163,7 +195,7 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
     }
 
     private fun createGlobalScriptVariables(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE script_globals (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        db.execSQL(TavernSchema.createGlobalScriptVariablesSql)
         val legacy = settings.getString("preferences", null)?.let(::JSONObject)?.optJSONObject("scriptVariables")
         if (legacy != null) db.saveGlobalScriptVariables(legacy.variableStrings())
     }
@@ -187,11 +219,6 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
         if (chat != null) writeChat(chat)
         if (globals != null) saveGlobalScriptVariables(globals)
         Unit
-    }
-
-    private fun addChatWorldBindings(db: SQLiteDatabase) {
-        db.execSQL("ALTER TABLE chats ADD COLUMN world_book_id TEXT NOT NULL DEFAULT ''")
-        db.execSQL("ALTER TABLE chats ADD COLUMN world_book_name TEXT NOT NULL DEFAULT ''")
     }
 
     private fun savedWorldBinding(payload: String): ConversationOptions = try {

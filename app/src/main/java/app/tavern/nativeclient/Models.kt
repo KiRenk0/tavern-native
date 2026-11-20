@@ -1,12 +1,12 @@
 package app.tavern.nativeclient
 
-import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.nio.ByteBuffer
 import java.time.Instant
+import java.util.Base64
 import java.util.UUID
 import java.util.zip.CRC32
 
@@ -196,15 +196,15 @@ internal object CardFile {
             }
         }
         val encoded = requireNotNull(v3 ?: v2) { "PNG 中没有 SillyTavern 角色卡数据" }
-        val json = boundedJsonObject(Base64.decode(encoded, Base64.DEFAULT).decodeToString(), "PNG 角色数据无法读取")
+        val json = boundedJsonObject(Base64.getMimeDecoder().decode(encoded).decodeToString(), "PNG 角色数据无法读取")
         return CardImport(Card.from(json, id, true), bytes)
     }
 
     fun png(card: Card, portrait: ByteArray): ByteArray {
         val root = card.portableJson()
         val label = if (root.string("spec") == "chara_card_v3") "ccv3" else "chara"
-        val payload = "$label\u0000" + Base64.encodeToString(
-            root.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP,
+        val payload = "$label\u0000" + Base64.getEncoder().encodeToString(
+            root.toString().toByteArray(Charsets.UTF_8),
         )
         val chunk = payload.toByteArray(Charsets.US_ASCII)
         val text = "tEXt".toByteArray(Charsets.US_ASCII)

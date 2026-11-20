@@ -1,55 +1,45 @@
 package app.tavern.nativeclient
 
-import android.content.ClipData
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts.OpenDocument
 import androidx.activity.result.contract.ActivityResultContracts.OpenMultipleDocuments
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.Article
-import androidx.compose.material.icons.automirrored.outlined.CallSplit
 import androidx.compose.material.icons.automirrored.outlined.ListAlt
-import androidx.compose.material.icons.automirrored.outlined.ManageSearch
-import androidx.compose.material.icons.automirrored.outlined.MenuBook
-import androidx.compose.material.icons.automirrored.outlined.Send
-import androidx.compose.material.icons.automirrored.outlined.StickyNote2
-import androidx.compose.material.icons.automirrored.outlined.Undo
-import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextRange
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.graphics.vector.ImageVector
+import app.tavern.nativeclient.chat.ChatBranchesDialog
+import app.tavern.nativeclient.chat.ChatBubble
+import app.tavern.nativeclient.chat.ChatComposerPanel
+import app.tavern.nativeclient.chat.ChatModelPicker
+import app.tavern.nativeclient.chat.ChatOptionsMenuItems
+import app.tavern.nativeclient.chat.ChatPromptOverridesDialog
+import app.tavern.nativeclient.chat.ChatSearch
+import app.tavern.nativeclient.chat.ChatSharedMemorySheet
+import app.tavern.nativeclient.chat.ChatSpeakerPickerDialog
+import app.tavern.nativeclient.chat.MessageAction
+import app.tavern.nativeclient.chat.TextDialog
+import app.tavern.nativeclient.chat.messageActionsFor
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.File
 
 @Composable
 internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, configure: () -> Unit) {
@@ -267,75 +257,44 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                             optionsMenu = true
                         }
                         DropdownMenu(optionsMenu, onDismissRequest = { optionsMenu = false }) {
-                            if (canContinue) MenuItem("续写最后一条回复", Icons.Outlined.PlayArrow) {
-                                optionsMenu = false; keyboard?.hide(); model.continueReply()
-                            }
-                            if (configured && (group == null || members.isNotEmpty())) {
-                                MenuItem("代写我的消息", Icons.Outlined.EditNote) {
-                                    optionsMenu = false; keyboard?.hide(); model.impersonate()
-                                }
-                            }
-                            if (parent != null) MenuItem("返回父对话", Icons.AutoMirrored.Outlined.Undo) {
-                                optionsMenu = false; model.openChat(parent.id)
-                            }
-                            if (chat.messages.isNotEmpty()) {
-                                MenuItem("查找消息", Icons.Outlined.Search) {
-                                    optionsMenu = false; searchOpen = true
-                                }
-                                if (!chat.isTemporary) MenuItem("保存检查点", Icons.Outlined.Flag) {
-                                    optionsMenu = false; checkpoint = chat.messages.lastIndex
-                                }
-                                MenuItem("批量删除消息", Icons.Outlined.DeleteSweep) {
-                                    optionsMenu = false; searchOpen = false; deleteToolCalls = true; selected = emptySet()
-                                }
-                            }
-                            MenuItem("对话人设", Icons.Outlined.Person) { optionsMenu = false; personaPicker = true }
-                            MenuItem("作者注释", Icons.AutoMirrored.Outlined.StickyNote2) { optionsMenu = false; noteEditor = true }
-                            MenuItem("场景与提示覆盖", Icons.Outlined.Landscape) { optionsMenu = false; scenarioEditor = true }
-                            MenuItem("对话世界书", Icons.AutoMirrored.Outlined.MenuBook) { optionsMenu = false; worldPicker = true }
-                            MenuItem("提示词预设", Icons.Outlined.Tune) { optionsMenu = false; promptPicker = true }
-                            MenuItem("对话翻译", Icons.Outlined.Translate) { optionsMenu = false; translationTools = true }
-                            if (attachedImages.size < MAX_CHAT_IMAGES) MenuItem("从文件生成图片描述", Icons.Outlined.ImageSearch) {
-                                optionsMenu = false
-                                pickCaptionImage.launch(arrayOf("image/*"))
-                            }
-                            if (draft.isNotBlank()) MenuItem("翻译输入", Icons.Outlined.Translate) {
-                                optionsMenu = false; model.translateDraft(draft) { draft = it }
-                            }
-                            MenuItem("摘要记忆", Icons.Outlined.Summarize) { optionsMenu = false; memoryTools = true }
-                            if (!chat.isTemporary) {
-                                MenuItem("向量索引", Icons.AutoMirrored.Outlined.ManageSearch) { optionsMenu = false; vectorTools = true }
-                                MenuItem("跨聊角色记忆", Icons.Outlined.Psychology) { optionsMenu = false; sharedMemoryPanel = true }
-                                MenuItem("资料库", Icons.AutoMirrored.Outlined.Article) { optionsMenu = false; dataBank = true }
-                                MenuItem("图库", Icons.Outlined.PhotoLibrary) { optionsMenu = false; model.showImageGallery() }
-                                MenuItem("角色表情", Icons.Outlined.Mood) { optionsMenu = false; expressions = true }
-                            }
-                            MenuItem(if (visualNovel) "关闭视觉小说模式" else "开启视觉小说模式", Icons.Outlined.AutoStories) {
-                                optionsMenu = false; model.setVisualNovel(!visualNovel)
-                            }
-                            MenuItem(
-                                if (appearance.layoutMode == ChatLayoutMode.BUBBLE) "切换为文档小说模式" else "切换为气泡模式",
-                                Icons.AutoMirrored.Outlined.Article,
-                            ) {
-                                optionsMenu = false
-                                val nextMode = if (appearance.layoutMode == ChatLayoutMode.BUBBLE) {
-                                    ChatLayoutMode.DOCUMENT
-                                } else ChatLayoutMode.BUBBLE
-                                model.setChatAppearance(appearance.copy(layoutMode = nextMode))
-                            }
-                            MenuItem("从文件设置对话背景", Icons.Outlined.AddPhotoAlternate) {
-                                optionsMenu = false; pickBackground.launch(arrayOf("image/*"))
-                            }
-                            if (chat.options.background != null) MenuItem("清除对话背景", Icons.Outlined.HideImage) {
-                                optionsMenu = false; model.clearDrawingBackground(chat.id)
-                            }
-                            if (quickConfig.sets.isNotEmpty()) MenuItem("快捷回复集", Icons.Outlined.Bolt) {
-                                optionsMenu = false; quickPicker = true
-                            }
-                            if (capturedPrompt != null) MenuItem("查看最近请求的提示词", Icons.AutoMirrored.Outlined.ListAlt) {
-                                optionsMenu = false; promptInspector = true
-                            }
-                            MenuItem("重命名聊天", Icons.Outlined.Edit) { optionsMenu = false; renaming = true }
+                            ChatOptionsMenuItems(
+                                chat = chat,
+                                state = state,
+                                model = model,
+                                keyboard = keyboard,
+                                configured = configured,
+                                group = group,
+                                members = members,
+                                canContinue = canContinue,
+                                parent = parent,
+                                draft = draft,
+                                attachedImagesCount = attachedImages.size,
+                                appearance = appearance,
+                                capturedPrompt = capturedPrompt,
+                                closeMenu = { optionsMenu = false },
+                                onContinue = model::continueReply,
+                                onImpersonate = model::impersonate,
+                                onOpenSearch = { searchOpen = true },
+                                onSaveCheckpoint = { checkpoint = it },
+                                onBatchDelete = { searchOpen = false; deleteToolCalls = true; selected = emptySet() },
+                                onOpenPersona = { personaPicker = true },
+                                onOpenNote = { noteEditor = true },
+                                onOpenScenario = { scenarioEditor = true },
+                                onOpenWorld = { worldPicker = true },
+                                onOpenPrompt = { promptPicker = true },
+                                onOpenTranslation = { translationTools = true },
+                                onPickCaptionImage = { pickCaptionImage.launch(arrayOf("image/*")) },
+                                onTranslateDraft = { draft = it },
+                                onOpenMemory = { memoryTools = true },
+                                onOpenVector = { vectorTools = true },
+                                onOpenSharedMemory = { sharedMemoryPanel = true },
+                                onOpenDataBank = { dataBank = true },
+                                onOpenExpressions = { expressions = true },
+                                onPickBackground = { pickBackground.launch(arrayOf("image/*")) },
+                                onOpenQuickReplies = { quickPicker = true },
+                                onOpenPromptInspector = { promptInspector = true },
+                                onRename = { renaming = true },
+                            )
                         }
                     }
                     if (group != null) ActionIcon(Icons.Outlined.RecordVoiceOver, "选择发言成员",
@@ -435,29 +394,14 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                                     nextDrawing = { model.nextDrawing(chat.id, index) },
                                     highlighted = searchOpen && currentMatch == index,
                                     generateAlternative = if (index == chat.messages.lastIndex && canContinue) model::nextAlternative else null,
-                                    actions = buildList {
-                                        if (state.prefs.voice.enabled && message.text.isNotBlank()) add(MessageAction.NARRATE)
-                                        if (message.text.isNotBlank() && message.role != "system") {
-                                            add(if (message.translation == null) MessageAction.TRANSLATE else MessageAction.SHOW_ORIGINAL)
-                                        }
-                                        if (message.role != "system" && message.documents.size < MAX_CHAT_DOCUMENTS) add(MessageAction.ATTACH_DOCUMENT)
-                                        if (message.text.isNotBlank() && message.drawing == null) add(MessageAction.DRAW)
-                                        add(MessageAction.EDIT)
-                                        add(if (message.hidden || message.role == "system" && message.toolTurn == null)
-                                            MessageAction.UNHIDE else MessageAction.HIDE)
-                                        if (message.role == "assistant") add(MessageAction.EDIT_REASONING)
-                                        if (message.role == "assistant" && message.variants.size > 1) add(MessageAction.ALTERNATIVES)
-                                        add(MessageAction.DUPLICATE)
-                                        if (index > 0) add(MessageAction.UP)
-                                        if (index < chat.messages.lastIndex) add(MessageAction.DOWN)
-                                        if (!chat.isTemporary) {
-                                            add(MessageAction.BRANCH)
-                                            add(MessageAction.CHECKPOINT)
-                                        }
-                                        if (openCheckpoint != null) add(MessageAction.OPEN_CHECKPOINT)
-                                        if (linkedBranches.isNotEmpty()) add(MessageAction.OPEN_BRANCHES)
-                                        add(MessageAction.DELETE)
-                                    }) { action ->
+                                    actions = messageActionsFor(
+                                        message = message,
+                                        index = index,
+                                        chat = chat,
+                                        voiceEnabled = state.prefs.voice.enabled,
+                                        hasCheckpoint = openCheckpoint != null,
+                                        hasBranches = linkedBranches.isNotEmpty(),
+                                    )) { action ->
                                     model.stopAuto()
                                     when (action) {
                                         MessageAction.NARRATE -> model.narrate(message)
@@ -525,155 +469,40 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                 }
             }
 
-            Surface(color = MaterialTheme.colorScheme.surfaceContainerLow, tonalElevation = 1.dp) {
-                val selectedMessages = selected
-                if (selectedMessages != null) {
-                    Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("已选 ${selectedMessages.size} 条", Modifier.weight(1f))
-                        TextButton({ selected = null }) { Text("取消") }
-                        Button({ deleting = selectedMessages }, enabled = selectedMessages.isNotEmpty()) { Text("删除") }
-                    }
-                } else {
-                    Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)) {
-                        if (quickButtons.isNotEmpty()) LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(quickButtons, key = { (set, item) -> "${set.id}:${item.id}" }) { (set, item) ->
-                                AssistChip(
-                                    onClick = { if (model.runQuickReply(set, item, draft)) keyboard?.hide() },
-                                    enabled = !busy && dictation == null,
-                                    label = { Text(item.label) },
-                                )
-                            }
-                        }
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("以 ${state.persona.name} 发言", Modifier.weight(1f), style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            if (group != null) FilterChip(selected = auto, onClick = model::toggleAuto,
-                                enabled = auto || (!busy && dictation == null && configured && group.participants(state.cards).isNotEmpty()),
-                                label = { Text(if (auto) "关闭自动发言" else "自动发言") })
-                        }
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            IconButton({ pickImages.launch(arrayOf("image/*")) }, enabled = !busy && dictation == null && attachedImages.size < MAX_CHAT_IMAGES) {
-                                Icon(Icons.Outlined.AddPhotoAlternate, "添加图片")
-                            }
-                            IconButton({ pickDocumentsForMessage = null; pickDocuments.launch(arrayOf("*/*")) },
-                                enabled = !busy && dictation == null && attachedDocuments.size < MAX_CHAT_DOCUMENTS) {
-                                Icon(Icons.Outlined.AttachFile, "添加文档")
-                            }
-                            IconButton({ keyboard?.hide(); animeDrawing = true }, enabled = !busy && dictation == null) {
-                                Icon(Icons.Outlined.AutoAwesome, "生成图片")
-                            }
-                            if (state.prefs.voice.dictationEnabled) DictationButton(state.prefs.voice, !busy,
-                                pausedPlayback = { model.stopAuto(); model.stopNarration(); keyboard?.hide() },
-                                onTranscript = { recognized ->
-                                    val result = state.prefs.voice.dictated(recognized, draft)
-                                    if (result.send && model.send(result.text, interpretCommands = result.shortcut)) {
-                                        draft = ""
-                                        draftSelection = TextRange.Zero
-                                    } else {
-                                        draft = result.text
-                                        draftSelection = TextRange(result.text.length)
-                                    }
-                                }, onError = model::notice, onProgress = { dictation = it })
-                            Spacer(Modifier.weight(1f))
-                            if (state.speaking) TextButton(model::stopNarration) {
-                                Icon(Icons.Outlined.Stop, null)
-                                Text("停止朗读")
-                            }
-                        }
-                        dictation?.let { progress ->
-                            Text(progress.partial.ifBlank { if (progress.finishing) "正在转写…" else "正在听…" },
-                                color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall,
-                                modifier = Modifier.padding(bottom = 8.dp), maxLines = 3, overflow = TextOverflow.Ellipsis)
-                        }
-                        if (attachedImages.isNotEmpty() || attachedDocuments.isNotEmpty()) LazyRow(Modifier.padding(bottom = 8.dp),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                            items(attachedImages, key = { "image:${it.id}" }) { image ->
-                                DraftImageTile(image, model.imageFile(image), !busy, { previewImage = CaptionImageTarget(image) },
-                                    { model.removeDraftImage(chat.id, image) })
-                            }
-                            items(attachedDocuments, key = { "document:${it.id}" }) { document ->
-                                ChatDocumentChip(document, { previewDocument = OpenChatDocument(document, null) },
-                                    { model.removeDraftDocument(chat.id, document) }, !busy)
-                            }
-                        }
-                        if (state.generatingImage) {
-                            LinearProgressIndicator(Modifier.fillMaxWidth())
-                            Text("正在生成图片…", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(vertical = 4.dp))
-                        }
-                        (state.utility ?: state.toolProgress?.takeUnless { state.generatingImage })?.let {
-                            LinearProgressIndicator(Modifier.fillMaxWidth())
-                            Text(it, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(vertical = 4.dp))
-                        }
-                        val input = generation?.text?.takeIf { impersonating && it.isNotBlank() } ?: draft
-                        val safeSelection = TextRange(
-                            draftSelection.start.coerceIn(0, input.length),
-                            draftSelection.end.coerceIn(0, input.length),
-                        )
-                        val readOnlyInput = impersonating || state.scriptRunning || state.utility != null
-                        val activeQuickItems = remember(quickConfig, chat) {
-                            if (!quickConfig.enabled) emptyList() else quickConfig.selected(chat).flatMap { it.items }
-                        }
-                        val autoQuery = remember(input, safeSelection, readOnlyInput) {
-                            if (readOnlyInput) null else detectAutocomplete(input, safeSelection.start)
-                        }
-                        val suggestions = remember(autoQuery, activeQuickItems, chat.options.variables, state.prefs.scriptVariables) {
-                            autoQuery?.let {
-                                suggestAutocomplete(it, activeQuickItems, chat.options.variables, state.prefs.scriptVariables)
-                            }.orEmpty()
-                        }
-                        if (suggestions.isNotEmpty() && autoQuery != null) {
-                            AutocompleteStrip(suggestions) { item ->
-                                val (updated, nextCursor) = applyAutocomplete(draft, autoQuery, item)
-                                draft = updated
-                                draftSelection = TextRange(nextCursor)
-                                model.stopAuto()
-                            }
-                        }
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedTextField(
-                                value = TextFieldValue(input, safeSelection),
-                                onValueChange = { updated ->
-                                    if (!readOnlyInput) {
-                                        draft = updated.text
-                                        draftSelection = updated.selection
-                                        model.stopAuto()
-                                    }
-                                },
-                                modifier = Modifier.weight(1f),
-                                readOnly = readOnlyInput,
-                                placeholder = { Text(if (impersonating) "正在代写…" else "输入消息（/ 命令 · {{ 宏）") },
-                                shape = RoundedCornerShape(24.dp),
-                                maxLines = 5,
-                            )
-                            if (generation != null || state.scriptRunning || state.generatingImage || state.utility != null) {
-                                FilledTonalIconButton(onClick = model::stop, modifier = Modifier.size(48.dp)) {
-                                    Icon(Icons.Outlined.Stop, when {
-                                        state.scriptRunning -> "停止脚本"
-                                        state.generatingImage -> "停止图像生成"
-                                        state.utility != null -> "停止当前操作"
-                                        else -> "停止生成"
-                                    })
-                                }
-                            } else {
-                                FilledIconButton(enabled = (canSend || draft.trimStart().startsWith('/')) && !busy && dictation == null &&
-                                    (draft.isNotBlank() || attachedImages.isNotEmpty() || attachedDocuments.isNotEmpty()),
-                                    modifier = Modifier.size(48.dp),
-                                    onClick = {
-                                        userDetached = false
-                                        if (model.send(draft)) {
-                                            draft = ""
-                                            draftSelection = TextRange.Zero
-                                            keyboard?.hide()
-                                        }
-                                    }) {
-                                    Icon(Icons.AutoMirrored.Outlined.Send, "发送")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            ChatComposerPanel(
+                chat = chat,
+                state = state,
+                model = model,
+                keyboard = keyboard,
+                selected = selected,
+                busy = busy,
+                group = group,
+                auto = auto,
+                configured = configured,
+                canSend = canSend,
+                generation = generation,
+                impersonating = impersonating,
+                quickConfig = quickConfig,
+                quickButtons = quickButtons,
+                attachedImages = attachedImages,
+                attachedDocuments = attachedDocuments,
+                dictation = dictation,
+                draft = draft,
+                draftSelection = draftSelection,
+                onDraftChange = { nextDraft, nextSel ->
+                    draft = nextDraft
+                    draftSelection = nextSel
+                },
+                onClearSelection = { selected = null },
+                onRequestDeleteSelected = { deleting = it },
+                onPickImages = { pickImages.launch(arrayOf("image/*")) },
+                onPickDocuments = { pickDocumentsForMessage = null; pickDocuments.launch(arrayOf("*/*")) },
+                onOpenDrawing = { keyboard?.hide(); animeDrawing = true },
+                onDictationProgress = { dictation = it },
+                onPreviewImage = { previewImage = CaptionImageTarget(it) },
+                onPreviewDocument = { previewDocument = OpenChatDocument(it, null) },
+                onBeforeSend = { userDetached = false },
+            )
         }
     }
 
@@ -712,21 +541,7 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
     if (translationTools) TranslationDialog(chat, state, model) { translationTools = false }
     if (memoryTools) MemoryDialog(chat, state, model) { memoryTools = false }
     if (sharedMemoryPanel) {
-        val activeCard = state.card ?: members.firstOrNull()
-        val activeWorld = activeCard?.let { chat.memoryWorld(it, state.books) }
-        SharedWorldMemoryDialog(
-            world = activeWorld,
-            card = activeCard,
-            recall = state.lastSharedMemory,
-            busy = busy,
-            dismiss = { sharedMemoryPanel = false },
-            refresh = { if (activeWorld != null && activeCard != null) model.inspectSharedWorldMemory(activeWorld, activeCard, chat) },
-            pinItem = { w, c, m -> model.pinSharedMemory(w, c, m) },
-            unpinItem = { w, c, id -> model.unpinSharedMemory(w, c, id) },
-            editItem = { w, c, key, txt -> model.editSharedMemory(w, c, key, txt) },
-            blockItem = { w, c, key, blk -> model.blockSharedMemory(w, c, key, blk) },
-            promoteItem = { w, c, txt, src -> model.promoteSharedMemoryToLore(w, c, txt, src) },
-        )
+        ChatSharedMemorySheet(state, chat, members, busy, model) { sharedMemoryPanel = false }
     }
     if (vectorTools) VectorIndexDialog(state, model, { vectorTools = false }, configure)
     if (dataBank) DataBankDialog(state, model, close = { dataBank = false }, configure = { dataBank = false; configure() })
@@ -748,18 +563,11 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
     if (quickPicker) ChatQuickReplySets(state, model) { quickPicker = false }
 
     if (speakerPicker) {
-        AlertDialog(onDismissRequest = { speakerPicker = false }, title = { Text("选择发言成员") },
-            text = {
-                LazyColumn(Modifier.heightIn(max = 320.dp)) {
-                    items(members, key = Card::id) { member ->
-                        TextButton(onClick = {
-                            speakerPicker = false
-                            keyboard?.hide()
-                            model.speakAs(member)
-                        }, modifier = Modifier.fillMaxWidth()) { Text(member.name, Modifier.weight(1f)) }
-                    }
-                }
-            }, confirmButton = { TextButton({ speakerPicker = false }) { Text("关闭") } })
+        ChatSpeakerPickerDialog(members, dismiss = { speakerPicker = false }) { member ->
+            speakerPicker = false
+            keyboard?.hide()
+            model.speakAs(member)
+        }
     }
 
     if (personaPicker) ChatPersonaDialog(state, model) { personaPicker = false }
@@ -824,311 +632,9 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
     branches?.let { index ->
         val chats = chat.messages.getOrNull(index)?.branches.orEmpty().mapNotNull { it.resolve(state.history) }
             .filter { it.id != chat.id }.distinctBy(ChatSummary::id)
-        AlertDialog(onDismissRequest = { branches = null }, title = { Text("消息分支") },
-            text = {
-                LazyColumn(Modifier.heightIn(max = 320.dp)) {
-                    items(chats, key = ChatSummary::id) { entry ->
-                        TextButton({ branches = null; model.openChat(entry.id) }) { Text(entry.title) }
-                    }
-                }
-            }, confirmButton = { TextButton({ branches = null }) { Text("关闭") } })
-    }
-}
-
-@Composable
-private fun ChatPromptOverridesDialog(options: ConversationOptions, busy: Boolean, close: () -> Unit,
-                                      save: (String, String, String) -> Unit) {
-    var scenario by rememberSaveable { mutableStateOf(options.scenario) }
-    var examples by rememberSaveable { mutableStateOf(options.exampleOverride) }
-    var system by rememberSaveable { mutableStateOf(options.systemPromptOverride) }
-    AlertDialog(onDismissRequest = { if (!busy) close() }, title = { Text("场景与提示覆盖") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("留空使用角色卡的设置。")
-                OutlinedTextField(scenario, { scenario = it }, Modifier.fillMaxWidth(), label = { Text("场景") },
-                    enabled = !busy, minLines = 2, maxLines = 4)
-                OutlinedTextField(examples, { examples = it }, Modifier.fillMaxWidth(), label = { Text("对话示例") },
-                    enabled = !busy, minLines = 2, maxLines = 4)
-                OutlinedTextField(system, { system = it }, Modifier.fillMaxWidth(), label = { Text("系统提示") },
-                    enabled = !busy, minLines = 2, maxLines = 4)
-            }
-        },
-        dismissButton = { TextButton(close, enabled = !busy) { Text("取消") } },
-        confirmButton = { Button({ save(scenario, examples, system) }, enabled = !busy) { Text("保存") } },
-    )
-}
-
-@Composable
-private fun ChatSearch(query: String, change: (String) -> Unit, count: Int, position: Int,
-                       navigate: (Int) -> Unit, close: () -> Unit) {
-    Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
-            OutlinedTextField(query, change, Modifier.fillMaxWidth(), singleLine = true,
-                label = { Text("搜索消息或发言者") },
-                trailingIcon = { ActionIcon(Icons.Outlined.Close, "关闭搜索", action = close) })
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(if (count == 0) "0 条匹配" else "${position + 1} / $count", Modifier.weight(1f),
-                    style = MaterialTheme.typography.labelMedium)
-                ActionIcon(Icons.Outlined.KeyboardArrowUp, "上一条匹配", position > 0) { navigate(position - 1) }
-                ActionIcon(Icons.Outlined.KeyboardArrowDown, "下一条匹配", position < count - 1) { navigate(position + 1) }
-            }
+        ChatBranchesDialog(chats, dismiss = { branches = null }) { id ->
+            branches = null
+            model.openChat(id)
         }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun ChatModelPicker(
-    state: TavernState,
-    chat: Chat,
-    dismiss: () -> Unit,
-    refresh: (Provider) -> Unit,
-    selectProfile: (String?) -> Unit,
-    select: (ModelSelection?) -> Unit,
-) {
-    var query by rememberSaveable { mutableStateOf("") }
-    val active = state.prefs.connectionFor(chat)
-    val default = state.prefs.connectionFor()
-    val activeProfile = state.prefs.activeProfile(chat)
-    val profiles = state.prefs.connectionProfiles
-    val providers = state.prefs.providers.filter { it.ready }
-    ModalBottomSheet(onDismissRequest = dismiss) {
-        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 540.dp),
-            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 24.dp)) {
-            item {
-                Text("切换此对话的模型", style = MaterialTheme.typography.titleLarge)
-                if (profiles.isNotEmpty()) {
-                    Text(
-                        "连接配置档案",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 8.dp, bottom = 4.dp),
-                    )
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (chat.options.connectionProfileId != null) {
-                            item(key = "profile:clear") {
-                                FilterChip(
-                                    selected = false,
-                                    onClick = { selectProfile(null) },
-                                    enabled = !state.busy,
-                                    label = { Text("恢复默认档案") },
-                                )
-                            }
-                        }
-                        items(profiles, key = ConnectionProfile::id) { profile ->
-                            val isSelected = activeProfile?.id == profile.id && chat.modelOverride == null
-                            FilterChip(
-                                selected = isSelected,
-                                onClick = { selectProfile(profile.id) },
-                                enabled = !state.busy,
-                                label = { Text(profile.name) },
-                            )
-                        }
-                    }
-                }
-                Field("搜索提供商或模型", query, { query = it })
-                if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                if (chat.modelOverride != null && default != null) {
-                    TextButton({ select(null) }, enabled = !state.busy) {
-                        Text("使用默认模型 · ${default.model}")
-                    }
-                }
-            }
-            providers.forEach { provider ->
-                val options = provider.choices.filter { it.contains(query.trim(), true) || provider.name.contains(query.trim(), true) }
-                if (options.isEmpty()) return@forEach
-                item(key = "provider:${provider.id}") {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text(provider.name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
-                        ActionIcon(Icons.Outlined.Refresh, "刷新 ${provider.name} 模型", !state.busy) { refresh(provider) }
-                    }
-                }
-                items(options, key = { "model:${provider.id}:$it" }) { candidate ->
-                    val selected = active?.provider?.id == provider.id && active.model == candidate
-                    TextButton({ select(ModelSelection(provider.id, candidate)) },
-                        enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
-                        Text(candidate, Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
-                        if (selected) Icon(Icons.Outlined.Check, "当前模型")
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun TextDialog(
-    title: String, label: String, initial: String, dismiss: () -> Unit, lines: Int = 1,
-    allowBlank: Boolean = false, save: (String) -> Unit,
-) {
-    var text by rememberSaveable { mutableStateOf(initial) }
-    AlertDialog(onDismissRequest = dismiss, title = { Text(title) },
-        text = { Field(label, text, { text = it }, lines = lines) },
-        dismissButton = { TextButton(dismiss) { Text("取消") } },
-        confirmButton = { TextButton({ save(text) }, enabled = allowBlank || text.isNotBlank()) { Text("保存") } })
-}
-
-private enum class MessageAction(val label: String, val icon: ImageVector) {
-    NARRATE("朗读", Icons.AutoMirrored.Outlined.VolumeUp),
-    TRANSLATE("翻译消息", Icons.Outlined.Translate), SHOW_ORIGINAL("显示原文", Icons.Outlined.Translate),
-    ATTACH_DOCUMENT("为消息附加文档", Icons.Outlined.AttachFile),
-    DRAW("用这条消息生成图片", Icons.Outlined.Brush),
-    EDIT("编辑", Icons.Outlined.Edit), EDIT_REASONING("编辑推理", Icons.Outlined.EditNote),
-    HIDE("从模型上下文隐藏", Icons.Outlined.VisibilityOff),
-    UNHIDE("加入模型上下文", Icons.Outlined.Visibility),
-    DUPLICATE("在下方复制一条", Icons.Outlined.Add),
-    UP("上移", Icons.Outlined.ArrowUpward), DOWN("下移", Icons.Outlined.ArrowDownward),
-    BRANCH("从这里创建分支", Icons.AutoMirrored.Outlined.CallSplit), CHECKPOINT("保存检查点", Icons.Outlined.Flag),
-    OPEN_CHECKPOINT("打开检查点", Icons.Outlined.BookmarkBorder), OPEN_BRANCHES("查看已有分支", Icons.Outlined.AccountTree),
-    ALTERNATIVES("查看备选回复", Icons.Outlined.CompareArrows),
-    DELETE("删除", Icons.Outlined.Delete),
-}
-
-@Composable
-private fun ChatBubble(
-    message: Message, enabled: Boolean = false, swipe: (Int) -> Unit = {}, avatar: File? = null,
-    openAlternatives: (() -> Unit)? = null,
-    generateAlternative: (() -> Unit)? = null, actions: List<MessageAction> = emptyList(), highlighted: Boolean = false,
-    regex: RegexRuntime = RegexRuntime.EMPTY, depth: Int? = null,
-    appearance: ChatAppearance = ChatAppearance(),
-    imageFile: ((ChatImage) -> File)? = null, previewImage: (ChatImage) -> Unit = {},
-    previewDocument: (ChatDocument) -> Unit = {},
-    previousDrawing: (() -> Unit)? = null, nextDrawing: (() -> Unit)? = null,
-    onAction: (MessageAction) -> Unit = {},
-) {
-    val mine = message.role == "user"
-    val documentMode = appearance.layoutMode == ChatLayoutMode.DOCUMENT
-    val clipboard = LocalClipboard.current
-    val scope = rememberCoroutineScope()
-    var menu by remember { mutableStateOf(false) }
-    val scheme = MaterialTheme.colorScheme
-    val background = when {
-        documentMode && mine -> scheme.primaryContainer.copy(alpha = 0.55f)
-        documentMode -> scheme.surfaceContainerLow
-        mine -> scheme.primaryContainer
-        else -> scheme.surfaceContainer
-    }
-    val foreground = if (mine) scheme.onPrimaryContainer else scheme.onSurface
-    val shape = when {
-        documentMode -> RoundedCornerShape(14.dp)
-        mine -> RoundedCornerShape(22.dp, 22.dp, 6.dp, 22.dp)
-        else -> RoundedCornerShape(22.dp, 22.dp, 22.dp, 6.dp)
-    }
-    val display = regexDisplay(message.displayText, message.regexSite, regex, depth)
-    val reasoning = regexDisplay(message.reasoning.orEmpty(), RegexSite.REASONING, regex, depth)
-    var openReasoning by rememberSaveable { mutableStateOf(false) }
-    var openTools by rememberSaveable { mutableStateOf(false) }
-
-    BoxWithConstraints(
-        Modifier.fillMaxWidth(),
-        contentAlignment = if (documentMode || !mine) Alignment.TopStart else Alignment.TopEnd,
-    ) {
-        val cardModifier = if (documentMode) Modifier.fillMaxWidth()
-        else Modifier.widthIn(max = minOf(maxWidth * 0.91f, 640.dp))
-        Surface(shape = shape, color = background, contentColor = foreground,
-            border = when {
-                highlighted -> BorderStroke(2.dp, scheme.primary)
-                documentMode -> BorderStroke(1.dp, scheme.outlineVariant.copy(alpha = 0.6f))
-                else -> null
-            },
-            modifier = cardModifier) {
-            Column(Modifier.padding(start = 15.dp, end = 13.dp, top = 6.dp, bottom = 13.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    if (avatar != null) AvatarBadge(message.name, avatar, 28.dp, true)
-                    Text(message.name.ifBlank { if (message.role == "system") "系统" else if (mine) "我" else "角色" },
-                        style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false).padding(top = 6.dp, bottom = 6.dp))
-                    if (actions.isNotEmpty()) {
-                        Box {
-                            ActionIcon(Icons.Outlined.MoreHoriz, "消息操作", enabled) { menu = true }
-                            DropdownMenu(menu, onDismissRequest = { menu = false }) {
-                                MenuItem("复制", Icons.Outlined.ContentCopy) {
-                                    menu = false
-                                    scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("消息", display.orEmpty()))) }
-                                }
-                                actions.forEach { action ->
-                                    MenuItem(action.label, action.icon) { menu = false; onAction(action) }
-                                }
-                            }
-                        }
-                    }
-                }
-                if (!reasoning.isNullOrBlank()) {
-                    TextButton({ openReasoning = !openReasoning }) { Text(if (openReasoning) "收起推理" else "查看推理") }
-                    if (openReasoning) SelectionContainer {
-                        Text(reasoning, style = MaterialTheme.typography.bodyMedium, color = scheme.onSurfaceVariant)
-                    }
-                }
-                if (message.hidden) Text("已从模型上下文隐藏", style = MaterialTheme.typography.labelSmall,
-                    color = scheme.onSurfaceVariant)
-                if (display?.isEmpty() == true && reasoning.isNullOrBlank() && message.displayImages.isEmpty() && message.documents.isEmpty()) {
-                    Text("（空消息）", style = MaterialTheme.typography.bodyMedium)
-                } else if (!display.isNullOrEmpty()) {
-                    RichMessageContent(display, appearance, textColor = foreground)
-                }
-                message.toolTurn?.let { turn ->
-                    TextButton({ openTools = !openTools }) { Text(if (openTools) "收起调用详情" else "查看调用详情") }
-                    if (openTools) SelectionContainer {
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            if (turn.content.isNotBlank()) Text(turn.content, style = MaterialTheme.typography.bodyMedium)
-                            turn.invocations.forEach { invocation ->
-                                Text(invocation.label, style = MaterialTheme.typography.labelLarge)
-                                if (invocation.call.arguments.isNotBlank())
-                                    Text(invocation.call.arguments, style = MaterialTheme.typography.bodySmall)
-                                Text(invocation.result, style = MaterialTheme.typography.bodySmall,
-                                    color = if (invocation.failed) scheme.error else scheme.onSurfaceVariant)
-                            }
-                        }
-                    }
-                }
-                if (imageFile != null) message.displayImages.forEach { image ->
-                    MessageImage(image, imageFile(image)) { previewImage(image) }
-                    message.captionFor(image)?.let { caption ->
-                        Text(caption, style = MaterialTheme.typography.bodySmall, maxLines = 4, overflow = TextOverflow.Ellipsis)
-                    }
-                }
-                val drawing = message.drawing
-                if (drawing != null && previousDrawing != null && nextDrawing != null) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        val hasNext = drawing.selected < drawing.images.lastIndex
-                        ActionIcon(Icons.Outlined.ChevronLeft, "上一张备选图片", enabled && drawing.selected > 0, previousDrawing)
-                        Text("${drawing.selected + 1} / ${drawing.images.size}", style = MaterialTheme.typography.labelMedium)
-                        ActionIcon(Icons.Outlined.ChevronRight, if (hasNext) "下一张备选图片" else "生成备选图片", enabled, nextDrawing)
-                    }
-                }
-                if (message.documents.isNotEmpty()) Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                    message.documents.forEach { document -> ChatDocumentChip(document, { previewDocument(document) }) }
-                }
-                if (message.variants.size > 1 || generateAlternative != null) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        ActionIcon(Icons.Outlined.ChevronLeft, "上一条备选回复", enabled && message.index > 0) {
-                            swipe(message.index - 1)
-                        }
-                        val count = "${message.index + 1} / ${maxOf(message.variants.size, 1)}"
-                        if (openAlternatives != null && message.variants.size > 1) {
-                            TextButton(openAlternatives, enabled = enabled) { Text(count) }
-                        } else Text(count, style = MaterialTheme.typography.labelMedium)
-                        val savedNext = message.index < message.variants.lastIndex
-                        ActionIcon(Icons.Outlined.ChevronRight, if (savedNext) "下一条备选回复" else "生成备选回复",
-                            enabled && (savedNext || generateAlternative != null)) {
-                            if (savedNext) swipe(message.index + 1) else generateAlternative?.invoke()
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun regexDisplay(text: String, site: RegexSite?, rules: RegexRuntime, depth: Int?): String? {
-    if (text.isEmpty() || site == null || !rules.applies(site, RegexStage.DISPLAY)) return text
-    return key(text, site, rules, depth) {
-        val rendered by produceState<String?>(null) {
-            value = withContext(Dispatchers.Default) { rules.transform(text, site, RegexStage.DISPLAY, depth) }
-        }
-        rendered
     }
 }
