@@ -1,0 +1,16 @@
+.gradle/
+.kotlin/
+**/build/
+local.properties
+*.jks
+*.keystore
+*.p12
+*.pk8
+*.log
+engine/bundle/
+dist/*.apk
+dist/*.idsig
+dist/*.onnx
+dist/*.zip
+.idea/
+*.iml
