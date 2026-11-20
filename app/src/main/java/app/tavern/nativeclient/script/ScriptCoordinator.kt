@@ -116,6 +116,21 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
             host.media::scriptExpression,
             ::scriptCaption,
             host::persistMacroVariables,
+            { book ->
+                withContext(Dispatchers.IO) { host.store.save(book) }
+                val books = withContext(Dispatchers.IO) { host.store.books() }
+                host.mutable.update { it.copy(books = books) }
+            },
+            { global ->
+                val state = host.current
+                val changes = if (global) {
+                    MacroVariableChanges(global = state.prefs.scriptVariables.keys.associateWith { null })
+                } else {
+                    MacroVariableChanges(local = state.chat?.options?.variables.orEmpty().keys.associateWith { null })
+                }
+                if (!changes.isEmpty) host.persistMacroVariables(state.chat?.id, changes)
+            },
+            { chat -> withContext(Dispatchers.IO) { host.store.gallery(chat.cardId, chat.groupId) } },
         ) { host.notice(it) }
 
     private suspend fun scriptCaption(named: Map<String, String>, prompt: String): String {
@@ -299,6 +314,7 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
                     "google", "gemini" -> ImageProtocol.GEMINI
                     "openai", "compatible" -> ImageProtocol.COMPATIBLE
                     "auto", "automatic1111", "sd", "forge" -> ImageProtocol.DIFFUSION
+                    "novelai", "nai" -> ImageProtocol.NOVELAI
                     "comfy", "comfyui" -> ImageProtocol.COMFY
                     "comfyrunpod", "runpod" -> ImageProtocol.COMFY_RUNPOD
                     else -> null

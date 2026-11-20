@@ -501,6 +501,8 @@ internal data class Preferences(
     val chatAppearance: ChatAppearance = ChatAppearance(),
     val connectionProfiles: List<ConnectionProfile> = emptyList(),
     val activeProfileId: String? = null,
+    val sync: app.tavern.nativeclient.backup.SyncSettings = app.tavern.nativeclient.backup.SyncSettings(),
+    val cardScriptsEnabled: Boolean = false,
 ) {
     fun personaFor(chat: Chat? = null, subjectId: String? = chat?.cardId ?: chat?.groupId,
                    temporaryId: String? = null): PersonaProfile =

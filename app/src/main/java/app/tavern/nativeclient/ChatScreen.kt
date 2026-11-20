@@ -157,6 +157,13 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
     val showStage = visualNovel && !historyExpanded && selected == null && !searchOpen && !keyboardVisible
     val appearance = state.prefs.chatAppearance
     val activePreset = state.presetFor(chat)
+    val mvuComputation = remember(messages, chat.options.variables) {
+        app.tavern.nativeclient.script.MvuEngine.recomputeMvuState(
+            messages = messages,
+            initial = app.tavern.nativeclient.script.MvuEngine.initialStateFrom(chat.options.variables),
+        )
+    }
+    val mvuStateJson = remember(mvuComputation) { mvuComputation.statData.toString() }
     var tokenEstimate by remember { mutableStateOf<ContextUsageEstimate?>(null) }
     LaunchedEffect(
         chat,
@@ -381,7 +388,11 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                                     ChatBubble(message, avatar = avatar, regex = regex, depth = depths[index],
                                         appearance = appearance,
                                         imageFile = model::imageFile, previewImage = { previewImage = CaptionImageTarget(it, index) },
-                                        previewDocument = { previewDocument = OpenChatDocument(it, index) })
+                                        previewDocument = { previewDocument = OpenChatDocument(it, index) },
+                                        cardScriptsEnabled = state.prefs.cardScriptsEnabled,
+                                        mvuDeltas = mvuComputation.messageDeltas[index].orEmpty(),
+                                        mvuStateJson = mvuStateJson,
+                                        onRunScript = { model.runScript(it) })
                                 }
                             } else {
                                 ChatBubble(message, enabled = !busy, swipe = { model.swipe(chat, index, it) }, avatar = avatar,
@@ -392,6 +403,10 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                                     previewDocument = { previewDocument = OpenChatDocument(it, index) },
                                     previousDrawing = { model.previousDrawing(chat.id, index) },
                                     nextDrawing = { model.nextDrawing(chat.id, index) },
+                                    cardScriptsEnabled = state.prefs.cardScriptsEnabled,
+                                    mvuDeltas = mvuComputation.messageDeltas[index].orEmpty(),
+                                    mvuStateJson = mvuStateJson,
+                                    onRunScript = { model.runScript(it) },
                                     highlighted = searchOpen && currentMatch == index,
                                     generateAlternative = if (index == chat.messages.lastIndex && canContinue) model::nextAlternative else null,
                                     actions = messageActionsFor(

@@ -17,6 +17,12 @@ internal class ConversationMacros(
     val variables: MacroVariables = MacroVariables(options.variables, globals),
 ) {
     private val now = ZonedDateTime.now()
+    private val mvuState by lazy {
+        app.tavern.nativeclient.script.MvuEngine.recomputeMvuState(
+            messages = history,
+            initial = app.tavern.nativeclient.script.MvuEngine.initialStateFrom(options.variables),
+        )
+    }
     private val eligible by lazy { history.indices.filter { allowHidden || !history[it].excludedFromContext } }
     private val last by lazy { eligible.lastOrNull()?.let(history::get) }
     private fun recent(role: String) = eligible.asReversed().firstOrNull { history[it].role == role }?.let(history::get)
@@ -75,6 +81,9 @@ internal class ConversationMacros(
             "currentswipeid" -> last?.takeIf { it.variants.isNotEmpty() }?.let { (it.index + 1).toString() }.orEmpty()
             "lastswipeid" -> last?.variants?.size?.takeIf { it > 0 }?.toString().orEmpty()
             "summary" -> history.currentSummary()?.summary?.text.orEmpty()
+            "get_message_variable" -> if (key.isBlank()) mvuState.statData.toString()
+                else app.tavern.nativeclient.script.MvuEngine.readPath(mvuState.statData, key).orEmpty()
+            "stat_data" -> mvuState.statData.toString()
             "model" -> model
             "lastgenerationtype" -> trigger
             "ismobile" -> "true"

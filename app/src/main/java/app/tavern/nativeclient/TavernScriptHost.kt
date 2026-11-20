@@ -26,6 +26,9 @@ internal class TavernScriptHost(
     private val expression: suspend (String, Map<String, String>, String) -> String = { _, _, _ -> "" },
     private val caption: suspend (Map<String, String>, String) -> String = { _, _ -> "" },
     private val saveVariables: suspend (String?, MacroVariableChanges) -> Unit,
+    private val saveBook: suspend (WorldBook) -> Unit = { error("当前脚本环境不支持修改世界书") },
+    private val clearVariables: suspend (Boolean) -> Unit = {},
+    private val galleryImages: suspend (Chat) -> List<GalleryImage> = { emptyList() },
     private val notice: (String) -> Unit,
 ) : StScriptHost {
     private val state get() = snapshot()
@@ -158,7 +161,19 @@ internal class TavernScriptHost(
             val databaseCommand = name.removePrefix("data-bank-").removePrefix("databank-").removePrefix("db-")
             if (databaseCommand != name && databaseCommand in setOf("list", "get", "add", "update", "delete", "enable", "disable")) {
                 dataBank("db-$databaseCommand", named, text)
-            } else null
+            } else {
+                app.tavern.nativeclient.script.ScriptExtensions.execute(
+                    name = name,
+                    named = named,
+                    text = text,
+                    state = state,
+                    saveChat = saveChat,
+                    savePrefs = savePrefs,
+                    saveBook = saveBook,
+                    clearVariables = clearVariables,
+                    galleryImages = galleryImages,
+                )
+            }
         }
     }
 
@@ -187,14 +202,15 @@ internal class TavernScriptHost(
     }
 
     companion object {
-        const val HELP = "/pass · /let · /var · /getvar · /setvar · /addvar · /if · /while · /times · /break · /run · " +
-            "/echo · /input · /buttons · /send · /sendas · /sys · /comment · /trigger · /gen · /regex · /setinput · /speak · /translate · /summarize · /db · /sd · /caption · /show-gallery · " +
+        const val HELP = "/pass · /let · /var · /getvar · /setvar · /addvar · /listvar · /flushvar · /flushglobalvar · /if · /while · /times · /break · /run · " +
+            "/echo · /input · /buttons · /send · /sendas · /sys · /comment · /trigger · /gen · /regex · /re-replace · /trimtokens · /setinput · /speak · /translate · /summarize · /db · /sd · /caption · /show-gallery · /bg · /preset · /char-get · " +
+            "/wi-get-book · /wi-list-entries · /wi-get-entry · /wi-set-entry · /wi-create-entry · /wi-delete-entry · " +
             "/tools-register · /tools-list · /tools-invoke · /tools-unregister · /messages · /message-role · /message-name · " +
-            "/hide · /unhide · /cut · /del · /delname · /addswipe · /delswipe · /swipe · /reroll-pick · /? macros"
+            "/hide · /unhide · /cut · /del · /delname · /addswipe · /delswipe · /swipe · /model · /profile · /reroll-pick · /? macros"
         const val MACRO_HELP = "{{char}} · {{user}} · {{persona}} · {{group}} · {{groupNotMuted}} · {{description}} · " +
             "{{scenario}} · {{charFirstMessage::1}} · {{model}} · {{lastUserMessage}} · {{summary}} · {{getvar::name}} · " +
             "{{setvar::name::值}} · {{incvar::计数}} · {{.name ??= 值}} · {{getglobalvar::name}} · " +
-            "{{random::甲::乙}} · {{pick::甲::乙}} · {{roll::2d6+1}} · {{isodate}} · " +
+            "{{get_message_variable::路径}} · {{stat_data}} · {{random::甲::乙}} · {{pick::甲::乙}} · {{roll::2d6+1}} · {{isodate}} · " +
             "{{newline}} · {{trim}} · {{outlet::名称}}。支持嵌套参数与 {{if .变量}}、{{else}}、{{/if}}。"
     }
 }

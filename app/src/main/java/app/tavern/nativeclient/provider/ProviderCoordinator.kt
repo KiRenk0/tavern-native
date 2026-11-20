@@ -22,6 +22,10 @@ internal class ProviderCoordinator(private val host: CoordinatorHost) {
         host.persistPreferences(host.current.prefs.copy(visualNovel = enabled))
     }
 
+    fun setCardScriptsEnabled(enabled: Boolean) = host.work {
+        host.persistPreferences(host.current.prefs.copy(cardScriptsEnabled = enabled))
+    }
+
     fun setChatAppearance(appearance: ChatAppearance) = host.work {
         host.persistPreferences(host.current.prefs.copy(chatAppearance = appearance.clamped()))
     }

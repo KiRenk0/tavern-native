@@ -14,6 +14,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import app.tavern.nativeclient.media.curatedEdgeVoices
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import org.json.JSONObject
@@ -32,6 +33,7 @@ internal fun VoiceSettings(state: TavernState, model: TavernViewModel, close: ()
     val providers = state.prefs.providers.filter { it.template == null }
     val people = listOf("" to "使用默认音色") + state.cards.map { "character:${it.id}" to "角色 · ${it.name}" } +
         state.prefs.personas.map { "persona:${it.id}" to "人设 · ${it.name}" }
+    val activeTts = options.activeBackend
     val shortcutPairs = shortcutRows.lineSequence().map(String::trim).filter(String::isNotBlank).map { line ->
         line.substringBefore('=', "").trim() to line.substringAfter('=', "").trim()
     }.toList()
@@ -45,23 +47,70 @@ internal fun VoiceSettings(state: TavernState, model: TavernViewModel, close: ()
         GroupToggle("启用朗读", options.enabled, enabled) { options = options.copy(enabled = it) }
         GroupToggle("自动朗读新回复", options.automatic, enabled && options.enabled) { options = options.copy(automatic = it) }
         GroupToggle("也朗读我发送的消息", options.includeUser, enabled && options.enabled && options.automatic) { options = options.copy(includeUser = it) }
-        SelectField("朗读引擎", options.backendId, listOf("") + providers.map(Provider::id), {
-            if (it.isBlank()) "Android 系统朗读" else providers.firstOrNull { provider -> provider.id == it }?.name ?: "服务已删除"
-        }, enabled) { options = options.copy(backendId = it) }
-        if (options.backendId.isEmpty()) {
-            OutlinedButton({ voiceTarget = "" }, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
-                Text("默认音色 · ${options.systemVoice.ifBlank { "系统默认" }}")
+        SelectField("朗读引擎", activeTts, TtsBackend.entries, TtsBackend::label, enabled) { next ->
+            options = options.copy(
+                ttsBackend = next,
+                backendId = if (next == TtsBackend.OPENAI_COMPAT) options.backendId.ifBlank { providers.firstOrNull()?.id.orEmpty() } else "",
+            )
+        }
+        when (activeTts) {
+            TtsBackend.SYSTEM -> {
+                OutlinedButton({ voiceTarget = "" }, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+                    Text("默认音色 · ${options.systemVoice.ifBlank { "系统默认" }}")
+                }
             }
-        } else {
-            Field("语音模型 ID", options.backendModel, { options = options.copy(backendModel = it) }, enabled = enabled)
-            Field("默认音色 ID", options.backendVoice, { options = options.copy(backendVoice = it) }, enabled = enabled)
-            Text("聊天文本会发送到选定的自定义语音服务。", style = MaterialTheme.typography.bodySmall)
+            TtsBackend.OPENAI_COMPAT -> {
+                SelectField("自定义语音服务", options.backendId, providers.map(Provider::id), {
+                    providers.firstOrNull { provider -> provider.id == it }?.name ?: "请先添加自定义提供商"
+                }, enabled && providers.isNotEmpty()) { options = options.copy(backendId = it) }
+                Field("语音模型 ID", options.backendModel, { options = options.copy(backendModel = it) }, enabled = enabled)
+                Field("默认音色 ID", options.backendVoice, { options = options.copy(backendVoice = it) }, enabled = enabled)
+                Text("聊天文本会发送到选定的 OpenAI 兼容语音服务。", style = MaterialTheme.typography.bodySmall)
+            }
+            TtsBackend.EDGE_TTS -> {
+                SelectField(
+                    "预设神经音色",
+                    options.edgeVoice,
+                    (curatedEdgeVoices.map { it.first } + options.edgeVoice).distinct(),
+                    { id -> curatedEdgeVoices.firstOrNull { it.first == id }?.second ?: id },
+                    enabled,
+                ) { options = options.copy(edgeVoice = it) }
+                Field("自定义音色名称（ShortName）", options.edgeVoice, { options = options.copy(edgeVoice = it) }, enabled = enabled)
+                Text("免 API Key，通过微软 Edge 语音 WebSocket 合成神经语音。", style = MaterialTheme.typography.bodySmall)
+            }
+            TtsBackend.ELEVENLABS -> {
+                Field("API 地址（留空默认官方）", options.ttsEndpoint, { options = options.copy(ttsEndpoint = it) }, enabled = enabled,
+                    placeholder = "https://api.elevenlabs.io")
+                Field("ElevenLabs API Key", options.ttsApiKey, { options = options.copy(ttsApiKey = it) }, secret = true, enabled = enabled)
+                Field("Voice ID", options.elevenLabsVoiceId, { options = options.copy(elevenLabsVoiceId = it) }, enabled = enabled)
+                Field("Model ID", options.elevenLabsModelId, { options = options.copy(elevenLabsModelId = it) }, enabled = enabled)
+            }
+            TtsBackend.FISH_AUDIO -> {
+                Field("API 地址（留空默认官方）", options.ttsEndpoint, { options = options.copy(ttsEndpoint = it) }, enabled = enabled,
+                    placeholder = "https://api.fish.audio")
+                Field("Fish Audio API Key", options.ttsApiKey, { options = options.copy(ttsApiKey = it) }, secret = true, enabled = enabled)
+                Field("Reference ID（音色模型 ID）", options.fishReferenceId, { options = options.copy(fishReferenceId = it) }, enabled = enabled)
+            }
+            TtsBackend.GPT_SOVITS -> {
+                Field("GPT-SoVITS 服务地址", options.ttsEndpoint, { options = options.copy(ttsEndpoint = it) }, enabled = enabled,
+                    placeholder = "http://192.168.1.20:9880")
+                Field("API Key（如无鉴权可留空）", options.ttsApiKey, { options = options.copy(ttsApiKey = it) }, secret = true, enabled = enabled)
+                Field("参考音频路径（ref_audio_path）", options.gptSovitsRefAudio, { options = options.copy(gptSovitsRefAudio = it) }, enabled = enabled)
+                Field("参考文本（prompt_text）", options.gptSovitsPromptText, { options = options.copy(gptSovitsPromptText = it) }, enabled = enabled)
+                Field("参考语言 / 合成语言", "${options.gptSovitsPromptLang}/${options.gptSovitsTextLang}", { pair ->
+                    val parts = pair.split('/', limit = 2)
+                    options = options.copy(
+                        gptSovitsPromptLang = parts.getOrElse(0) { "zh" }.trim(),
+                        gptSovitsTextLang = parts.getOrElse(1) { "auto" }.trim(),
+                    )
+                }, enabled = enabled)
+            }
         }
         if (people.size > 1) {
             SelectField("角色与人设音色", actor, people.map { it.first }, { id -> people.firstOrNull { it.first == id }?.second ?: "使用默认音色" }, enabled) { actor = it }
             if (actor.isNotBlank()) {
-                val override = options.voices["${options.backendId}:$actor"].orEmpty()
-                if (options.backendId.isEmpty()) {
+                val override = options.voices["${options.backendScopeKey}:$actor"].orEmpty()
+                if (activeTts == TtsBackend.SYSTEM) {
                     OutlinedButton({ voiceTarget = actor }, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
                         Text(override.ifBlank { "使用默认音色" })
                     }
@@ -69,16 +118,25 @@ internal fun VoiceSettings(state: TavernState, model: TavernViewModel, close: ()
                     placeholder = "留空使用默认音色")
             }
         }
+        val canPreview = when (activeTts) {
+            TtsBackend.SYSTEM, TtsBackend.EDGE_TTS -> true
+            TtsBackend.OPENAI_COMPAT -> options.backendId.isNotBlank() && options.backendModel.isNotBlank() && options.backendVoice.isNotBlank()
+            TtsBackend.ELEVENLABS -> options.ttsApiKey.isNotBlank() && options.elevenLabsVoiceId.isNotBlank()
+            TtsBackend.FISH_AUDIO -> options.ttsApiKey.isNotBlank()
+            TtsBackend.GPT_SOVITS -> options.ttsEndpoint.isNotBlank() && options.gptSovitsRefAudio.isNotBlank()
+        }
         val playing = state.speaking
         OutlinedButton({
             if (playing) model.stopNarration() else model.previewVoice(options, options.actorVoice(actor.takeIf(String::isNotBlank)), SAMPLE)
-        }, enabled = enabled && (options.backendId.isBlank() || options.backendModel.isNotBlank() && options.backendVoice.isNotBlank())) {
+        }, enabled = enabled && canPreview) {
             Icon(if (playing) Icons.Outlined.Stop else Icons.AutoMirrored.Outlined.VolumeUp, null)
             Spacer(Modifier.width(8.dp))
             Text(if (playing) "停止试听" else "试听选定音色")
         }
         VoiceSlider("语速", options.speed, enabled) { options = options.copy(speed = it) }
-        if (options.backendId.isEmpty()) VoiceSlider("音高", options.pitch, enabled) { options = options.copy(pitch = it) }
+        if (activeTts == TtsBackend.SYSTEM || activeTts == TtsBackend.EDGE_TTS) {
+            VoiceSlider("音高", options.pitch, enabled) { options = options.copy(pitch = it) }
+        }
         GroupToggle("有引号时只读引号中的文字", options.quoteOnly, enabled) { options = options.copy(quoteOnly = it) }
         GroupToggle("跳过星号内的动作描写", options.skipActions, enabled) { options = options.copy(skipActions = it) }
         GroupToggle("跳过代码块", options.skipCode, enabled) { options = options.copy(skipCode = it) }
@@ -88,19 +146,51 @@ internal fun VoiceSettings(state: TavernState, model: TavernViewModel, close: ()
         HorizontalDivider()
         FormHeading("语音输入")
         GroupToggle("显示麦克风按钮", options.dictationEnabled, enabled) { options = options.copy(dictationEnabled = it) }
+        SelectField("识别引擎", options.sttBackend, SttBackend.entries, SttBackend::label, enabled) {
+            options = options.copy(sttBackend = it)
+        }
+        if (options.sttBackend == SttBackend.WHISPER_API) {
+            Field("Whisper 接口基址", options.sttEndpoint, { options = options.copy(sttEndpoint = it) }, enabled = enabled,
+                placeholder = "https://api.openai.com/v1")
+            Field("API Key（本地服务可留空）", options.sttApiKey, { options = options.copy(sttApiKey = it) }, secret = true, enabled = enabled)
+            Field("模型名", options.sttModel, { options = options.copy(sttModel = it) }, enabled = enabled,
+                placeholder = "whisper-1")
+        }
         SelectField("识别结果", options.dictationMode, DictationMode.entries, DictationMode::label, enabled) { options = options.copy(dictationMode = it) }
         Field("识别语言标签（可选）", options.language, { options = options.copy(language = it) },
             placeholder = "留空随系统，例如 zh-CN", enabled = enabled)
-        GroupToggle("仅使用设备上的离线识别", options.requireOffline, enabled) { options = options.copy(requireOffline = it) }
-        Text("系统识别可联网。离线模式需要 Android 12 和已安装的语言包。", style = MaterialTheme.typography.bodySmall)
+        if (options.sttBackend == SttBackend.SYSTEM) {
+            GroupToggle("仅使用设备上的离线识别", options.requireOffline, enabled) { options = options.copy(requireOffline = it) }
+            Text("系统识别可联网。离线模式需要 Android 12 和已安装的语言包。", style = MaterialTheme.typography.bodySmall)
+        }
         Field("语音快捷词（每行一条）", shortcutRows, { shortcutRows = it }, lines = 3, enabled = enabled,
             placeholder = "说出的短语 = 预设文字或斜杠命令")
         if (!shortcutsValid) Text("请用等号分隔短语和替换内容，并避免重复的短语。", color = MaterialTheme.colorScheme.error)
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedButton(::leave, enabled = enabled) { Text("取消") }
-            Button({ model.saveVoice(options.copy(language = options.language.trim(), filter = options.filter.trim(),
-                backendModel = options.backendModel.trim(), backendVoice = options.backendVoice.trim(), shortcuts = shortcutPairs.toMap()), ::leave) },
-                enabled = enabled && shortcutsValid) { Text("保存语音设置") }
+            Button({
+                model.saveVoice(
+                    options.copy(
+                        language = options.language.trim(),
+                        filter = options.filter.trim(),
+                        backendModel = options.backendModel.trim(),
+                        backendVoice = options.backendVoice.trim(),
+                        ttsEndpoint = options.ttsEndpoint.trim(),
+                        ttsApiKey = options.ttsApiKey.trim(),
+                        edgeVoice = options.edgeVoice.trim().ifBlank { "zh-CN-XiaoxiaoNeural" },
+                        elevenLabsVoiceId = options.elevenLabsVoiceId.trim(),
+                        elevenLabsModelId = options.elevenLabsModelId.trim().ifBlank { "eleven_multilingual_v2" },
+                        fishReferenceId = options.fishReferenceId.trim(),
+                        gptSovitsRefAudio = options.gptSovitsRefAudio.trim(),
+                        gptSovitsPromptText = options.gptSovitsPromptText.trim(),
+                        sttEndpoint = options.sttEndpoint.trim(),
+                        sttApiKey = options.sttApiKey.trim(),
+                        sttModel = options.sttModel.trim().ifBlank { "whisper-1" },
+                        shortcuts = shortcutPairs.toMap(),
+                    ),
+                    ::leave,
+                )
+            }, enabled = enabled && shortcutsValid) { Text("保存语音设置") }
         }
     }
     voiceTarget?.let { target ->

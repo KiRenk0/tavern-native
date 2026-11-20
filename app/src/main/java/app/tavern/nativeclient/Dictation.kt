@@ -22,6 +22,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import app.tavern.nativeclient.media.WhisperRecorder
 
 internal data class DictationProgress(val finishing: Boolean = false, val partial: String = "")
 
@@ -119,32 +120,70 @@ internal fun DictationButton(options: VoicePreferences, enabled: Boolean, paused
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val dictation = remember(context) { Dictation(context.applicationContext) }
+    val whisper = remember(context) { WhisperRecorder(context.applicationContext) }
+    var whisperProgress by remember { mutableStateOf<DictationProgress?>(null) }
     val deliver by rememberUpdatedState(onTranscript)
     val error by rememberUpdatedState(onError)
-    val progress = dictation.progress
+    val progress = if (options.sttBackend == SttBackend.WHISPER_API) whisperProgress else dictation.progress
     LaunchedEffect(progress) { onProgress(progress) }
-    DisposableEffect(lifecycle, dictation) {
-        val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_STOP) dictation.release() }
+    DisposableEffect(lifecycle, dictation, whisper) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                dictation.release()
+                whisper.release()
+                whisperProgress = null
+            }
+        }
         lifecycle.addObserver(observer)
         onDispose {
             lifecycle.removeObserver(observer)
             dictation.release()
+            whisper.release()
+            whisperProgress = null
             onProgress(null)
         }
     }
     fun start() {
         pausedPlayback()
-        dictation.start(options, { deliver(it) }, { error(it) })
+        if (options.sttBackend == SttBackend.WHISPER_API) {
+            whisperProgress = DictationProgress(finishing = false, partial = "准备录音…")
+            whisper.start(
+                options,
+                onPartial = { status -> whisperProgress = DictationProgress(finishing = status.contains("上传"), partial = status) },
+                onResult = { text ->
+                    whisperProgress = null
+                    deliver(text)
+                },
+                onError = { msg ->
+                    whisperProgress = null
+                    error(msg)
+                },
+            )
+        } else {
+            dictation.start(options, { deliver(it) }, { error(it) })
+        }
     }
     val permission = rememberLauncherForActivityResult(RequestPermission()) { granted ->
         if (granted && enabled) start()
         else if (!granted) error("语音输入需要麦克风权限")
     }
     IconButton(onClick = {
-        if (progress?.finishing == true) dictation.release()
-        else if (progress != null) dictation.finish()
-        else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) start()
-        else permission.launch(Manifest.permission.RECORD_AUDIO)
+        if (options.sttBackend == SttBackend.WHISPER_API) {
+            if (whisperProgress?.finishing == true) {
+                whisper.release()
+                whisperProgress = null
+            } else if (whisperProgress != null) {
+                whisperProgress = whisperProgress?.copy(finishing = true, partial = "正在转写…")
+                whisper.finish()
+            } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                start()
+            } else permission.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            if (progress?.finishing == true) dictation.release()
+            else if (progress != null) dictation.finish()
+            else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) start()
+            else permission.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }, enabled = enabled || progress != null) {
         Icon(if (progress != null) Icons.Outlined.Stop else Icons.Outlined.MicNone, when {
             progress?.finishing == true -> "取消语音识别"

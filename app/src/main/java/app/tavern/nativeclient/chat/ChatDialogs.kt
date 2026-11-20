@@ -456,6 +456,10 @@ internal fun ChatBubble(
     previewDocument: (ChatDocument) -> Unit = {},
     previousDrawing: (() -> Unit)? = null,
     nextDrawing: (() -> Unit)? = null,
+    cardScriptsEnabled: Boolean = false,
+    mvuDeltas: List<app.tavern.nativeclient.script.MvuDelta> = emptyList(),
+    mvuStateJson: String = "{}",
+    onRunScript: ((String) -> Unit)? = null,
     onAction: (MessageAction) -> Unit = {},
 ) {
     val mine = message.role == "user"
@@ -538,10 +542,21 @@ internal fun ChatBubble(
                     style = MaterialTheme.typography.labelSmall,
                     color = scheme.onSurfaceVariant,
                 )
-                if (display?.isEmpty() == true && reasoning.isNullOrBlank() && message.displayImages.isEmpty() && message.documents.isEmpty()) {
+                val visibleDisplay = display?.let { app.tavern.nativeclient.script.MvuEngine.stripUpdateVariableBlocks(it) }
+                if (visibleDisplay?.isEmpty() == true && reasoning.isNullOrBlank() && message.displayImages.isEmpty() && message.documents.isEmpty() && mvuDeltas.isEmpty()) {
                     Text("（空消息）", style = MaterialTheme.typography.bodyMedium)
-                } else if (!display.isNullOrEmpty()) {
-                    RichMessageContent(display, appearance, textColor = foreground)
+                } else if (!visibleDisplay.isNullOrEmpty()) {
+                    RichMessageContent(
+                        text = visibleDisplay,
+                        appearance = appearance,
+                        textColor = foreground,
+                        cardScriptsEnabled = cardScriptsEnabled,
+                        mvuStateJson = mvuStateJson,
+                        onRunScript = onRunScript,
+                    )
+                }
+                if (mvuDeltas.isNotEmpty()) {
+                    app.tavern.nativeclient.script.MvuStateChip(mvuDeltas, mvuStateJson)
                 }
                 message.toolTurn?.let { turn ->
                     TextButton({ openTools = !openTools }) { Text(if (openTools) "收起调用详情" else "查看调用详情") }

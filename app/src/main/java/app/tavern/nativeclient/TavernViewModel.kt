@@ -455,6 +455,7 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     // --- Providers, Appearance, Presets, Profiles & Regex ---
     fun savePrefs(prefs: Preferences) = provider.savePrefs(prefs)
     fun setVisualNovel(enabled: Boolean) = provider.setVisualNovel(enabled)
+    fun setCardScriptsEnabled(enabled: Boolean) = provider.setCardScriptsEnabled(enabled)
     fun setChatAppearance(appearance: ChatAppearance) = provider.setChatAppearance(appearance)
     fun tokenCounterFor(connection: ModelConnection?): TextTokenCounter = provider.tokenCounterFor(connection)
     fun setWelcomeAssistant(card: Card?) = provider.setWelcomeAssistant(card)
@@ -547,6 +548,20 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
         backup.listRemote(address, handle, password, basicUser, basicPassword)
     fun clearRemote() = backup.clearRemote()
     fun importRemote(card: RemoteCard, withChats: Boolean) = backup.importRemote(card, withChats)
+    fun saveSyncSettings(settings: app.tavern.nativeclient.backup.SyncSettings, done: () -> Unit) =
+        backup.saveSyncSettings(settings, done)
+    fun testWebDavConnection(settings: app.tavern.nativeclient.backup.SyncSettings) =
+        backup.testWebDavConnection(settings)
+    fun runWebDavSync(settings: app.tavern.nativeclient.backup.SyncSettings) =
+        backup.runWebDavSync(settings)
+    fun syncLanServer(
+        address: String,
+        handle: String,
+        password: String,
+        basicUser: String,
+        basicPass: String,
+        includeChats: Boolean,
+    ) = backup.syncLanServer(address, handle, password, basicUser, basicPass, includeChats)
 
     // --- World Books, Shared Memory 2.0, Vectors & Data Bank ---
     fun saveBook(book: WorldBook, done: () -> Unit) = world.saveBook(book, done)

@@ -143,14 +143,21 @@ internal class StScript(private val host: StScriptHost, private val random: Rand
             name in VARIABLE_COMMANDS -> {
                 val settings = args()
                 val global = "global" in name
-                val key = settings["key"] ?: body(fallback = implicit).text().trim()
-                require(key.isNotBlank()) { "需要变量名" }
-                val existing = host.variable(key, global)
-                val index = settings["index"]
-                when {
-                    name.startsWith("get") -> text(if (index == null) existing.orEmpty() else readVariableKey(existing, index))
-                    name.startsWith("flush") -> { host.variable(key, null, global); text("") }
-                    else -> {
+                val key = if (name.startsWith("flush")) {
+                    settings["key"] ?: node.args.firstOrNull()?.let { value(it, frame, pipe).text() }.orEmpty().trim()
+                } else {
+                    settings["key"] ?: body(fallback = implicit).text().trim()
+                }
+                if (name.startsWith("flush") && key.isBlank()) {
+                    text(host.command(name, settings, "") ?: "")
+                } else {
+                    require(key.isNotBlank()) { "需要变量名" }
+                    val existing = host.variable(key, global)
+                    val index = settings["index"]
+                    when {
+                        name.startsWith("get") -> text(if (index == null) existing.orEmpty() else readVariableKey(existing, index))
+                        name.startsWith("flush") -> { host.variable(key, null, global); text("") }
+                        else -> {
                         val item = body(fallback = implicit).text()
                         val previous = if (index == null) existing.orEmpty() else readVariableKey(existing, index)
                         val updated = when {
@@ -161,6 +168,7 @@ internal class StScript(private val host: StScriptHost, private val random: Rand
                         }
                         host.variable(key, if (index == null) updated else writeVariableKey(existing, index, updated), global)
                         text(updated)
+                        }
                     }
                 }
             }

@@ -4,7 +4,7 @@ Tavern Native 使用 Kotlin、Jetpack Compose 和 Material 3 重写 SillyTavern 
 
 ## 安装与迁移
 
-- 安装 `dist/Tavern-Native-0.43.0-ST1.19.1.apk`。可用同签名包覆盖安装，保留本地角色、聊天和提供商设置。小米 15 Pro 上 0.12.0 的启动闪退已在 0.12.1 修复，后续版本均包含该修复。
+- 安装 `dist/Tavern-Native-0.48.0-ST1.19.1.apk`（`arm64-v8a` 分包精简版，通用包为 `-universal.apk`）。可用同签名包覆盖安装，保留本地角色、聊天和提供商设置。小米 15 Pro 上 0.12.0 的启动闪退已在 0.12.1 修复，后续版本均包含该修复。
 - 在原版账户设置下载备份后，在「角色库 → SillyTavern 数据迁移 → 导入原版账户备份 ZIP」直接选择 ZIP。可恢复角色、单聊、群聊、世界书、人设、提示词预设、世界书规则、快捷回复、消息图片、锁定背景、图库和随包保存的文本资料。也识别压缩包里的 `data/<账户>/` 目录。重复导入按账户和源文件去重。连接凭证在原生应用的提供商设置里配置。 [SillyTavern 账户备份说明](https://docs.sillytavern.app/usage/user-settings/)
 - 从同一页面点「导出本机账户备份 ZIP」可备份上述内容，以及标签、作者注释、聊天分支和角色表情。原生版可以直接重新导入 ZIP。原版格式的数据位于压缩包内的 `data/tavern-native/`，包含标准角色 PNG、聊天 JSONL 和世界书 JSON。提供商 API Key 和连接密码在迁移后单独配置。
 - 如果在 0.3.0 内置引擎预览版使用了本机酒馆，在「角色库」的右上角打开「SillyTavern 数据迁移」，点「导入本机预览版酒馆数据」。应用会复制默认账号的角色卡、单人聊天、群组、群聊、世界书、人设和提示词预设。重复导入会补充新记录。
@@ -160,12 +160,22 @@ Tavern Native 使用 Kotlin、Jetpack Compose 和 Material 3 重写 SillyTavern 
 - 在聊天顶部菜单选择「导出聊天及附件 ZIP」可把本机图片、对话背景、文档文本和消息一起迁移。到目标角色或群组的「导入聊天记录 → 从 JSONL / ZIP 文件导入」打开 ZIP。普通 JSONL 携带消息和本机附件引用。
 - 单张图片的导入上限为 16 MB。应用将图片最长边压到 2,048 像素以内并将单张保存大小限制在 2 MB。聊天模型请求最多附带 12 MB 的原始图片数据，优先附带最近消息里的图片。
 
+- 聊天设置支持「气泡模式 / 文档小说模式」、字号与行距调节、中英文对话引号主题高亮、完整 Markdown（标题、引用、列表、表格、代码块一键复制、`<details>` 原生折叠），以及无网络隔离的 HTML/CSS 状态栏容器；输入框输入 `/` 或 `{{` 弹出 STscript 命令与宏自动补全，聊天顶部显示实时上下文 Token 占用条。
+
 ## 语音朗读和输入
 
 - 点消息菜单的「朗读」播放该消息。在「设置 → 语音朗读与输入」可开启自动朗读，选择是否也读出自己的消息。流式回复保存后进入朗读队列。切换聊天、点击「停止朗读」或切到后台会停止播放。
-- 可以试听设备上的系统音色，设置语速和音高，为每个角色或人设指定音色。可设置仅朗读引号内容、过滤动作描写、代码块、标签内文字或匹配正则的内容。STscript 支持 `/speak`、`/narrate` 和 `/tts`，例如 `/speak voice="角色名" 欢迎来到酒馆`。
-- 朗读引擎也可选择已保存的自定义提供商，填写语音模型和默认音色 ID。服务须支持 OpenAI 兼容 `/audio/speech`，返回 MP3 音频。
-- 点聊天输入框旁的麦克风开始识别，再点一次可结束录音。识别结果支持追加、替换或直接发送。语音快捷词每行用 `短语 = 预设文字或斜杠命令` 配置。默认使用设备上的系统识别服务。选择「仅使用设备上的离线识别」需要 Android 12 或以上及对应的离线语言包。
+- 支持系统音色、Microsoft Edge TTS（免 Key，内置多款中文/日语/英语音色）、ElevenLabs、Fish Audio、GPT-SoVITS 以及 OpenAI 兼容 `/audio/speech` 六种后端。密钥通过 Android Keystore AES-GCM 本地加密保存。
+- 可以试听音色，设置语速和音高，为每个角色或人设指定音色。可设置仅朗读引号内容、过滤动作描写、代码块、标签内文字或匹配正则的内容。STscript 支持 `/speak`、`/narrate` 和 `/tts`，例如 `/speak voice="角色名" 欢迎来到酒馆`。
+- 点聊天输入框旁的麦克风开始识别，再点一次可结束录音。语音输入支持系统识别与 OpenAI 兼容 Whisper STT（16 kHz PCM16 录音上传至 `/audio/transcriptions`）。识别结果支持追加、替换或直接发送。语音快捷词每行用 `短语 = 预设文字或斜杠命令` 配置。
+
+## 跨设备同步与生态扩展（0.48.0 新增）
+
+- **多协议模型与连接配置档案**：除 OpenAI 兼容协议外，原生支持 Anthropic Claude（Prompt Caching、Extended Thinking、Assistant Prefill）、Google Gemini 原生接口（安全阈值、Context Caching、Thinking Budget）、OpenRouter（Provider 路由与 Reasoning Effort）、Ollama 与 KoboldCPP Text Completion；可通过「设置 → 连接配置档案」一键绑定模型、提示词预设与采样参数并按对话切换。
+- **NovelAI 绘图**：绘图弹窗与 `/sd source=novelai` 支持 NovelAI Image API ZIP 解包出图。
+- **WebDAV 与局域网 SillyTavern 双向增量同步**：在「设置 → 对话与同步 → WebDAV 云同步与跨设备联动」可配置坚果云、Nextcloud、AList、NAS 等 WebDAV 服务（原生长连接 Socket 实现 `PROPFIND`/`MKCOL` 增量同步角色卡 PNG、世界书、提示词预设与单聊 JSONL，支持冲突策略与密码加密保存）；也可在 Server 页或同步页与桌面端 SillyTavern 进行角色与聊天双向增量同步。
+- **同世界书跨聊记忆 2.0**：结合关键词与本地 ONNX 向量（BGE/Jina）混合召回跨聊经历，支持在对话菜单打开「跨聊记忆面板」查看、置顶、编辑、屏蔽召回记忆或一键沉淀为世界书条目。
+- **STscript 扩展与 MVU 状态引擎**：新增 `/wi-get-book`、`/wi-list-entries`、`/wi-get-entry`、`/wi-set-entry`、`/wi-create-entry`、`/wi-delete-entry`、`/preset`、`/bg`、`/char-get`、`/listvar`、`/flushvar`、`/flushglobalvar`、`/re-replace`、`/trimtokens`；原生解析角色回复里的 `<UpdateVariable>`（`_.set` / `_.add` / `_.assign` / `_.unset` 与 JSON Patch，支持 Swipe/编辑/删除时确定性回滚重算），隐藏源码并渲染可展开状态变更标签，提供 `{{get_message_variable::路径}}` 与 `{{stat_data}}` 宏；并在设置提供可选开启的离线零网络 `TavernHelper` 沙盒桥接容器。
 
 ## 对话翻译和摘要记忆
 

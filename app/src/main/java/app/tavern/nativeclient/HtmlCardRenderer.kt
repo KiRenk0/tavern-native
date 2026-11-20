@@ -48,6 +48,9 @@ internal fun RichMessageContent(
     appearance: ChatAppearance,
     modifier: Modifier = Modifier,
     textColor: Color = LocalContentColor.current,
+    cardScriptsEnabled: Boolean = false,
+    mvuStateJson: String = "{}",
+    onRunScript: ((String) -> Unit)? = null,
 ) {
     val scheme = MaterialTheme.colorScheme
     val blocks = remember(text, appearance.renderHtmlCards) {
@@ -157,8 +160,26 @@ internal fun RichMessageContent(
                     color = scheme.outlineVariant,
                 )
                 is RichBlock.MarkdownTable -> MarkdownTableView(block, appearance, textColor)
-                is RichBlock.DetailsBlock -> DetailsBlockCard(block, appearance, textColor)
-                is RichBlock.HtmlCardBlock -> HtmlStatusCard(block)
+                is RichBlock.DetailsBlock -> DetailsBlockCard(
+                    block = block,
+                    appearance = appearance,
+                    textColor = textColor,
+                    cardScriptsEnabled = cardScriptsEnabled,
+                    mvuStateJson = mvuStateJson,
+                    onRunScript = onRunScript,
+                )
+                is RichBlock.HtmlCardBlock -> {
+                    if (cardScriptsEnabled && block.rawHtml.contains("<script", ignoreCase = true)) {
+                        app.tavern.nativeclient.script.CardScriptWebView(
+                            rawHtml = block.rawHtml,
+                            label = block.label,
+                            mvuStateJson = mvuStateJson,
+                            onRunScript = onRunScript,
+                        )
+                    } else {
+                        HtmlStatusCard(block)
+                    }
+                }
                 is RichBlock.Paragraph -> {
                     SelectionContainer {
                         Text(
@@ -290,7 +311,14 @@ private fun MarkdownTableView(block: RichBlock.MarkdownTable, appearance: ChatAp
 }
 
 @Composable
-private fun DetailsBlockCard(block: RichBlock.DetailsBlock, appearance: ChatAppearance, textColor: Color) {
+private fun DetailsBlockCard(
+    block: RichBlock.DetailsBlock,
+    appearance: ChatAppearance,
+    textColor: Color,
+    cardScriptsEnabled: Boolean = false,
+    mvuStateJson: String = "{}",
+    onRunScript: ((String) -> Unit)? = null,
+) {
     var expanded by rememberSaveable(block.summary, block.openByDefault) { mutableStateOf(block.openByDefault) }
     val scheme = MaterialTheme.colorScheme
     OutlinedCard(
@@ -329,6 +357,9 @@ private fun DetailsBlockCard(block: RichBlock.DetailsBlock, appearance: ChatAppe
                     appearance = appearance,
                     modifier = Modifier.padding(12.dp),
                     textColor = textColor,
+                    cardScriptsEnabled = cardScriptsEnabled,
+                    mvuStateJson = mvuStateJson,
+                    onRunScript = onRunScript,
                 )
             }
         }

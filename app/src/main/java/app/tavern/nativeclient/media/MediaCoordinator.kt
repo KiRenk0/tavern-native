@@ -46,11 +46,37 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
     }
 
     fun saveVoice(options: VoicePreferences, done: () -> Unit) = host.work {
-        require(options.backendId.isBlank() || host.current.prefs.providers.any { it.id == options.backendId && it.template == null }) {
-            "请选择已保存的自定义语音服务"
+        when (options.activeBackend) {
+            TtsBackend.SYSTEM -> Unit
+            TtsBackend.OPENAI_COMPAT -> {
+                require(options.backendId.isNotBlank() &&
+                    host.current.prefs.providers.any { it.id == options.backendId && it.template == null }) {
+                    "请选择已保存的自定义语音服务"
+                }
+                require(options.backendModel.isNotBlank() && options.backendVoice.isNotBlank()) {
+                    "请填写语音模型和默认音色"
+                }
+            }
+            TtsBackend.EDGE_TTS -> Unit
+            TtsBackend.ELEVENLABS -> {
+                if (options.ttsEndpoint.isNotBlank()) checkedAddress(options.ttsEndpoint)
+                require(options.ttsApiKey.isNotBlank() && options.elevenLabsVoiceId.isNotBlank()) {
+                    "请填写 ElevenLabs API Key 与 Voice ID"
+                }
+            }
+            TtsBackend.FISH_AUDIO -> {
+                if (options.ttsEndpoint.isNotBlank()) checkedAddress(options.ttsEndpoint)
+                require(options.ttsApiKey.isNotBlank()) { "请填写 Fish Audio API Key" }
+            }
+            TtsBackend.GPT_SOVITS -> {
+                require(options.ttsEndpoint.isNotBlank()) { "请填写 GPT-SoVITS 服务地址" }
+                checkedAddress(options.ttsEndpoint)
+                require(options.gptSovitsRefAudio.isNotBlank()) { "请填写 GPT-SoVITS 参考音频路径" }
+            }
         }
-        require(options.backendId.isBlank() || options.backendModel.isNotBlank() && options.backendVoice.isNotBlank()) {
-            "请填写语音模型和默认音色"
+        if (options.sttBackend == SttBackend.WHISPER_API) {
+            require(options.sttEndpoint.isNotBlank()) { "请填写 Whisper STT 接口地址" }
+            checkedAddress(options.sttEndpoint)
         }
         if (options.filter.isNotBlank()) {
             val result = regexTest(RegexRule(pattern = options.filter), "朗读测试", RegexNames(null, ""))
@@ -82,7 +108,7 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
     private fun enqueueSpeech(text: String, chatId: String?, options: VoicePreferences, voice: String, replace: Boolean) {
         if (!voiceForeground || text.isBlank()) return
         if (chatId != null && chatId != host.current.chat?.id) return
-        val backend = if (options.backendId.isEmpty()) null else {
+        val backend = if (options.activeBackend != TtsBackend.OPENAI_COMPAT) null else {
             host.current.prefs.providers.firstOrNull { it.id == options.backendId && it.template == null }
                 ?: return host.notice("请重新选择朗读使用的语音服务")
         }

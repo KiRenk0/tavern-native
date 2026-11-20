@@ -2,26 +2,31 @@ package app.tavern.nativeclient
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.net.URI
 import java.util.Base64
+import java.util.zip.ZipInputStream
 
 internal enum class ImageProtocol(val label: String, val source: String) {
     GEMINI("Google Gemini", "google"), COMPATIBLE("OpenAI 兼容", "openai"), DIFFUSION("AUTOMATIC1111 / Forge", "auto"),
+    NOVELAI("NovelAI", "novelai"),
     COMFY("ComfyUI", "comfy"), COMFY_RUNPOD("ComfyUI · RunPod", "comfyrunpod");
 
     val usesWorkflow get() = this == COMFY || this == COMFY_RUNPOD
     val supportsReferences get() = this == GEMINI || usesWorkflow
-    val usesSamplerParameters get() = this == DIFFUSION || usesWorkflow
+    val usesSamplerParameters get() = this == DIFFUSION || this == NOVELAI || usesWorkflow
 
     fun available(provider: Provider) = when (this) {
         GEMINI -> provider.template == ProviderTemplate.GOOGLE && provider.apiKey.isNotBlank()
         COMPATIBLE, DIFFUSION, COMFY -> provider.template == null && provider.endpoint.isNotBlank()
+        NOVELAI -> provider.template == null && provider.apiKey.isNotBlank()
         COMFY_RUNPOD -> provider.template == null && provider.endpoint.isNotBlank() && provider.apiKey.isNotBlank()
     }
 
     fun initialModel(provider: Provider) = when (this) {
         GEMINI -> DEFAULT_GEMINI_IMAGE
         COMPATIBLE, COMFY, COMFY_RUNPOD -> provider.defaultModel
+        NOVELAI -> provider.defaultModel.ifBlank { "nai-diffusion-4-curated-preview" }
         DIFFUSION -> ""
     }
 }
@@ -51,6 +56,7 @@ internal class ImageService(private val geminiBase: String = "https://generative
             ImageProtocol.GEMINI -> gemini(options, readImage)
             ImageProtocol.COMPATIBLE -> compatible(options)
             ImageProtocol.DIFFUSION -> diffusion(options)
+            ImageProtocol.NOVELAI -> novelAi(options)
             ImageProtocol.COMFY, ImageProtocol.COMFY_RUNPOD ->
                 ComfyService().generate(options, comfy ?: ComfyInputs(defaultComfyWorkflow), readImage)
         }
@@ -116,6 +122,50 @@ internal class ImageService(private val geminiBase: String = "https://generative
         return decodeGeneratedImage(payload("$endpoint/sdapi/v1/txt2img", body, headers).optJSONArray("images")?.optString(0).orEmpty())
     }
 
+    private suspend fun novelAi(options: ImageRequest): ByteArray {
+        val rawEndpoint = options.provider.endpoint.trim().ifBlank { "https://image.novelai.net" }
+        val base = checkedAddress(rawEndpoint).toString().trimEnd('/').removeSuffix("/ai/generate-image")
+        val targetUrl = "$base/ai/generate-image"
+        val tuning = options.tuning
+        val width = (tuning.width ?: when (options.shape) {
+            ImageShape.SQUARE -> 1024
+            ImageShape.PORTRAIT -> 832
+            ImageShape.LANDSCAPE -> 1216
+        }).coerceIn(64, 2048)
+        val height = (tuning.height ?: when (options.shape) {
+            ImageShape.SQUARE -> 1024
+            ImageShape.PORTRAIT -> 1216
+            ImageShape.LANDSCAPE -> 832
+        }).coerceIn(64, 2048)
+        val params = jsonOf(
+            "params_version" to 3,
+            "width" to width,
+            "height" to height,
+            "scale" to (tuning.cfg ?: 5.0),
+            "sampler" to tuning.sampler.ifBlank { "k_euler_ancestral" },
+            "steps" to (tuning.steps ?: 28),
+            "n_samples" to 1,
+            "ucPreset" to 0,
+            "qualityToggle" to true,
+            "negative_prompt" to tuning.negative,
+        )
+        tuning.seed?.let { params.put("seed", it) }
+        val body = jsonOf(
+            "input" to options.prompt,
+            "model" to options.model.trim().ifBlank { "nai-diffusion-4-curated-preview" },
+            "action" to "generate",
+            "parameters" to params,
+        )
+        val headers = mapOf(
+            "Authorization" to "Bearer ${options.provider.apiKey.trim()}",
+            "Accept" to "application/zip, application/x-zip-compressed, image/png",
+        )
+        val zipBytes = request(targetUrl, body, headers, readTimeout = 240_000) { stream, _ ->
+            stream.readLimited(MAX_IMAGE_SOURCE)
+        }
+        return extractNovelAiZipImage(zipBytes)
+    }
+
     private fun descriptivePrompt(options: ImageRequest) = if (options.tuning.negative.isBlank()) options.prompt
         else "${options.prompt}\nAvoid these visual elements: ${options.tuning.negative}"
 
@@ -124,6 +174,22 @@ internal class ImageService(private val geminiBase: String = "https://generative
 
     private fun bearer(key: String) = if (key.isBlank()) emptyMap() else mapOf("Authorization" to "Bearer ${key.trim()}")
 
+}
+
+internal fun extractNovelAiZipImage(zipBytes: ByteArray): ByteArray {
+    ZipInputStream(ByteArrayInputStream(zipBytes)).use { zip ->
+        while (true) {
+            val entry = zip.nextEntry ?: break
+            if (entry.isDirectory) continue
+            val name = entry.name.lowercase()
+            if (name.endsWith(".png") || name.endsWith(".webp") || name.endsWith(".jpg") || name.endsWith(".jpeg") || '.' !in name) {
+                return zip.readLimited(MAX_IMAGE_SOURCE).also {
+                    check(it.isNotEmpty()) { "NovelAI 返回了空的图片条目" }
+                }
+            }
+        }
+    }
+    error("NovelAI ZIP 响应中未找到生成的图片")
 }
 
 internal fun decodeGeneratedImage(value: String): ByteArray {

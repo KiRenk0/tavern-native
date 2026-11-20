@@ -135,6 +135,59 @@ internal class BackupCoordinator(private val host: CoordinatorHost) {
         host.notice("角色已导入 · 新增 $count 个聊天" + if (missing > 0) " · $missing 份文档无法读取" else "")
     }
 
+    fun saveSyncSettings(settings: SyncSettings, done: () -> Unit = {}) = host.work {
+        host.persistPreferences(host.current.prefs.copy(sync = settings))
+        host.notice("同步配置已保存")
+        done()
+    }
+
+    fun testWebDavConnection(settings: SyncSettings) = host.work {
+        val message = RawWebDavClient.testConnection(settings)
+        host.notice(message)
+    }
+
+    fun runWebDavSync(settings: SyncSettings) = host.utilityWork("正在执行 WebDAV 增量同步…") {
+        val report = try {
+            val activePrefs = host.current.prefs.copy(sync = settings)
+            host.persistPreferences(activePrefs)
+            val (updatedSettings, syncReport) = withContext(Dispatchers.IO) {
+                SyncEngine.syncWebDav(host.app, host.store, activePrefs)
+            }
+            host.persistPreferences(host.current.prefs.copy(sync = updatedSettings))
+            syncReport
+        } finally {
+            refreshImportedLibrary()
+        }
+        host.notice(report.summary)
+    }
+
+    fun syncLanServer(
+        address: String,
+        handle: String,
+        password: String,
+        basicUser: String,
+        basicPass: String,
+        includeChats: Boolean,
+    ) = host.utilityWork("正在与 SillyTavern 双向同步…") {
+        val report = try {
+            withContext(Dispatchers.IO) {
+                SyncEngine.syncLanTwoWay(
+                    store = host.store,
+                    prefs = host.current.prefs,
+                    address = address.trim(),
+                    handle = handle.trim(),
+                    password = password,
+                    basicUser = basicUser.trim(),
+                    basicPass = basicPass,
+                    includeChats = includeChats,
+                )
+            }
+        } finally {
+            refreshImportedLibrary()
+        }
+        host.notice(report.summary)
+    }
+
     internal suspend fun hydrateOriginalDocuments(
         chat: Chat,
         destination: ChatDocumentStore = host.documentStore,

@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import app.tavern.nativeclient.media.synthesizeBackendAudio
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -95,7 +96,7 @@ internal class SpeechPlayback(private val context: Context, private val interrup
         .sortedWith(compareBy(DeviceVoice::language, DeviceVoice::network, DeviceVoice::id))
 
     suspend fun play(narration: Narration) = serial.withLock {
-        if (narration.backend == null) {
+        if (narration.options.activeBackend == TtsBackend.SYSTEM) {
             val tts = system()
             val voice = if (narration.voice.isBlank()) tts.defaultVoice else tts.voices.orEmpty().firstOrNull { it.name == narration.voice }
             if (voice != null) check(tts.setVoice(voice) == TextToSpeech.SUCCESS) { "系统无法启用此音色" }
@@ -109,7 +110,7 @@ internal class SpeechPlayback(private val context: Context, private val interrup
                 }
             }
         } else for (part in speechChunks(narration.text, 3000)) {
-            val bytes = synthesizeSpeech(narration.backend, narration.options.backendModel, narration.voice, part, narration.options.speed)
+            val bytes = synthesizeBackendAudio(narration.copy(text = part))
             withFocus { playBytes(bytes) }
         }
     }

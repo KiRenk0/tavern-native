@@ -624,6 +624,13 @@ internal object ModelService {
 
 internal data class RemoteCard(val avatar: String, val name: String)
 
+internal data class RemoteChatSummary(
+    val fileName: String,
+    val messageCount: Int,
+    val fileSize: Long,
+    val lastMessageMs: Long,
+)
+
 internal class TavernServer(address: String, private val handle: String, private val basicUser: String, basicPassword: String) {
     private val base = checkedAddress(address).toString().trimEnd('/')
     private val cookies = CookieManager(null, CookiePolicy.ACCEPT_ORIGINAL_SERVER)
@@ -674,6 +681,39 @@ internal class TavernServer(address: String, private val handle: String, private
         return request("$base/user/files/$name", headers = basicAuth + ("Accept" to "text/plain"), cookies = cookies) { input, _ ->
             input.readLimited(MAX_STORED_CHAT_DOCUMENT)
         }
+    }
+
+    suspend fun listChats(remote: RemoteCard): List<RemoteChatSummary> {
+        val listing = text("/api/characters/chats", jsonOf("avatar_url" to remote.avatar))
+        return JSONArray(listing).objects().mapNotNull { row ->
+            val file = row.string("file_name").ifBlank { return@mapNotNull null }
+            val count = row.optInt("chat_items", 0)
+            val size = row.optLong("file_size", 0L)
+            val stamp = row.optLong("last_mes", 0L).takeIf { it > 1_000_000_000L } ?: 0L
+            RemoteChatSummary(file, count, size, stamp)
+        }
+    }
+
+    suspend fun downloadChatRows(remote: RemoteCard, fileName: String): List<JSONObject> =
+        JSONArray(text("/api/chats/get", jsonOf(
+            "ch_name" to remote.name,
+            "file_name" to fileName.removeSuffix(".jsonl"),
+            "avatar_url" to remote.avatar,
+        ))).objects()
+
+    suspend fun saveChat(remote: RemoteCard, chat: Chat, fileName: String, personaName: String) {
+        if (csrf.isBlank()) loadToken()
+        val rows = JSONArray().apply {
+            chat.jsonl(remote.name, personaName).decodeToString().lineSequence()
+                .filter(String::isNotBlank)
+                .forEach { put(JSONObject(it)) }
+        }
+        text("/api/chats/save", jsonOf(
+            "ch_name" to remote.name,
+            "file_name" to fileName.removeSuffix(".jsonl"),
+            "avatar_url" to remote.avatar,
+            "chat" to rows,
+        ))
     }
 
     private suspend fun loadToken() {

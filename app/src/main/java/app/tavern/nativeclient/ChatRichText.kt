@@ -38,8 +38,9 @@ private val htmlTitleCandidate = Regex("""(?is)<(?:h[1-4]|title|summary|caption)
 private val htmlTagStripper = Regex("""<[^>]+>""")
 
 internal fun parseRichBlocks(text: String, renderHtml: Boolean): List<RichBlock> {
-    if (text.isEmpty()) return emptyList()
-    val normalized = text.replace("\r\n", "\n").replace('\r', '\n')
+    val cleaned = app.tavern.nativeclient.script.MvuEngine.stripUpdateVariableBlocks(text)
+    if (cleaned.isEmpty()) return emptyList()
+    val normalized = cleaned.replace("\r\n", "\n").replace('\r', '\n')
     val blocks = mutableListOf<RichBlock>()
     val lines = normalized.split('\n')
     var index = 0

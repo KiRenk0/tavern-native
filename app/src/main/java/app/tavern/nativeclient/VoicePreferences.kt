@@ -6,6 +6,20 @@ internal enum class DictationMode(val label: String) {
     APPEND("追加到草稿"), REPLACE("替换草稿"), SEND("直接发送");
 }
 
+internal enum class TtsBackend(val label: String, val usesCustomProvider: Boolean = false) {
+    SYSTEM("Android 系统朗读"),
+    OPENAI_COMPAT("OpenAI 兼容 TTS", usesCustomProvider = true),
+    EDGE_TTS("Edge 微软神经语音（免费）"),
+    ELEVENLABS("ElevenLabs"),
+    FISH_AUDIO("Fish Audio"),
+    GPT_SOVITS("GPT-SoVITS（本地/自建）"),
+}
+
+internal enum class SttBackend(val label: String) {
+    SYSTEM("Android 系统语音识别"),
+    WHISPER_API("Whisper API（兼容接口）"),
+}
+
 internal data class VoicePreferences(
     val enabled: Boolean = true,
     val automatic: Boolean = false,
@@ -18,39 +32,98 @@ internal data class VoicePreferences(
     val speed: Float = 1f,
     val pitch: Float = 1f,
     val systemVoice: String = "",
+    val ttsBackend: TtsBackend = TtsBackend.SYSTEM,
+    val ttsEndpoint: String = "",
+    val ttsApiKey: String = "",
+    val edgeVoice: String = "zh-CN-XiaoxiaoNeural",
+    val elevenLabsVoiceId: String = "",
+    val elevenLabsModelId: String = "eleven_multilingual_v2",
+    val fishReferenceId: String = "",
+    val gptSovitsRefAudio: String = "",
+    val gptSovitsPromptText: String = "",
+    val gptSovitsPromptLang: String = "zh",
+    val gptSovitsTextLang: String = "auto",
     val backendId: String = "",
     val backendModel: String = "",
     val backendVoice: String = "",
     val voices: Map<String, String> = emptyMap(),
     val dictationEnabled: Boolean = true,
     val dictationMode: DictationMode = DictationMode.APPEND,
+    val sttBackend: SttBackend = SttBackend.SYSTEM,
+    val sttEndpoint: String = "",
+    val sttApiKey: String = "",
+    val sttModel: String = "whisper-1",
     val language: String = "",
     val requireOffline: Boolean = false,
     val shortcuts: Map<String, String> = emptyMap(),
     val translatedText: Boolean = false,
 ) {
-    val defaultVoice get() = if (backendId.isEmpty()) systemVoice else backendVoice
+    val activeBackend: TtsBackend
+        get() = if (ttsBackend == TtsBackend.SYSTEM && backendId.isNotBlank()) TtsBackend.OPENAI_COMPAT else ttsBackend
 
-    fun actorVoice(actor: String?) = voices["$backendId:$actor"].orEmpty().ifBlank { defaultVoice }
+    val backendScopeKey: String
+        get() = when (activeBackend) {
+            TtsBackend.SYSTEM -> ""
+            TtsBackend.OPENAI_COMPAT -> backendId
+            TtsBackend.EDGE_TTS -> "edge"
+            TtsBackend.ELEVENLABS -> "elevenlabs"
+            TtsBackend.FISH_AUDIO -> "fish"
+            TtsBackend.GPT_SOVITS -> "gptsovits"
+        }
+
+    val defaultVoice: String
+        get() = when (activeBackend) {
+            TtsBackend.SYSTEM -> systemVoice
+            TtsBackend.OPENAI_COMPAT -> backendVoice
+            TtsBackend.EDGE_TTS -> edgeVoice.ifBlank { "zh-CN-XiaoxiaoNeural" }
+            TtsBackend.ELEVENLABS -> elevenLabsVoiceId
+            TtsBackend.FISH_AUDIO -> fishReferenceId
+            TtsBackend.GPT_SOVITS -> gptSovitsRefAudio
+        }
+
+    fun actorVoice(actor: String?): String {
+        if (actor.isNullOrBlank()) return defaultVoice
+        return voices["$backendScopeKey:$actor"].orEmpty().ifBlank { defaultVoice }
+    }
 
     fun withVoice(actor: String, voice: String): VoicePreferences {
-        val key = "$backendId:$actor"
+        val key = "$backendScopeKey:$actor"
         return copy(voices = if (voice.isBlank()) voices - key else voices + (key to voice))
     }
 
-    fun json() = jsonOf(
+    fun json(seal: (String) -> String = { it }) = jsonOf(
         "enabled" to enabled, "automatic" to automatic, "includeUser" to includeUser,
         "quoteOnly" to quoteOnly, "skipActions" to skipActions, "skipCode" to skipCode, "skipTags" to skipTags,
         "filter" to filter, "speed" to speed, "pitch" to pitch, "systemVoice" to systemVoice,
+        "ttsBackend" to activeBackend.name,
+        "ttsEndpoint" to ttsEndpoint,
+        "ttsApiKey" to seal(ttsApiKey),
+        "edgeVoice" to edgeVoice,
+        "elevenLabsVoiceId" to elevenLabsVoiceId,
+        "elevenLabsModelId" to elevenLabsModelId,
+        "fishReferenceId" to fishReferenceId,
+        "gptSovitsRefAudio" to gptSovitsRefAudio,
+        "gptSovitsPromptText" to gptSovitsPromptText,
+        "gptSovitsPromptLang" to gptSovitsPromptLang,
+        "gptSovitsTextLang" to gptSovitsTextLang,
         "backendId" to backendId, "backendModel" to backendModel, "backendVoice" to backendVoice, "voices" to JSONObject(voices),
         "dictationEnabled" to dictationEnabled, "dictationMode" to dictationMode.name,
+        "sttBackend" to sttBackend.name,
+        "sttEndpoint" to sttEndpoint,
+        "sttApiKey" to seal(sttApiKey),
+        "sttModel" to sttModel,
         "language" to language, "requireOffline" to requireOffline, "shortcuts" to JSONObject(shortcuts),
         "translatedText" to translatedText,
     )
 
     companion object {
-        fun from(row: JSONObject?): VoicePreferences {
+        fun from(row: JSONObject?, unseal: (String) -> String = { it }): VoicePreferences {
             if (row == null) return VoicePreferences()
+            val legacyBackendId = row.string("backendId")
+            val parsedTts = TtsBackend.entries.firstOrNull { it.name == row.string("ttsBackend") }
+                ?: if (legacyBackendId.isNotBlank()) TtsBackend.OPENAI_COMPAT else TtsBackend.SYSTEM
+            val parsedStt = SttBackend.entries.firstOrNull { it.name == row.string("sttBackend") }
+                ?: SttBackend.SYSTEM
             return VoicePreferences(
                 enabled = row.optBoolean("enabled", true), automatic = row.optBoolean("automatic"),
                 includeUser = row.optBoolean("includeUser"), quoteOnly = row.optBoolean("quoteOnly"),
@@ -58,10 +131,27 @@ internal data class VoicePreferences(
                 skipTags = row.optBoolean("skipTags"), filter = row.string("filter"),
                 speed = row.optDouble("speed", 1.0).toFloat().coerceIn(0.5f, 2f),
                 pitch = row.optDouble("pitch", 1.0).toFloat().coerceIn(0.5f, 2f), systemVoice = row.string("systemVoice"),
-                backendId = row.string("backendId"), backendModel = row.string("backendModel"), backendVoice = row.string("backendVoice"),
+                ttsBackend = parsedTts,
+                ttsEndpoint = row.string("ttsEndpoint"),
+                ttsApiKey = unseal(row.string("ttsApiKey")),
+                edgeVoice = row.string("edgeVoice").ifBlank { "zh-CN-XiaoxiaoNeural" },
+                elevenLabsVoiceId = row.string("elevenLabsVoiceId"),
+                elevenLabsModelId = row.string("elevenLabsModelId").ifBlank { "eleven_multilingual_v2" },
+                fishReferenceId = row.string("fishReferenceId"),
+                gptSovitsRefAudio = row.string("gptSovitsRefAudio"),
+                gptSovitsPromptText = row.string("gptSovitsPromptText"),
+                gptSovitsPromptLang = row.string("gptSovitsPromptLang").ifBlank { "zh" },
+                gptSovitsTextLang = row.string("gptSovitsTextLang").ifBlank { "auto" },
+                backendId = legacyBackendId,
+                backendModel = row.string("backendModel"),
+                backendVoice = row.string("backendVoice"),
                 voices = row.optJSONObject("voices").variableStrings(),
                 dictationEnabled = row.optBoolean("dictationEnabled", true),
                 dictationMode = DictationMode.entries.firstOrNull { it.name == row.string("dictationMode") } ?: DictationMode.APPEND,
+                sttBackend = parsedStt,
+                sttEndpoint = row.string("sttEndpoint"),
+                sttApiKey = unseal(row.string("sttApiKey")),
+                sttModel = row.string("sttModel").ifBlank { "whisper-1" },
                 language = row.string("language"), requireOffline = row.optBoolean("requireOffline"),
                 shortcuts = row.optJSONObject("shortcuts").variableStrings(),
                 translatedText = row.optBoolean("translatedText"),

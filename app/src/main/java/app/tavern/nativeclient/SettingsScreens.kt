@@ -1,5 +1,6 @@
 package app.tavern.nativeclient
 
+import app.tavern.nativeclient.backup.SyncSettingsScreen
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts.OpenDocument
 import androidx.activity.result.contract.ActivityResultContracts.CreateDocument
@@ -136,6 +137,7 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
     var replyAutomation by rememberSaveable { mutableStateOf(false) }
     var comfyWorkflows by rememberSaveable { mutableStateOf(false) }
     var profileSettings by rememberSaveable { mutableStateOf(false) }
+    var syncSettings by rememberSaveable { mutableStateOf(false) }
     var temperature by rememberSaveable(prefs.temperature) { mutableStateOf(prefs.temperature) }
     var maxTokens by rememberSaveable(prefs.maxTokens) { mutableStateOf(prefs.maxTokens) }
     var reasoning by rememberSaveable(prefs.includeReasoning) { mutableStateOf(prefs.includeReasoning) }
@@ -185,6 +187,10 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
         ConnectionProfilesScreen(state, model) { profileSettings = false }
         return
     }
+    if (syncSettings) {
+        SyncSettingsScreen(state, model) { syncSettings = false }
+        return
+    }
     if (selected != null) {
         val saved = prefs.providers.firstOrNull { it.id == selected }
         val draft = saved ?: ProviderTemplate.entries.firstOrNull { it.id == selected }?.profile() ?: Provider(draftId)
@@ -232,7 +238,13 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
             Text("ComfyUI 工作流")
         }
         HorizontalDivider()
-        FormHeading("对话")
+        FormHeading("对话与同步")
+        OutlinedButton({ syncSettings = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Outlined.CloudSync, null)
+            Spacer(Modifier.width(8.dp))
+            Text(if (prefs.sync.configured) "WebDAV 云同步与跨设备联动 · 已配置" else "WebDAV 云同步与跨设备联动")
+        }
+        GroupToggle("启用角色卡扩展脚本（MVU 面板 / 离线沙盒桥接）", prefs.cardScriptsEnabled, !state.busy, model::setCardScriptsEnabled)
         OutlinedButton({ replyAutomation = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
             Icon(Icons.Outlined.Bolt, null)
             Spacer(Modifier.width(8.dp))
@@ -598,6 +610,18 @@ internal fun ServerScreen(state: TavernState, model: TavernViewModel) {
                     basicPassword.takeIf { showBasic }.orEmpty())
             }, enabled = !state.busy && address.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
                 Icon(Icons.Outlined.Link, null); Spacer(Modifier.width(8.dp)); Text("连接")
+            }
+            OutlinedButton(onClick = {
+                model.syncLanServer(
+                    address = address,
+                    handle = handle,
+                    password = password,
+                    basicUser = basicUser.takeIf { showBasic }.orEmpty(),
+                    basicPass = basicPassword.takeIf { showBasic }.orEmpty(),
+                    includeChats = withChats,
+                )
+            }, enabled = !state.busy && address.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Outlined.Sync, null); Spacer(Modifier.width(8.dp)); Text("双向同步角色与聊天")
             }
         }
     } else {
