@@ -127,6 +127,21 @@ internal class TavernScriptHost(
                 text
             }
         }
+        "profile" -> {
+            val conversation = chat()
+            val trimmed = text.trim()
+            if (trimmed.isEmpty()) {
+                state.prefs.activeProfile(conversation)?.name.orEmpty()
+            } else if (trimmed.equals("off", true) || trimmed.equals("default", true) || trimmed == "默认") {
+                saveChat(conversation.copy(modelOverride = null, options = conversation.options.copy(connectionProfileId = "")))
+                ""
+            } else {
+                val profile = state.prefs.connectionProfiles.firstOrNull { it.name.equals(trimmed, ignoreCase = true) }
+                    ?: error("找不到连接配置档案 $trimmed")
+                saveChat(conversation.copy(modelOverride = null, options = conversation.options.copy(connectionProfileId = profile.id)))
+                profile.name
+            }
+        }
         "reroll-pick" -> {
             val conversation = chat()
             saveChat(conversation.copy(options = conversation.options.copy(pickRerollSeed = newId())))

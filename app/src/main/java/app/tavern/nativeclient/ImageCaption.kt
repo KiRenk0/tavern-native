@@ -58,7 +58,8 @@ internal data class CaptionSettings(
     }
 }
 
-internal fun supportsImageCaptions(provider: Provider) = provider.ready && provider.template != ProviderTemplate.DEEPSEEK
+internal fun supportsImageCaptions(provider: Provider) =
+    provider.ready && provider.template != ProviderTemplate.DEEPSEEK && provider.protocol != ApiProtocol.KOBOLD_TEXT
 
 internal data class CaptionImageTarget(val image: ChatImage, val messageIndex: Int? = null)
 

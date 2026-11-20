@@ -132,6 +132,7 @@ internal data class ConversationOptions(
     val systemPromptOverride: String = "",
     val expressions: ExpressionSettings = ExpressionSettings(),
     val pickRerollSeed: String = "",
+    val connectionProfileId: String? = null,
 ) {
     val hasWorldBookOverride get() = worldBookId.isNotBlank() || worldBookName.isNotBlank()
 
@@ -170,6 +171,8 @@ internal data class ConversationOptions(
         else metadata.put("tavern_native_memory", memory.json())
         if (background == null) metadata.remove("tavern_native_background") else metadata.put("tavern_native_background", background.json())
         if (expressions == ExpressionSettings()) metadata.remove(EXPRESSION_EXTENSION) else metadata.put(EXPRESSION_EXTENSION, expressions.json())
+        if (connectionProfileId == null) metadata.remove("tavern_native_connection_profile")
+        else metadata.put("tavern_native_connection_profile", connectionProfileId)
     }
 
     fun json() = JSONObject().also(::applyTo).put("variables", JSONObject(variables))
@@ -194,6 +197,7 @@ internal data class ConversationOptions(
             value?.string("system_prompt").orEmpty(),
             ExpressionSettings.from(value?.optJSONObject(EXPRESSION_EXTENSION)),
             value?.string("pick_reroll_seed").orEmpty(),
+            value?.takeUnless { it.isNull("tavern_native_connection_profile") }?.string("tavern_native_connection_profile"),
         )
     }
 }

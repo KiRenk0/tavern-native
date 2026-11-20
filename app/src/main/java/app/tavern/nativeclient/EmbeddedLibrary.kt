@@ -338,6 +338,10 @@ internal class EmbeddedLibrary(
         val appearance = if (prefs.chatAppearance == ChatAppearance() && power?.has("tavern_native_chat_appearance") == true) {
             ChatAppearance.from(power.optJSONObject("tavern_native_chat_appearance"))
         } else prefs.chatAppearance
+        val profilesImported = if (prefs.connectionProfiles.isEmpty() && power?.has("tavern_native_connection_profiles") == true) {
+            power.optJSONArray("tavern_native_connection_profiles")?.objects()?.mapNotNull(ConnectionProfile::fromJson).orEmpty()
+        } else prefs.connectionProfiles
+        val activeProfileImported = prefs.activeProfileId ?: power?.string("tavern_native_active_profile")?.takeIf(String::isNotBlank)
         val tags = settings?.let { settingsJson ->
             prefs.library.mergeTags(settingsJson, ownerFor = { key ->
                 avatars[key]?.let(::libraryCardId) ?: groupIds[key]?.let(::libraryGroupId)
@@ -348,13 +352,15 @@ internal class EmbeddedLibrary(
         if (profiles != prefs.personas || links != prefs.personaConnections || (defaultNote != null && prefs.defaultAuthorNote == AuthorNote()) ||
             (importedLore != null && importedLore != prefs.loreSettings) || defaultPreset != prefs.defaultPresetId ||
             regex != prefs.regex || quickReplies != quick || scriptVariables != prefs.scriptVariables ||
-            library != prefs.library || automation != prefs.replyAutomation || appearance != prefs.chatAppearance) {
+            library != prefs.library || automation != prefs.replyAutomation || appearance != prefs.chatAppearance ||
+            profilesImported != prefs.connectionProfiles || activeProfileImported != prefs.activeProfileId) {
             store.save(prefs.copy(personas = profiles, personaConnections = links,
                 defaultPersonaId = sourceDefaultId.takeIf { useSourceDefaults } ?: prefs.defaultPersonaId,
                 defaultAuthorNote = defaultNote?.takeIf { prefs.defaultAuthorNote == AuthorNote() } ?: prefs.defaultAuthorNote,
                 loreSettings = importedLore ?: prefs.loreSettings, defaultPresetId = defaultPreset, regex = regex,
                 quickReplies = quickReplies, scriptVariables = scriptVariables, library = library,
-                replyAutomation = automation, chatAppearance = appearance))
+                replyAutomation = automation, chatAppearance = appearance,
+                connectionProfiles = profilesImported, activeProfileId = activeProfileImported))
         }
         return "已读取 ${avatars.size} 个角色、$groupCount 个群组、新增 $chatCount 个聊天、$bookCount 本世界书、" +
             "${profiles.size - prefs.personas.size} 个人设、$addedPresets 个提示词预设和 $addedQuickSets 个快捷回复集" +

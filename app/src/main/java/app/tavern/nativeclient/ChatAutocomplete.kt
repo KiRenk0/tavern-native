@@ -77,6 +77,7 @@ internal val stScriptCatalog: List<AutocompleteItem> = listOf(
     AutocompleteItem("/tools-list", "/tools-list", "列出已注册工具", AutocompleteKind.COMMAND),
     AutocompleteItem("/tools-invoke ", "/tools-invoke", "手动调用工具", AutocompleteKind.COMMAND),
     AutocompleteItem("/model ", "/model", "读取或切换对话模型", AutocompleteKind.COMMAND),
+    AutocompleteItem("/profile ", "/profile", "读取或切换连接配置档案", AutocompleteKind.COMMAND),
     AutocompleteItem("/reroll-pick", "/reroll-pick", "重新抽取 {{pick}} 结果", AutocompleteKind.COMMAND),
     AutocompleteItem("/help", "/help", "查看命令帮助", AutocompleteKind.COMMAND),
 )

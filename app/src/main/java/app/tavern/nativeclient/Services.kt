@@ -154,43 +154,8 @@ internal object ModelService {
 
     suspend fun models(provider: Provider): List<String> = discoverModels(provider).ids
 
-    suspend fun discoverModels(provider: Provider): DiscoveredModels {
-        val endpoint = base(provider)
-        if (provider.template == ProviderTemplate.GOOGLE &&
-            endpoint == "https://generativelanguage.googleapis.com/v1beta/openai") {
-            try {
-                val models = googleModels(endpoint.removeSuffix("/openai"), provider.apiKey.trim())
-                if (models.ids.isNotEmpty()) return models
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // Some accounts can only use the compatibility model list.
-            }
-        }
-        return request("$endpoint/models", headers = auth(provider)) { input, _ ->
-            DiscoveredModels.read(JSONObject(input.readLimited().decodeToString()), provider.template == ProviderTemplate.GOOGLE)
-        }
-    }
-
-    private suspend fun googleModels(endpoint: String, key: String): DiscoveredModels {
-        var page = ""
-        val seen = hashSetOf<String>()
-        val ids = linkedSetOf<String>()
-        val contexts = linkedMapOf<String, Int>()
-        repeat(16) {
-            val next = page.takeIf(String::isNotBlank)?.let {
-                "&pageToken=" + java.net.URLEncoder.encode(it, "UTF-8")
-            }.orEmpty()
-            val result = request("$endpoint/models?pageSize=100$next", headers = mapOf("x-goog-api-key" to key),
-                readTimeout = 12_000) { input, _ -> JSONObject(input.readLimited().decodeToString()) }
-            val discovered = DiscoveredModels.read(result)
-            ids += discovered.ids
-            contexts += discovered.contexts
-            page = result.string("nextPageToken")
-            if (page.isBlank() || !seen.add(page)) return DiscoveredModels(ids.sorted(), contexts)
-        }
-        return DiscoveredModels(ids.sorted(), contexts)
-    }
+    suspend fun discoverModels(provider: Provider): DiscoveredModels =
+        ProviderProtocols.discoverModels(provider)
 
     suspend fun reply(prefs: Preferences, connection: ModelConnection, card: Card, history: List<Message>,
                       books: List<WorldBook>, group: GroupPrompt?,
@@ -209,6 +174,7 @@ internal object ModelService {
                       onLoreBudget: (LoreBudgetUsage) -> Unit = {},
                       chatId: String = "",
                       onVariables: suspend (MacroVariableChanges) -> Unit = {},
+                      effectiveSampling: EffectiveSampling? = null,
                       token: (String) -> Unit): ReplyResult {
         val provider = connection.provider
         val textRules = prefs.regex.runtime(card, persona.name, preset, group?.roster.orEmpty())
@@ -218,17 +184,21 @@ internal object ModelService {
             val rawImages = if (prefs.captions.textOnly) emptyMap() else promptImages(window, readImage)
             rawImages to promptDocuments(window, vectors.attachments, readDocument)
         }
+        val leadingSystemOnly = provider.template == ProviderTemplate.DEEPSEEK ||
+            (provider.template == ProviderTemplate.GOOGLE && provider.protocol == ApiProtocol.OPENAI_COMPATIBLE)
+        val includeReasoning = effectiveSampling?.includeReasoning ?: prefs.includeReasoning
         val prepared = withContext(Dispatchers.Default) {
-            prompt(card, history, provider.template != null, books, group, persona, options, prefs.loreSettings,
-                trigger, preset, textRules, prefs.includeReasoning, prefs.scriptVariables, images, prefs.vectors, vectors,
+            prompt(card, history, leadingSystemOnly, books, group, persona, options, prefs.loreSettings,
+                trigger, preset, textRules, includeReasoning, prefs.scriptVariables, images, prefs.vectors, vectors,
                 documents, toolConnection, sharedMemory, prefs.loreSettings.modelBudget(connection, prefs, preset, loreCounter),
                 prefs.captions, connection.model, chatId)
         }
         onLoreBudget(prepared.loreBudget)
         val payload = completionPayload(connection, prepared.messages, provider.streaming)
         preset?.applySampling(payload, provider.template)
-        prefs.temperature.toDoubleOrNull()?.let { payload.put("temperature", it) }
-        prefs.maxTokens.toIntOrNull()?.let { payload.put("max_tokens", it) }
+        (effectiveSampling?.temperature ?: prefs.temperature).toDoubleOrNull()?.let { payload.put("temperature", it) }
+        effectiveSampling?.topP.orEmpty().toDoubleOrNull()?.let { payload.put("top_p", it) }
+        (effectiveSampling?.maxTokens ?: prefs.maxTokens).toIntOrNull()?.let { payload.put("max_tokens", it) }
         if (!prepared.variables.isEmpty) onVariables(prepared.variables)
         if (prepared.automationIds.isNotEmpty()) onLoreActivated(prepared.automationIds)
         for (round in 0..MAX_TOOL_ROUNDS) {
@@ -291,9 +261,13 @@ internal object ModelService {
         return output.toString().trim().also { check(it.isNotBlank()) { "模型没有返回文本" } }
     }
 
-    private suspend fun complete(provider: Provider, payload: JSONObject, onReasoning: (String) -> Unit,
+    internal suspend fun complete(provider: Provider, payload: JSONObject, onReasoning: (String) -> Unit,
                                  token: (String) -> Unit, acceptTools: Boolean = false,
                                  onRetry: () -> Unit = {}): CompletionAccumulator {
+        if (provider.protocol !in setOf(ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER)) {
+            return ProviderProtocols.completeProtocol(provider, payload, onReasoning, token, acceptTools, onRetry)
+        }
+        ProviderProtocols.enrichOpenAiPayload(provider, payload)
         val hydrogen = payload.string("model").substringAfterLast('/').equals("gemini-4-hydrogen", ignoreCase = true)
         var result = readCompletion(provider, payload, onReasoning, token, acceptTools, readFullStream = hydrogen)
         if (result.hasOutput) return result
@@ -346,7 +320,7 @@ internal object ModelService {
         var streamOpened = false
         var streamConsumed = false
         try {
-            request("${base(provider)}/chat/completions", payload, auth(provider)) { input, type ->
+            request("${base(provider)}/chat/completions", payload, ProviderProtocols.buildOpenAiHeaders(provider)) { input, type ->
                 if (!type.contains("text/event-stream", ignoreCase = true)) {
                     appendResponse(JSONObject(input.readLimited().toString(Charsets.UTF_8)), streaming = false)
                     return@request

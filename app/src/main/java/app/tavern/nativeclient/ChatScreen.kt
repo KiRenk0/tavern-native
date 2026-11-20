@@ -100,6 +100,7 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
     var drawingReference by remember { mutableStateOf<ChatImage?>(null) }
     var translationTools by rememberSaveable { mutableStateOf(false) }
     var memoryTools by rememberSaveable { mutableStateOf(false) }
+    var sharedMemoryPanel by rememberSaveable { mutableStateOf(false) }
     var vectorTools by rememberSaveable { mutableStateOf(false) }
     var dataBank by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(state.openDataBank, state.scriptRunning, state.busy, state.generation != null) {
@@ -304,6 +305,7 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
                             MenuItem("摘要记忆", Icons.Outlined.Summarize) { optionsMenu = false; memoryTools = true }
                             if (!chat.isTemporary) {
                                 MenuItem("向量索引", Icons.AutoMirrored.Outlined.ManageSearch) { optionsMenu = false; vectorTools = true }
+                                MenuItem("跨聊角色记忆", Icons.Outlined.Psychology) { optionsMenu = false; sharedMemoryPanel = true }
                                 MenuItem("资料库", Icons.AutoMirrored.Outlined.Article) { optionsMenu = false; dataBank = true }
                                 MenuItem("图库", Icons.Outlined.PhotoLibrary) { optionsMenu = false; model.showImageGallery() }
                                 MenuItem("角色表情", Icons.Outlined.Mood) { optionsMenu = false; expressions = true }
@@ -709,12 +711,36 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
     }
     if (translationTools) TranslationDialog(chat, state, model) { translationTools = false }
     if (memoryTools) MemoryDialog(chat, state, model) { memoryTools = false }
+    if (sharedMemoryPanel) {
+        val activeCard = state.card ?: members.firstOrNull()
+        val activeWorld = activeCard?.let { chat.memoryWorld(it, state.books) }
+        SharedWorldMemoryDialog(
+            world = activeWorld,
+            card = activeCard,
+            recall = state.lastSharedMemory,
+            busy = busy,
+            dismiss = { sharedMemoryPanel = false },
+            refresh = { if (activeWorld != null && activeCard != null) model.inspectSharedWorldMemory(activeWorld, activeCard, chat) },
+            pinItem = { w, c, m -> model.pinSharedMemory(w, c, m) },
+            unpinItem = { w, c, id -> model.unpinSharedMemory(w, c, id) },
+            editItem = { w, c, key, txt -> model.editSharedMemory(w, c, key, txt) },
+            blockItem = { w, c, key, blk -> model.blockSharedMemory(w, c, key, blk) },
+            promoteItem = { w, c, txt, src -> model.promoteSharedMemoryToLore(w, c, txt, src) },
+        )
+    }
     if (vectorTools) VectorIndexDialog(state, model, { vectorTools = false }, configure)
     if (dataBank) DataBankDialog(state, model, close = { dataBank = false }, configure = { dataBank = false; configure() })
     if (modelPicker) {
-        ChatModelPicker(state, chat, dismiss = { modelPicker = false }, refresh = {
-            model.loadModels(it, persistCatalog = true)
-        }) { selected ->
+        ChatModelPicker(
+            state = state,
+            chat = chat,
+            dismiss = { modelPicker = false },
+            refresh = { model.loadModels(it, persistCatalog = true) },
+            selectProfile = { profileId ->
+                modelPicker = false
+                model.setChatConnectionProfile(profileId)
+            },
+        ) { selected ->
             modelPicker = false
             model.switchModel(selected)
         }
@@ -852,17 +878,54 @@ private fun ChatSearch(query: String, change: (String) -> Unit, count: Int, posi
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ChatModelPicker(state: TavernState, chat: Chat, dismiss: () -> Unit,
-                            refresh: (Provider) -> Unit, select: (ModelSelection?) -> Unit) {
+private fun ChatModelPicker(
+    state: TavernState,
+    chat: Chat,
+    dismiss: () -> Unit,
+    refresh: (Provider) -> Unit,
+    selectProfile: (String?) -> Unit,
+    select: (ModelSelection?) -> Unit,
+) {
     var query by rememberSaveable { mutableStateOf("") }
     val active = state.prefs.connectionFor(chat)
     val default = state.prefs.connectionFor()
+    val activeProfile = state.prefs.activeProfile(chat)
+    val profiles = state.prefs.connectionProfiles
     val providers = state.prefs.providers.filter { it.ready }
     ModalBottomSheet(onDismissRequest = dismiss) {
         LazyColumn(Modifier.fillMaxWidth().heightIn(max = 540.dp),
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 24.dp)) {
             item {
                 Text("切换此对话的模型", style = MaterialTheme.typography.titleLarge)
+                if (profiles.isNotEmpty()) {
+                    Text(
+                        "连接配置档案",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp, bottom = 4.dp),
+                    )
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (chat.options.connectionProfileId != null) {
+                            item(key = "profile:clear") {
+                                FilterChip(
+                                    selected = false,
+                                    onClick = { selectProfile(null) },
+                                    enabled = !state.busy,
+                                    label = { Text("恢复默认档案") },
+                                )
+                            }
+                        }
+                        items(profiles, key = ConnectionProfile::id) { profile ->
+                            val isSelected = activeProfile?.id == profile.id && chat.modelOverride == null
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = { selectProfile(profile.id) },
+                                enabled = !state.busy,
+                                label = { Text(profile.name) },
+                            )
+                        }
+                    }
+                }
                 Field("搜索提供商或模型", query, { query = it })
                 if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 if (chat.modelOverride != null && default != null) {

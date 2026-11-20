@@ -128,7 +128,8 @@ internal data class PromptPreset(
     fun applySampling(payload: JSONObject, template: ProviderTemplate?) {
         for ((option, value) in sampling) {
             val supported = when (option) {
-                PresetSampling.SEED, PresetSampling.FREQUENCY, PresetSampling.PRESENCE -> template == null
+                PresetSampling.SEED, PresetSampling.FREQUENCY, PresetSampling.PRESENCE ->
+                    template == null || template == ProviderTemplate.OPENROUTER
                 else -> true
             }
             if (supported) option.number(value)?.let { payload.put(option.wire, it) }

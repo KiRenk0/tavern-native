@@ -61,6 +61,8 @@ internal fun WorldBookLibrary(state: TavernState, model: TavernViewModel) {
     var editingEntry by rememberSaveable { mutableStateOf<Int?>(null) }
     var deletingBook by remember { mutableStateOf(false) }
     var deletingEntry by remember { mutableStateOf<LoreEntry?>(null) }
+    var managingMemory by remember { mutableStateOf(false) }
+    var memoryCardId by rememberSaveable { mutableStateOf<String?>(null) }
     var query by rememberSaveable { mutableStateOf("") }
     val context = LocalContext.current
     val open = state.books.firstOrNull { it.id == openId }
@@ -118,6 +120,24 @@ internal fun WorldBookLibrary(state: TavernState, model: TavernViewModel) {
                     if (open.sharedMemory) {
                         Text("绑定本书的单聊和群聊会按角色召回历史。召回片段会随回复请求发给当前模型。",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        val boundCards = remember(state.cards, open) {
+                            state.cards.filter { it.worldName == open.name }.ifEmpty { state.cards }
+                        }
+                        if (boundCards.isNotEmpty()) {
+                            OutlinedButton(
+                                onClick = {
+                                    if (memoryCardId == null || boundCards.none { it.id == memoryCardId }) {
+                                        memoryCardId = boundCards.first().id
+                                    }
+                                    managingMemory = true
+                                },
+                                enabled = !state.busy,
+                            ) {
+                                Icon(Icons.Outlined.Psychology, null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("管理跨聊角色记忆")
+                            }
+                        }
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         ActionIcon(Icons.Outlined.Settings, "世界书设置", !state.busy) { editingBook = true }
@@ -195,6 +215,22 @@ internal fun WorldBookLibrary(state: TavernState, model: TavernViewModel) {
             model.saveBook(open.withEntries(entries.filterNot { it.id == entry.id })) {}
             deletingEntry = null
         }
+    }
+    if (managingMemory && open != null) {
+        val targetCard = state.cards.firstOrNull { it.id == memoryCardId } ?: state.cards.firstOrNull()
+        SharedWorldMemoryDialog(
+            world = open,
+            card = targetCard,
+            recall = state.lastSharedMemory,
+            busy = state.busy,
+            dismiss = { managingMemory = false },
+            refresh = { targetCard?.let { model.inspectSharedWorldMemory(open, it) } },
+            pinItem = { w, c, m -> model.pinSharedMemory(w, c, m) },
+            unpinItem = { w, c, id -> model.unpinSharedMemory(w, c, id) },
+            editItem = { w, c, key, txt -> model.editSharedMemory(w, c, key, txt) },
+            blockItem = { w, c, key, blk -> model.blockSharedMemory(w, c, key, blk) },
+            promoteItem = { w, c, txt, src -> model.promoteSharedMemoryToLore(w, c, txt, src) },
+        )
     }
 }
 

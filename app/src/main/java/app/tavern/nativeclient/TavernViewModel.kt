@@ -82,6 +82,7 @@ internal data class TavernState(
     val remoteCards: List<RemoteCard>? = null,
     val recentChats: List<RecentChat> = emptyList(),
     val libraryUsage: Map<String, LibraryUsage> = emptyMap(),
+    val lastSharedMemory: SharedMemoryRecallResult? = null,
 ) {
     val card get() = if (chat?.isTemporary == true) temporaryAssistant else cards.firstOrNull { it.id == cardId }
     val welcomeAssistant get() = cards.firstOrNull { it.id == prefs.welcome.assistantId }
@@ -107,6 +108,9 @@ internal data class TavernState(
         if (selected != null) {
             if (selected.isEmpty()) return null
             presets.firstOrNull { it.id == selected }?.let { return it }
+        }
+        prefs.activeProfile(chat)?.presetId?.let { pid ->
+            presets.firstOrNull { it.id == pid }?.let { return it }
         }
         if (chat != null) {
             val name = card?.name ?: group?.name
@@ -1596,7 +1600,8 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
             onRetry = { output.clear() }, sharedMemory = sharedMemory, loreCounter = loreCounter, onLoreBudget = {
                 loreBudget = it
                 if (it.blocked && prefs.loreSettings.overflowAlert) notice("世界书额度已达 ${it.limit} Token，部分条目未注入")
-            }, chatId = chat.id, onVariables = { persistMacroVariables(chat.id, it) }) { output.append(it) }
+            }, chatId = chat.id, onVariables = { persistMacroVariables(chat.id, it) },
+            effectiveSampling = prefs.effectiveConfig(chat).sampling) { output.append(it) }
         result.incomplete?.let { notice(it) }
         return output.toString().trim()
     }
@@ -1909,6 +1914,40 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
         val chat = current.chat ?: return@work
         require(selection == null || current.prefs.resolve(selection) != null) { "请先配置此提供商" }
         persist(chat.copy(modelOverride = selection))
+    }
+
+    fun saveConnectionProfile(draft: ConnectionProfile, done: () -> Unit) = work {
+        val profile = draft.validated()
+        val prefs = current.prefs
+        val list = prefs.connectionProfiles.toMutableList()
+        val idx = list.indexOfFirst { it.id == profile.id }
+        if (idx >= 0) list[idx] = profile else list += profile
+        persistPreferences(prefs.copy(connectionProfiles = list))
+        done()
+        notice("连接配置档案已保存")
+    }
+
+    fun deleteConnectionProfile(profileId: String, done: () -> Unit) = work {
+        val prefs = current.prefs
+        val remaining = prefs.connectionProfiles.filterNot { it.id == profileId }
+        val active = prefs.activeProfileId?.takeUnless { it == profileId }
+        persistPreferences(prefs.copy(connectionProfiles = remaining, activeProfileId = active))
+        done()
+        notice("连接配置档案已删除")
+    }
+
+    fun setActiveProfile(profileId: String?) = work {
+        val prefs = current.prefs
+        require(profileId == null || prefs.connectionProfiles.any { it.id == profileId }) { "找不到该配置档案" }
+        persistPreferences(prefs.copy(activeProfileId = profileId))
+    }
+
+    fun setChatConnectionProfile(profileId: String?) = work {
+        val chat = current.chat ?: return@work
+        require(profileId == null || profileId.isEmpty() || current.prefs.connectionProfiles.any { it.id == profileId }) {
+            "找不到该配置档案"
+        }
+        persist(chat.copy(modelOverride = null, options = chat.options.copy(connectionProfileId = profileId)))
     }
 
     fun importEmbedded() = work {
@@ -3014,7 +3053,7 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
                                                books: List<WorldBook>, groups: List<TavernGroup>, cards: List<Card>): String {
         val world = chat.memoryWorld(card, books)?.takeIf(WorldBook::sharedMemory) ?: return ""
         val groupById = groups.filter { card.id in it.memberIds }.associateBy(TavernGroup::id)
-        return withContext(Dispatchers.IO) {
+        val recall = withContext(Dispatchers.IO) {
             val context = currentCoroutineContext()
             val terms = sharedWorldTerms(history)
             val solo = store.sharedMemoryChats(card, world, chat.id)
@@ -3037,7 +3076,94 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
                     }
                 }
             }
-            sharedWorldPrompt(world, card, chat, turns)
+            selectSharedWorldMemoriesHybrid(
+                world = world,
+                card = card,
+                active = chat,
+                candidates = turns,
+                queryText = sharedWorldQueryText(history),
+                embeddingSource = current.vectorSource(),
+                embeddingService = embeddingService,
+                vectorCache = store,
+            )
+        }
+        mutable.update { it.copy(lastSharedMemory = recall) }
+        return recall.promptText
+    }
+
+    fun inspectSharedWorldMemory(world: WorldBook, card: Card, chat: Chat? = current.chat) = work {
+        if (!world.sharedMemory) return@work
+        val targetChat = chat ?: Chat(id = "", cardId = card.id, title = card.name)
+        val snapshot = current
+        val groupById = snapshot.groups.filter { card.id in it.memberIds }.associateBy(TavernGroup::id)
+        val recall = withContext(Dispatchers.IO) {
+            val context = currentCoroutineContext()
+            val terms = sharedWorldTerms(targetChat.messages)
+            val solo = store.sharedMemoryChats(card, world, targetChat.id)
+            val group = groupById.keys.asSequence().flatMap { groupId ->
+                context.ensureActive()
+                store.sharedMemoryChats(card, world, targetChat.id, groupId).asSequence()
+            }.sortedByDescending(ChatSummary::updated).take(SHARED_WORLD_CHAT_LIMIT)
+            val turns = buildList {
+                for (source in solo + group) {
+                    context.ensureActive()
+                    val previous = runCatching { store.chat(source.id) }.getOrNull()
+                    if (previous != null && previous.memoryWorld(card, snapshot.books)?.id == world.id) {
+                        addAll(previous.sharedWorldTurns(card, groupById[previous.groupId], snapshot.cards, terms))
+                    }
+                }
+            }
+            selectSharedWorldMemoriesHybrid(
+                world = world,
+                card = card,
+                active = targetChat,
+                candidates = turns,
+                queryText = sharedWorldQueryText(targetChat.messages),
+                embeddingSource = snapshot.vectorSource(),
+                embeddingService = embeddingService,
+                vectorCache = store,
+            )
+        }
+        mutable.update { it.copy(lastSharedMemory = recall) }
+    }
+
+    fun pinSharedMemory(world: WorldBook, card: Card, item: RecalledWorldMemory) {
+        val overrides = world.memoryOverridesFor(card.id)
+        val pin = PinnedWorldMemory(
+            sourceChatId = item.turn.chatId,
+            sourceTitle = item.turn.title,
+            group = item.turn.group,
+            text = item.displayText,
+        )
+        val updated = world.withMemoryOverrides(card.id, overrides.copy(pinned = overrides.pinned + pin))
+        saveBook(updated) { inspectSharedWorldMemory(updated, card) }
+    }
+
+    fun unpinSharedMemory(world: WorldBook, card: Card, pinId: String) {
+        val overrides = world.memoryOverridesFor(card.id)
+        val updated = world.withMemoryOverrides(card.id, overrides.copy(pinned = overrides.pinned.filterNot { it.id == pinId }))
+        saveBook(updated) { inspectSharedWorldMemory(updated, card) }
+    }
+
+    fun editSharedMemory(world: WorldBook, card: Card, replyKey: String, newText: String) {
+        val overrides = world.memoryOverridesFor(card.id)
+        val nextEdited = overrides.editedTexts + (replyKey to newText)
+        val updated = world.withMemoryOverrides(card.id, overrides.copy(editedTexts = nextEdited))
+        saveBook(updated) { inspectSharedWorldMemory(updated, card) }
+    }
+
+    fun blockSharedMemory(world: WorldBook, card: Card, replyKey: String, block: Boolean) {
+        val overrides = world.memoryOverridesFor(card.id)
+        val nextBlocked = if (block) overrides.blockedKeys + replyKey else overrides.blockedKeys - replyKey
+        val updated = world.withMemoryOverrides(card.id, overrides.copy(blockedKeys = nextBlocked))
+        saveBook(updated) { inspectSharedWorldMemory(updated, card) }
+    }
+
+    fun promoteSharedMemoryToLore(world: WorldBook, card: Card, memoryText: String, sourceTitle: String) {
+        val updated = promoteMemoryToLoreEntry(world, card, memoryText, sourceTitle)
+        saveBook(updated) {
+            notice("已写入世界书「${updated.name}」")
+            inspectSharedWorldMemory(updated, card)
         }
     }
 
@@ -3599,7 +3725,8 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
                                 if (it.blocked && activePrefs.loreSettings.overflowAlert) {
                                     notice("世界书额度已达 ${it.limit} Token，部分条目未注入")
                                 }
-                            }, chatId = ongoing.id, onVariables = { persistMacroVariables(ongoing.id, it) }) { fragment ->
+                            }, chatId = ongoing.id, onVariables = { persistMacroVariables(ongoing.id, it) },
+                            effectiveSampling = activePrefs.effectiveConfig(ongoing).sampling) { fragment ->
                             buffer.append(fragment)
                             val text = if (continued == null) buffer.toString() else joinContinuation(continued.text, buffer.toString())
                             mutable.update { state ->

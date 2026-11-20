@@ -212,6 +212,43 @@ internal class CompletionAccumulator {
     val hasText get() = text.isNotBlank()
     val hasOutput get() = hasText || parts.isNotEmpty()
 
+    fun appendText(fragment: String, token: (String) -> Unit) {
+        if (fragment.isEmpty()) return
+        text.append(fragment)
+        check(text.length <= MAX_MODEL_TEXT && shownReasoning.length <= MAX_MODEL_TEXT) { "生成内容超过上限" }
+        token(fragment)
+    }
+
+    fun appendReasoning(thought: String, onReasoning: (String) -> Unit, explicit: Boolean = false) {
+        if (thought.isEmpty()) return
+        shownReasoning.append(thought)
+        if (explicit) {
+            explicitReasoning = true
+            reasoning.append(thought)
+        }
+        check(text.length <= MAX_MODEL_TEXT && shownReasoning.length <= MAX_MODEL_TEXT) { "生成内容超过上限" }
+        onReasoning(thought)
+    }
+
+    fun startToolCall(index: Int, id: String, name: String) {
+        require(index in 0 until MAX_CALLS_PER_ROUND) { "模型返回了太多工具调用" }
+        parts.getOrPut(index) { CallParts() }.append(
+            jsonOf("id" to id, "function" to jsonOf("name" to name, "arguments" to "")),
+        )
+    }
+
+    fun appendToolArgs(index: Int, partialJson: String) {
+        parts[index]?.append(jsonOf("function" to jsonOf("arguments" to partialJson)))
+    }
+
+    fun appendDirectToolCall(id: String, name: String, argumentsJson: String) {
+        val index = parts.size
+        require(index in 0 until MAX_CALLS_PER_ROUND) { "模型返回了太多工具调用" }
+        parts[index] = CallParts().apply {
+            append(jsonOf("id" to id, "function" to jsonOf("name" to name, "arguments" to argumentsJson)))
+        }
+    }
+
     fun append(message: JSONObject, acceptTools: Boolean, onReasoning: (String) -> Unit, token: (String) -> Unit) {
         val content = when (val value = message.opt("content")) {
             is String -> value

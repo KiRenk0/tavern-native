@@ -38,16 +38,17 @@ private fun estimateTextTokens(text: String): Int {
 internal fun ModelConnection.contextTokens(): Int {
     val id = model.removePrefix("models/").lowercase()
     val reported = provider.modelContexts[model] ?: provider.modelContexts[id]
-    val known = when (provider.template) {
-        ProviderTemplate.DEEPSEEK -> when {
-            id == "deepseek-flash" || id == "deepseek-pro" || id.startsWith("deepseek-v4") -> 1_048_576
-            id == "deepseek-chat" || id == "deepseek-reasoner" -> 131_072
+    val known = when {
+        provider.template == ProviderTemplate.DEEPSEEK || "deepseek" in id -> when {
+            id == "deepseek-flash" || id == "deepseek-pro" || id.startsWith("deepseek-v4") || "deepseek-v4" in id -> 1_048_576
+            id == "deepseek-chat" || id == "deepseek-reasoner" || "deepseek" in id -> 131_072
             else -> null
         }
-        ProviderTemplate.GOOGLE -> 1_048_576.takeIf {
-            id.startsWith("gemini-4") || id.startsWith("gemini-3") || id.startsWith("gemini-2.5")
+        provider.template == ProviderTemplate.GOOGLE || "gemini" in id -> 1_048_576.takeIf {
+            "gemini-4" in id || "gemini-3" in id || "gemini-2.5" in id || "gemini-2.0" in id || "gemini-1.5" in id
         }
-        null -> null
+        provider.template == ProviderTemplate.ANTHROPIC || provider.protocol == ApiProtocol.ANTHROPIC || "claude" in id -> 200_000
+        else -> null
     }
     val automatic = reported ?: known
     val override = provider.contextLimit

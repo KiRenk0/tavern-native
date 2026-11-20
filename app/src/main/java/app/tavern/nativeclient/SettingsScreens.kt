@@ -135,6 +135,7 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
     var noteSettings by rememberSaveable { mutableStateOf(false) }
     var replyAutomation by rememberSaveable { mutableStateOf(false) }
     var comfyWorkflows by rememberSaveable { mutableStateOf(false) }
+    var profileSettings by rememberSaveable { mutableStateOf(false) }
     var temperature by rememberSaveable(prefs.temperature) { mutableStateOf(prefs.temperature) }
     var maxTokens by rememberSaveable(prefs.maxTokens) { mutableStateOf(prefs.maxTokens) }
     var reasoning by rememberSaveable(prefs.includeReasoning) { mutableStateOf(prefs.includeReasoning) }
@@ -180,6 +181,10 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
         })
         return
     }
+    if (profileSettings) {
+        ConnectionProfilesScreen(state, model) { profileSettings = false }
+        return
+    }
     if (selected != null) {
         val saved = prefs.providers.firstOrNull { it.id == selected }
         val draft = saved ?: ProviderTemplate.entries.firstOrNull { it.id == selected }?.profile() ?: Provider(draftId)
@@ -204,6 +209,11 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
         }
         OutlinedButton(onClick = { draftId = newId(); editor = draftId }, enabled = !state.busy) {
             Icon(Icons.Outlined.Add, null); Spacer(Modifier.width(8.dp)); Text("添加自定义提供商")
+        }
+        OutlinedButton(onClick = { profileSettings = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Outlined.Tune, null)
+            Spacer(Modifier.width(8.dp))
+            Text("连接配置档案 · ${prefs.activeProfile()?.name ?: "未指定默认档案"}")
         }
         HorizontalDivider()
         FormHeading("生成参数")
@@ -390,13 +400,37 @@ private fun ProviderEditor(provider: Provider, saved: Boolean, state: TavernStat
     var contextLimit by rememberSaveable { mutableStateOf(provider.contextLimit?.toString().orEmpty()) }
     var contexts by rememberSaveable { mutableStateOf(HashMap(provider.modelContexts)) }
     var contextEndpoint by rememberSaveable { mutableStateOf(provider.endpoint.trim()) }
+    var protocol by rememberSaveable { mutableStateOf(provider.protocol) }
+    var promptCaching by rememberSaveable { mutableStateOf(provider.promptCaching) }
+    var thinkingBudget by rememberSaveable { mutableStateOf(provider.thinkingBudget?.toString().orEmpty()) }
+    var geminiSafety by rememberSaveable { mutableStateOf(provider.geminiSafety) }
+    var openRouterProviders by rememberSaveable { mutableStateOf(provider.openRouterProviders.joinToString(", ")) }
+    var openRouterFallbacks by rememberSaveable { mutableStateOf(provider.openRouterAllowFallbacks) }
+    var openRouterEffort by rememberSaveable { mutableStateOf(provider.openRouterReasoningEffort) }
+    var textCompletion by rememberSaveable { mutableStateOf(provider.textCompletion) }
     var advanced by rememberSaveable { mutableStateOf(false) }
     var remove by remember { mutableStateOf(false) }
     val template = provider.template
     val context = contextLimit.trim().toIntOrNull()?.takeIf { it in 1..MAX_CONTEXT_TOKENS }
-    fun draft() = provider.copy(name = name, endpoint = endpoint, apiKey = apiKey, defaultModel = defaultModel,
-        models = knownModels.lineSequence().map(String::trim).filter(String::isNotBlank).toList(), streaming = streaming,
-        contextLimit = context, modelContexts = contexts.takeIf { endpoint.trim() == contextEndpoint }.orEmpty())
+    val thinking = thinkingBudget.trim().toIntOrNull()?.takeIf { it in 1..128_000 }
+    fun draft() = provider.copy(
+        name = name,
+        endpoint = endpoint,
+        apiKey = apiKey,
+        defaultModel = defaultModel,
+        models = knownModels.lineSequence().map(String::trim).filter(String::isNotBlank).toList(),
+        streaming = streaming,
+        contextLimit = context,
+        modelContexts = contexts.takeIf { endpoint.trim() == contextEndpoint }.orEmpty(),
+        protocol = protocol,
+        promptCaching = promptCaching,
+        thinkingBudget = thinking,
+        geminiSafety = geminiSafety,
+        openRouterProviders = openRouterProviders.split(',', '，', '\n').map(String::trim).filter(String::isNotBlank).distinct(),
+        openRouterAllowFallbacks = openRouterFallbacks,
+        openRouterReasoningEffort = openRouterEffort,
+        textCompletion = textCompletion,
+    )
     val canSave = if (template == null) name.isNotBlank() && endpoint.isNotBlank() && defaultModel.isNotBlank()
         else apiKey.isNotBlank()
     Form {
@@ -405,8 +439,16 @@ private fun ProviderEditor(provider: Provider, saved: Boolean, state: TavernStat
             template?.let { "默认模型为 ${it.defaultModel}。填写 Key 后即可保存。" })
         if (template == null) {
             Field("提供商名称", name, { name = it }, enabled = !state.busy)
-            Field("API 地址", endpoint, { endpoint = it }, placeholder = "https://api.example.com/v1",
-                enabled = !state.busy, type = KeyboardType.Uri)
+            SelectField("通信协议", protocol, ApiProtocol.entries, ApiProtocol::label, !state.busy) { protocol = it }
+            Field("API 地址", endpoint, { endpoint = it }, placeholder = when (protocol) {
+                ApiProtocol.ANTHROPIC -> "https://api.anthropic.com"
+                ApiProtocol.GEMINI_NATIVE -> "https://generativelanguage.googleapis.com/v1beta"
+                ApiProtocol.OLLAMA -> "http://127.0.0.1:11434"
+                ApiProtocol.KOBOLD_TEXT -> "http://127.0.0.1:5001"
+                else -> "https://api.example.com/v1"
+            }, enabled = !state.busy, type = KeyboardType.Uri)
+        } else if (template.allowedProtocols().size > 1) {
+            SelectField("通信协议", protocol, template.allowedProtocols(), ApiProtocol::label, !state.busy) { protocol = it }
         }
         Field(if (template == null) "API Key（可选）" else "API Key",
             apiKey, { apiKey = it }, secret = true, enabled = !state.busy)
@@ -427,8 +469,37 @@ private fun ProviderEditor(provider: Provider, saved: Boolean, state: TavernStat
                 Text("流式回复", Modifier.weight(1f))
                 Switch(streaming, { streaming = it }, enabled = !state.busy)
             }
+            if (protocol == ApiProtocol.ANTHROPIC || protocol == ApiProtocol.GEMINI_NATIVE) {
+                GroupToggle("启用 Prompt / Context 缓存", promptCaching, !state.busy) { promptCaching = it }
+            }
+            if (protocol in setOf(ApiProtocol.ANTHROPIC, ApiProtocol.GEMINI_NATIVE, ApiProtocol.OPENROUTER)) {
+                Field("思考预算 Token（可选）", thinkingBudget, { thinkingBudget = it }, enabled = !state.busy,
+                    placeholder = "留空按模型默认", type = KeyboardType.Number)
+            }
+            if (protocol == ApiProtocol.GEMINI_NATIVE) {
+                SelectField("安全过滤级别", geminiSafety, GeminiSafetyLevel.entries, GeminiSafetyLevel::label, !state.busy) {
+                    geminiSafety = it
+                }
+            }
+            if (protocol == ApiProtocol.OPENROUTER) {
+                Field("优先提供商路由（逗号分隔，可选）", openRouterProviders, { openRouterProviders = it }, enabled = !state.busy,
+                    placeholder = "例如：anthropic, google-vertex")
+                GroupToggle("允许 OpenRouter 自动回退其他节点", openRouterFallbacks, !state.busy) { openRouterFallbacks = it }
+                SelectField(
+                    "OpenRouter 思考强度",
+                    openRouterEffort,
+                    listOf("", "low", "medium", "high"),
+                    { when (it) { "low" -> "低"; "medium" -> "中"; "high" -> "高"; else -> "默认" } },
+                    !state.busy,
+                ) { openRouterEffort = it }
+            }
+            if (protocol == ApiProtocol.OLLAMA) {
+                GroupToggle("使用 Text Completion（/api/generate）", textCompletion, !state.busy) { textCompletion = it }
+            }
         }
-        Button({ model.saveProvider(draft(), close) }, enabled = canSave && !state.busy && (contextLimit.isBlank() || context != null),
+        Button({ model.saveProvider(draft(), close) },
+            enabled = canSave && !state.busy && (contextLimit.isBlank() || context != null) &&
+                (thinkingBudget.isBlank() || thinking != null),
             modifier = Modifier.fillMaxWidth()) { Text("保存提供商") }
         if (saved) TextButton({ remove = true }, enabled = !state.busy) { Text("移除此提供商") }
     }

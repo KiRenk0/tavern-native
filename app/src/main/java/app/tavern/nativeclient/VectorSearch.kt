@@ -82,8 +82,9 @@ internal data class VectorPreferences(
 
 internal fun supportsEmbeddings(provider: Provider) = when (provider.template) {
     ProviderTemplate.GOOGLE -> provider.apiKey.isNotBlank()
-    ProviderTemplate.DEEPSEEK -> false
-    null -> provider.endpoint.isNotBlank()
+    ProviderTemplate.DEEPSEEK, ProviderTemplate.ANTHROPIC -> false
+    ProviderTemplate.OPENROUTER -> provider.apiKey.isNotBlank()
+    null -> provider.endpoint.isNotBlank() && provider.protocol !in setOf(ApiProtocol.ANTHROPIC, ApiProtocol.KOBOLD_TEXT)
 }
 
 internal sealed interface EmbeddingSource {

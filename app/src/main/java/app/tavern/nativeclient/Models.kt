@@ -499,6 +499,8 @@ internal data class Preferences(
     val library: LibraryPreferences = LibraryPreferences(),
     val replyAutomation: ReplyAutomation = ReplyAutomation(),
     val chatAppearance: ChatAppearance = ChatAppearance(),
+    val connectionProfiles: List<ConnectionProfile> = emptyList(),
+    val activeProfileId: String? = null,
 ) {
     fun personaFor(chat: Chat? = null, subjectId: String? = chat?.cardId ?: chat?.groupId,
                    temporaryId: String? = null): PersonaProfile =
@@ -511,6 +513,5 @@ internal data class Preferences(
         return ModelConnection(provider, requireNotNull(selection).model)
     }
 
-    fun connectionFor(chat: Chat? = null): ModelConnection? =
-        resolve(chat?.modelOverride) ?: resolve(defaultSelection)
+    fun connectionFor(chat: Chat? = null): ModelConnection? = effectiveConfig(chat).connection
 }

@@ -123,6 +123,20 @@ internal data class WorldBook(
     fun withSharedMemory(enabled: Boolean): WorldBook = copy(raw = root()
         .put("tavern_native_shared_memory", enabled).toString())
 
+    fun memoryOverridesFor(cardId: String): WorldMemoryOverrides {
+        val all = root().optJSONObject("tavern_native_memory_overrides") ?: return WorldMemoryOverrides()
+        return WorldMemoryOverrides.fromJson(all.optJSONObject(cardId))
+    }
+
+    fun withMemoryOverrides(cardId: String, overrides: WorldMemoryOverrides): WorldBook {
+        val data = root()
+        val all = data.optJSONObject("tavern_native_memory_overrides") ?: JSONObject()
+        if (overrides.isEmpty) all.remove(cardId) else all.put(cardId, overrides.json())
+        if (all.length() == 0) data.remove("tavern_native_memory_overrides")
+        else data.put("tavern_native_memory_overrides", all)
+        return copy(raw = data.toString())
+    }
+
     fun export(): ByteArray = root().apply { put("name", name) }.toString(2).toByteArray(Charsets.UTF_8)
 
     companion object {

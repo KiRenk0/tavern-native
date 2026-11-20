@@ -690,6 +690,8 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
             translationServices = TranslationServices.from(j.optJSONObject("translationServices"), ::unseal),
             library = LibraryPreferences.from(j.optJSONObject("library")),
             chatAppearance = ChatAppearance.from(j.optJSONObject("chatAppearance")),
+            connectionProfiles = j.optJSONArray("connectionProfiles")?.objects()?.mapNotNull(ConnectionProfile::fromJson).orEmpty(),
+            activeProfileId = j.string("activeProfileId").takeIf(String::isNotBlank),
         )
     }
 
@@ -716,6 +718,8 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
             "translationServices" to prefs.translationServices.json(::seal),
             "library" to prefs.library.json(),
             "chatAppearance" to prefs.chatAppearance.json(),
+            "connectionProfiles" to JSONArray(prefs.connectionProfiles.map(ConnectionProfile::json)),
+            "activeProfileId" to prefs.activeProfileId,
             "temperature" to prefs.temperature, "maxTokens" to prefs.maxTokens,
             "theme" to prefs.theme, "dynamicColor" to prefs.dynamicColor,
             "server" to prefs.server, "handle" to prefs.handle,
