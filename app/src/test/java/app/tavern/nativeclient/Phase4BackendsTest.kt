@@ -180,7 +180,7 @@ class Phase4BackendsTest {
             saveChat = { chat -> state = state.copy(chat = chat) },
             savePrefs = { prefs -> state = state.copy(prefs = prefs) },
             ask = { null },
-            generate = { "" },
+            trigger = { _, _ -> },
             quiet = { _, _ -> "" },
             draft = {},
             saveVariables = { chatId, changes ->

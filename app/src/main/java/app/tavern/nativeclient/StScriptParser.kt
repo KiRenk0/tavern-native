@@ -21,6 +21,7 @@ internal data class ScriptArgument(val raw: String, val start: Int = 0) {
 
 internal data class ScriptCommand(
     val name: String, val named: Map<String, ScriptArgument>, val args: List<ScriptArgument>, val source: String, val line: Int,
+    val repeatedTags: List<ScriptArgument> = emptyList(),
 ) {
     fun rawFrom(index: Int): String = args.getOrNull(index)?.start?.let { source.substring(it).trimEnd() }.orEmpty()
 }
@@ -68,6 +69,7 @@ private class ScriptReader(private val source: String) {
             require(name.isNotEmpty()) { "第 $line 行缺少命令名" }
             val commandStart = cursor
             val fields = linkedMapOf<String, ScriptArgument>()
+            val tags = mutableListOf<ScriptArgument>()
             val positional = mutableListOf<ScriptArgument>()
             while (!commandEnd()) {
                 while (char?.isWhitespace() == true && !commandEnd()) cursor++
@@ -75,12 +77,13 @@ private class ScriptReader(private val source: String) {
                 val named = if (positional.isEmpty()) takeAssignment() else null
                 if (named != null) {
                     fields[named.first] = named.second
+                    if (name in setOf("char-find", "findchar") && named.first == "tag") tags += named.second
                     continue
                 }
                 val point = cursor
                 positional += ScriptArgument(readArgument(), point - commandStart)
             }
-            commands += ScriptCommand(name, fields, positional, source.substring(commandStart, cursor), line)
+            commands += ScriptCommand(name, fields, positional, source.substring(commandStart, cursor), line, tags)
             if (char == '|' || char == '\n') cursor++
         }
         return ParsedScript(defaults, commands)

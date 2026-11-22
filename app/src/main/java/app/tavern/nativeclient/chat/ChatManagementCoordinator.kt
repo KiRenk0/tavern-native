@@ -11,6 +11,33 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 
 internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
+    suspend fun conversationStatistics(chat: Chat?, cardId: String?, groupId: String?): ConversationStatistics =
+        withContext(Dispatchers.IO) {
+            val context = currentCoroutineContext()
+            val result = ConversationStatisticsCollector()
+            if (chat != null) {
+                result.add(chat) { context.ensureActive() }
+                return@withContext result.snapshot()
+            }
+            var skipped = 0
+            for (id in host.store.statisticsChatIds(cardId, groupId)) {
+                context.ensureActive()
+                val history = try {
+                    host.store.chat(id)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: org.json.JSONException) {
+                    null
+                } catch (_: IllegalArgumentException) {
+                    null
+                } catch (_: IllegalStateException) {
+                    null
+                }
+                if (history == null) skipped++ else result.add(history) { context.ensureActive() }
+            }
+            result.snapshot(skipped)
+        }
+
     fun attachChatDocuments(chatId: String, messageIndex: Int?, uris: List<Uri>) {
         val chat = host.current.chat?.takeIf { it.id == chatId } ?: return
         if (uris.isEmpty()) return
@@ -103,35 +130,64 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
         }
     }
 
-    private suspend fun startChat(card: Card, greeting: String) {
+    internal suspend fun startChat(card: Card, greeting: String) {
         val prefs = host.current.prefs
         val persona = prefs.personaFor(subjectId = card.id)
         val chat = Chat(newId(), card.id, "", options = ConversationOptions(authorNote = host.current.prefs.defaultAuthorNote))
         val preset = host.current.copy(cardId = card.id, groupId = null).presetFor(chat)
-        val rules = prefs.regex.runtime(card, persona.name, preset)
-        val (messages, variables) = if (greeting.isBlank()) emptyList<Message>() to MacroVariableChanges()
-        else withContext(Dispatchers.Default) {
-            val macros = ConversationMacros(
-                card, persona, options = chat.options, globals = prefs.scriptVariables,
-                model = prefs.connectionFor(chat)?.model.orEmpty(), chatId = chat.id,
-            )
-            val text = rules.transform(macros.expand(greeting, write = true), RegexSite.REPLY, RegexStage.STORAGE)
-            val message = text.takeIf(String::isNotBlank)?.let { Message("assistant", card.name, it, characterId = card.id) }
-            listOfNotNull(message) to macros.variables.changes()
+        val (opening, variables) = withContext(Dispatchers.Default) {
+            openingGreeting(chat, card, prefs, persona, preset, greeting)
         }
         val history = if (host.current.cardId == card.id) host.current.history else withContext(Dispatchers.IO) { host.store.chats(card.id) }
         val title = if (history.isEmpty()) "新对话" else "新对话 · ${history.size + 1}"
+        val available = chat.copy(title = title).availableTitle(history)
         val locals = chat.options.variables.withVariableChanges(variables.local)
         val globals = variables.global.takeIf { it.isNotEmpty() }?.let { host.current.prefs.scriptVariables.withVariableChanges(it) }
         withContext(NonCancellable) {
-            host.persist(chat.copy(title = title, messages = messages, options = chat.options.copy(variables = locals)), scriptGlobals = globals)
+            host.persist(chat.copy(title = available, messages = listOfNotNull(opening), options = chat.options.copy(variables = locals)), scriptGlobals = globals)
         }
-        messages.forEach { host.media.narrate(it, automatic = true) }
+        opening?.let { host.media.narrate(it, automatic = true) }
         host.script.quickEvent(QuickEvent.NEW)
         host.script.quickEvent(QuickEvent.CHAT)
     }
 
-    fun openChat(id: String) = host.work {
+    fun openChat(id: String) = host.work { openStoredChat(id) }
+
+    fun reloadChat(id: String) = host.work { reloadStoredChat(id) }
+
+    private suspend fun reloadStoredChat(id: String) {
+        val active = host.current.chat?.takeIf { it.id == id && !it.isTemporary } ?: return
+        host.generation.stopAuto()
+        val (saved, history) = withContext(Dispatchers.IO) {
+            val loaded = host.store.chat(active.id)
+            loaded to host.store.chats(loaded.cardId, loaded.groupId)
+        }
+        host.showChat(saved, history, resetPersona = false)
+        host.mutable.update { it.copy(googleReplies = it.googleReplies.filterNot { reply -> reply.chatId == id },
+            lastPrompt = it.lastPrompt?.takeUnless { prompt -> prompt.chatId == id }) }
+        host.notice("已重新载入聊天")
+    }
+
+    suspend fun scriptChatAction(action: ScriptChatAction, chat: Chat, value: String) {
+        if (action != ScriptChatAction.JUMP && host.current.generation != null) {
+            host.notice("请等待当前回复结束再操作聊天")
+            return
+        }
+        when (action) {
+            ScriptChatAction.RENAME -> if (value.isBlank()) host.notice("请输入聊天名称") else renameActiveChat(chat.id, value)
+            ScriptChatAction.CLOSE -> if (host.current.chat?.id == chat.id) host.library.closeSubject() else Unit
+            ScriptChatAction.RELOAD -> if (chat.isTemporary) host.notice("请先打开已保存的聊天") else reloadStoredChat(chat.id)
+            ScriptChatAction.JUMP -> {
+                val target = scriptChatJump(chat, value)
+                if (target != null) host.mutable.update { if (it.chat?.id == target.chatId) it.copy(archiveJump = target) else it }
+                else host.notice("请输入聊天中的消息编号，从 0 开始")
+            }
+        }
+    }
+
+    fun openArchiveHit(hit: ChatArchiveHit, query: String) = host.work { openStoredChat(hit.chat.id, hit, query) }
+
+    internal suspend fun openStoredChat(id: String, hit: ChatArchiveHit? = null, query: String = ""): Chat {
         host.generation.stopAuto()
         val (chat, history) = withContext(Dispatchers.IO) {
             val opened = host.store.chat(id)
@@ -139,7 +195,15 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
             opened to host.store.chats(opened.cardId, opened.groupId)
         }
         host.showChat(chat, history, resetPersona = true)
+        if (hit?.match != null) {
+            val position = if (hit.chat.updated == chat.updated) hit.match.index
+                else withContext(Dispatchers.Default) { ChatArchiveQuery(query).match(chat.messages)?.index }
+            if (position != null && position in chat.messages.indices) {
+                host.mutable.update { it.copy(archiveJump = ChatArchiveJump(chat.id, position)) }
+            }
+        }
         host.script.quickEvent(QuickEvent.CHAT)
+        return chat
     }
 
     fun openTemporaryChat(uri: Uri? = null, title: String = "临时聊天") = host.work {
@@ -148,7 +212,9 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
         val chat = try {
             if (uri == null) Chat(newId(), temporaryAssistant.id, title)
             else withContext(Dispatchers.IO) {
-                readChatFile(uri, title, temporaryAssistant, null, emptyList(), media.documents, media.images)
+                val loaded = readChatFiles(uri, title, temporaryAssistant, null, emptyList(), host.current.persona.name,
+                    media.documents, media.images, media.videos)
+                requireNotNull(loaded.singleOrNull()) { "文件包含多段聊天，请在角色或群组详情页批量导入" }
             }
         } catch (e: Exception) {
             withContext(NonCancellable + Dispatchers.IO) { media.close() }
@@ -160,31 +226,66 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
         if (uri != null) host.notice("已载入临时聊天")
     }
 
-    fun renameChat(chat: Chat, name: String) = host.work {
-        require(name.isNotBlank()) { "请输入聊天名称" }
-        host.persist(chat.copy(title = name.trim()))
+    fun renameChat(chat: Chat, name: String) = host.work { renameActiveChat(chat.id, name) }
+
+    private suspend fun renameActiveChat(id: String, name: String) {
+        val current = host.current.chat?.takeIf { it.id == id } ?: return
+        if (current.isTemporary) {
+            require(name.isNotBlank()) { "请输入聊天名称" }
+            host.persist(current.copy(title = name.trim()))
+        } else renameStoredChat(id, name)
     }
 
-    fun forkChat(position: Int, checkpoint: Boolean, requestedName: String = "") = host.work {
-        val chat = host.current.chat ?: return@work
+    fun renameChatFile(id: String, name: String, done: () -> Unit = {}) = host.work(completed = done) { renameStoredChat(id, name) }
+
+    private suspend fun renameStoredChat(id: String, name: String) = withContext(NonCancellable) {
+        require(name.isNotBlank()) { "请输入聊天名称" }
+        val state = host.current
+        require(state.cardId != null || state.groupId != null) { "请先选择角色或群组" }
+        val (history, open) = withContext(Dispatchers.IO) {
+            val saved = host.store.renameChatFile(id, name.trim(), state.cardId, state.groupId)
+            saved to state.chat?.takeUnless(Chat::isTemporary)?.let { host.store.chat(it.id) }
+        }
+        host.mutable.update { it.copy(history = history, chat = open?.takeIf { chat -> chat.id == it.chat?.id } ?: it.chat) }
+        host.notice("聊天已重命名")
+    }
+
+    fun forkChat(position: Int, checkpoint: Boolean, requestedName: String = "", swipe: Int? = null) = host.work {
+        createChatFork(position, checkpoint, requestedName, swipe)
+    }
+
+    fun refreshCheckpoint(position: Int, checkpointId: String) = host.work {
+        val chat = requireNotNull(host.current.chat?.takeUnless(Chat::isTemporary)) { "请先打开已保存的聊天" }
+        host.generation.stopAuto()
+        val (source, history) = withContext(Dispatchers.IO) {
+            val updated = host.store.refreshCheckpoint(chat.id, checkpointId, position)
+            updated to host.store.chats(updated.cardId, updated.groupId)
+        }
+        host.mutable.update { it.copy(chat = source, history = history) }
+        host.notice("检查点已更新")
+    }
+
+    internal suspend fun createChatFork(position: Int, checkpoint: Boolean, requestedName: String, swipe: Int? = null): String {
+        val chat = requireNotNull(host.current.chat) { "请先打开对话" }
         require(!chat.isTemporary) { "请先将临时聊天导入角色或群组" }
+        require(checkpoint || host.current.generation == null) { "请等待当前回复结束再切换聊天" }
         host.generation.stopAuto()
         val title = requestedName.trim().ifBlank { chat.nextForkTitle(host.current.history, checkpoint) }
         require(host.current.history.none { it.title == title }) { "聊天名称已存在" }
-        val (source, fork) = chat.fork(position, title, checkpoint)
+        val (source, fork) = chat.fork(position, title, checkpoint, swipe)
         val history = withContext(Dispatchers.IO) {
             host.store.saveFork(source, fork)
             if (!checkpoint) host.store.rememberLastChat(fork.id)
             host.store.chats(source.cardId, source.groupId)
         }
-        host.mutable.update {
-            it.copy(
-                chat = if (checkpoint) source else fork,
-                history = history,
-                temporaryPersonaId = it.temporaryPersonaId.takeIf { checkpoint },
-            )
+        if (checkpoint) {
+            host.mutable.update { it.copy(chat = source, history = history) }
+            host.notice("检查点已保存")
+        } else {
+            host.showChat(fork, history, resetPersona = true)
+            host.script.quickEvent(QuickEvent.CHAT)
         }
-        if (checkpoint) host.notice("检查点已保存")
+        return title
     }
 
     fun convertToGroup(done: () -> Unit) = host.work {
@@ -262,41 +363,74 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
         host.showChat(chat, history, resetPersona = true)
     }
 
+    fun restoreChatBackup(id: Long, done: () -> Unit) = host.work(completed = done) {
+        val card = host.current.card?.takeUnless { host.current.chat?.isTemporary == true }
+        val group = host.current.group
+        require((card != null) != (group != null)) { "请选择要恢复到的角色或群组" }
+        val backup = withContext(Dispatchers.IO) { host.store.chatBackup(id) }
+        copyHistory(backup, card, group)
+        host.notice("已从备份恢复聊天副本")
+    }
+
     fun removeChat(chat: ChatSummary) = host.work {
         val (cardId, groupId) = host.current.cardId to host.current.groupId
         val history = withContext(Dispatchers.IO) { host.store.deleteChat(chat.id); host.store.chats(cardId, groupId) }
         host.mutable.update { it.copy(history = history, chat = it.chat?.takeUnless { open -> open.id == chat.id }) }
     }
 
-    fun importChat(uri: Uri, title: String) = host.work {
+    fun importChats(uris: List<Uri>) = host.work {
+        if (uris.isEmpty()) return@work
         val (card, group) = host.current.card to host.current.group
         require(card != null || group != null) { "请先选择目标角色或群组" }
         require(host.current.chat?.isTemporary != true) { "请使用载入临时聊天" }
         val cards = host.current.cards
+        val userName = host.current.persona.name
         host.generation.stopAuto()
-        val chat = withContext(Dispatchers.IO) { readChatFile(uri, title, card, group, cards, host.savedDocuments, host.savedImages) }
-        host.persist(chat)
-        host.notice("聊天已导入")
+        var added = 0
+        var failures = 0
+        var firstFailure: String? = null
+        val (selected, history) = withContext(Dispatchers.IO) {
+            var first: Chat? = null
+            for (uri in uris.distinct()) {
+                currentCoroutineContext().ensureActive()
+                var name = "聊天文件"
+                try {
+                    name = host.app.documentName(uri)
+                    val parsed = readChatFiles(uri, name, card, group, cards, userName,
+                        host.savedDocuments, host.savedImages, host.savedVideos)
+                    val imported = host.store.importChats(parsed, card?.id, group?.id)
+                    added += imported.size
+                    if (first == null) first = imported.firstOrNull()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    failures++
+                    if (firstFailure == null) firstFailure =
+                        "${name.take(100)} · ${(e.localizedMessage ?: "无法读取聊天文件").take(160)}"
+                }
+            }
+            first?.let { host.store.rememberLastChat(it.id) }
+            first to host.store.chats(card?.id, group?.id)
+        }
+        if (selected != null) host.showChat(selected, history, resetPersona = true)
+        val summary = "已导入 $added 段聊天"
+        host.notice(if (failures == 0) summary else "$summary，$failures 个文件失败。$firstFailure")
     }
 
-    private suspend fun readChatFile(
+    private suspend fun readChatFiles(
         uri: Uri,
         title: String,
         card: Card?,
         group: TavernGroup?,
         cards: List<Card>,
+        userName: String,
         documents: ChatDocumentStore,
         images: ChatImageStore,
-    ): Chat {
+        videos: ChatVideoStore,
+    ): List<Chat> {
         val members = group?.members(cards).orEmpty()
-        fun parse(bytes: ByteArray): Chat {
-            val root = bytes.toString(Charsets.UTF_8).trimStart('\uFEFF')
-            val rows = root.lineSequence().withIndex().filter { it.value.isNotBlank() }.map { (index, line) ->
-                boundedJsonObject(line, "无法读取聊天文件第 ${index + 1} 行")
-            }.toList()
-            val chatTitle = title.replace(Regex("(?i)\\.(jsonl|zip)$"), "").ifBlank { "导入的聊天" }
-            return Chat.import(null, chatTitle, rows).withOwner(card, group, members, knownCards = cards)
-        }
+        val assistantName = card?.name ?: members.singleOrNull()?.name ?: "角色"
+        fun attach(chat: Chat) = chat.withOwner(card, group, members, knownCards = cards)
         return requireNotNull(host.resolver.openInputStream(uri)) { "无法打开聊天文件" }.buffered().use { input ->
             input.mark(4)
             val header = ByteArray(4)
@@ -307,17 +441,43 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
             }
             val archive = ChatMediaArchive.isArchive(header)
             input.reset()
-            if (archive) ChatMediaArchive.read(input, ::parse, documents::restore, images::restore)
-            else host.backup.hydrateOriginalDocuments(parse(input.readLimited()), documents).first
+            if (archive) {
+                val chat = ChatMediaArchive.read(input, { transcript ->
+                    attach(importJsonLinesChat(transcript.decodeToString(), chatImportTitle(title)))
+                }, documents::restore, { video, stream -> videos.restore(video, stream) }, images::restore)
+                listOf(chat)
+            } else {
+                importChatTranscripts(input.readLimited(), title, userName, assistantName).map { chat ->
+                    host.backup.hydrateOriginalDocuments(attach(chat), documents).first
+                }
+            }
         }
     }
 
     fun exportChat(uri: Uri, chat: Chat, subject: String, withAttachments: Boolean = false) = host.work {
-        val name = host.current.persona.name
-        val book = chat.options.worldBook(host.current.books)
-        val history = host.current.history
+        val format = if (withAttachments) ChatExportFormat.ARCHIVE else ChatExportFormat.JSONL
+        writeChatExport(uri, chat, subject, format, host.current)
+    }
+
+    fun exportChatFile(uri: Uri, id: String, format: ChatExportFormat) = host.work {
+        val state = host.current
+        val saved = withContext(Dispatchers.IO) { host.store.chat(id) }
+        require(saved.cardId == state.cardId && saved.groupId == state.groupId) { "找不到所选聊天" }
+        val subject = state.card?.name ?: state.group?.name ?: error("找不到所选聊天的角色或群组")
+        writeChatExport(uri, saved, subject, format, state)
+    }
+
+    private suspend fun writeChatExport(uri: Uri, chat: Chat, subject: String, format: ChatExportFormat, state: TavernState) {
+        if (format == ChatExportFormat.TEXT) {
+            withContext(Dispatchers.IO) { host.writeUri(uri, chat.plainText()) }
+            host.notice("聊天文本已导出")
+            return
+        }
+        val name = if (chat.id == state.chat?.id) state.persona.name else state.prefs.personaFor(chat).name
+        val book = chat.options.worldBook(state.books)
+        val history = state.history
         val quickNames = chat.options.quickReplyNames + chat.options.quickReplySets.mapNotNull { id ->
-            host.current.prefs.quickReplies.sets.firstOrNull { it.id == id }?.name
+            state.prefs.quickReplies.sets.firstOrNull { it.id == id }?.name
         }
         val portable = chat.copy(
             messages = chat.messages.map { it.portable(history) },
@@ -329,31 +489,38 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
                 worldBookName = book?.name ?: chat.options.worldBookName.takeIf { chat.options.worldBookId.isEmpty() }.orEmpty(),
             ),
         )
+        val images = if (chat.isTemporary) host.imageStore else host.savedImages
+        val documents = if (chat.isTemporary) host.documentStore else host.savedDocuments
+        val videos = if (chat.isTemporary) host.videoStore else host.savedVideos
         withContext(Dispatchers.IO) {
             val transcript = portable.jsonl(subject, name)
-            if (withAttachments) requireNotNull(host.resolver.openOutputStream(uri, "wt")) { "无法写入所选文件" }.use { output ->
-                ChatMediaArchive.write(output, transcript, portable, host.documentStore::bytes, host.imageStore::bytes)
+            if (format == ChatExportFormat.ARCHIVE) requireNotNull(host.resolver.openOutputStream(uri, "wt")) { "无法写入所选文件" }.use { output ->
+                ChatMediaArchive.write(output, transcript, portable, documents::bytes, videos::input) { image ->
+                    images.bytes(image) ?: image.takeIf { it == portable.options.background }?.let(host.savedImages::bytes)
+                }
             } else host.writeUri(uri, transcript)
         }
         host.notice("聊天已导出")
     }
 
     fun exportChatText(uri: Uri, chat: Chat) = host.work {
-        withContext(Dispatchers.IO) { host.writeUri(uri, chat.plainText()) }
-        host.notice("聊天文本已导出")
+        writeChatExport(uri, chat, "", ChatExportFormat.TEXT, host.current)
     }
 
-    fun editMessage(chat: Chat, index: Int, text: String) = host.work {
-        require(text.isNotBlank()) { "消息不能为空" }
+    fun editMessage(chat: Chat, index: Int, text: String, done: () -> Unit = {}) = host.work(completed = done) {
         host.generation.stopAuto()
-        val updated = chat.messages.toMutableList()
-        val message = updated[index]
+        val active = host.current.chat?.takeIf { it.id == chat.id } ?: return@work
+        val message = active.messages.getOrNull(index) ?: return@work
+        updateMessage(active, index, editedMessage(active, message, text))
+    }
+
+    private suspend fun editedMessage(chat: Chat, message: Message, text: String): Message {
+        require(message.acceptsEditing(text)) { "消息不能为空" }
         val rules = host.current.textRules(chat, host.current.regexCard(message))
         val replacement = withContext(Dispatchers.Default) {
             message.regexSite?.let { rules.transform(text, it, RegexStage.STORAGE, editing = true) } ?: text
         }
-        updated[index] = message.withText(replacement)
-        host.persist(chat.copy(messages = updated, updated = System.currentTimeMillis()))
+        return message.withText(replacement)
     }
 
     fun editReasoning(chat: Chat, index: Int, text: String) = host.work {
@@ -368,9 +535,10 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
         host.persist(chat.copy(messages = updated, updated = System.currentTimeMillis()))
     }
 
-    fun deleteMessages(chat: Chat, indices: Set<Int>, includeTools: Boolean = true) = host.work {
+    fun deleteMessages(chat: Chat, indices: Set<Int>, includeTools: Boolean = true, done: () -> Unit = {}) = host.work(completed = done) {
         host.generation.stopAuto()
-        removeMessages(chat, indices, includeTools)
+        val active = host.current.chat?.takeIf { it.id == chat.id } ?: return@work
+        removeMessages(active, indices, includeTools)
     }
 
     internal suspend fun removeMessages(chat: Chat, indices: Set<Int>, includeTools: Boolean) {
@@ -381,22 +549,25 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
         ))
     }
 
-    fun duplicateMessage(chat: Chat, index: Int) = host.work {
+    fun duplicateMessage(chat: Chat, index: Int, draft: String? = null, done: () -> Unit = {}) = host.work(completed = done) {
         host.generation.stopAuto()
-        val original = chat.messages[index]
-        val copy = original.copy(checkpoint = null, branches = emptyList())
-        host.persist(chat.copy(
-            messages = chat.messages.toMutableList().apply { add(index + 1, copy) },
+        val active = host.current.chat?.takeIf { it.id == chat.id } ?: return@work
+        val original = active.messages.getOrNull(index) ?: return@work
+        val copy = (draft?.let { editedMessage(active, original, it) } ?: original)
+            .copy(checkpoint = null, branches = emptyList())
+        host.persist(active.copy(
+            messages = active.messages.toMutableList().apply { add(index + 1, copy) },
             updated = System.currentTimeMillis(),
         ))
     }
 
-    fun moveMessage(chat: Chat, index: Int, direction: Int) = host.work {
+    fun moveMessage(chat: Chat, index: Int, direction: Int, done: () -> Unit = {}) = host.work(completed = done) {
         host.generation.stopAuto()
+        val active = host.current.chat?.takeIf { it.id == chat.id } ?: return@work
         val destination = index + direction
-        require(destination in chat.messages.indices) { "消息已在对话边界" }
-        val moved = chat.messages.toMutableList().apply { add(destination, removeAt(index)) }
-        host.persist(chat.copy(messages = moved, updated = System.currentTimeMillis()))
+        require(index in active.messages.indices && destination in active.messages.indices) { "消息已在对话边界" }
+        val moved = active.messages.toMutableList().apply { add(destination, removeAt(index)) }
+        host.persist(active.copy(messages = moved, updated = System.currentTimeMillis()))
     }
 
     fun swipe(chat: Chat, messageIndex: Int, option: Int) = host.work {
@@ -556,16 +727,27 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
         host.persist(chat.copy(messages = chat.messages.withSummary(previous.index, "")))
     }
 
+    fun saveSummaryExtras(settings: SummaryExtrasSettings, done: () -> Unit) = host.work {
+        val clean = settings.copy(endpoint = settings.endpoint.trim(), apiKey = settings.apiKey.trim())
+        if (clean.endpoint.isNotEmpty()) clean.requestAddress()
+        else require(clean.apiKey.isEmpty()) { "请填写 Extras 服务地址" }
+        host.persistPreferences(host.current.prefs.copy(summaryExtras = clean))
+        done()
+    }
+
     private suspend fun refreshMemory(chat: Chat, force: Boolean): String? {
         val batch = withContext(Dispatchers.Default) { chat.summaryBatch(force) } ?: return null
         val options = chat.options.memory
-        val result = ModelService.utility(
-            host.current.prefs.utilityModel(chat, options.model, "摘要"),
-            batch.messages,
-            options.maxTokens,
-        )
+        val prefs = host.current.prefs
+        val result = when (options.source) {
+            SummarySource.MODEL -> ModelService.utility(prefs.utilityModel(chat, options.model, "摘要"),
+                batch.forModel(options.modelInstruction()), options.maxTokens)
+            SummarySource.EXTRAS -> summarizeWithExtras(prefs.summaryExtras, batch.forExtras())
+        }
         val messages = withContext(Dispatchers.Default) { chat.messages.withSummary(batch.lastIndex, result) }
-        host.persist(chat.copy(messages = messages))
+        val active = host.current.chat?.takeIf { it.id == chat.id && it.messages == chat.messages }
+            ?: error("对话内容已变更，请重新更新摘要")
+        host.persist(active.copy(messages = messages, options = active.options.copy(memory = options)))
         return result
     }
 
@@ -577,7 +759,7 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
     }
 
     internal suspend fun summarizeAutomatically(chat: Chat) {
-        if (!chat.options.memory.enabled || chat.options.memory.paused || chat.options.memory.interval == 0) return
+        if (!chat.options.memory.automatic) return
         try {
             refreshMemory(chat, false)
         } catch (e: CancellationException) {
@@ -587,14 +769,21 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
         }
     }
 
-    internal suspend fun scriptSummarize(text: String, instruction: String?): String {
-        val chat = requireNotNull(host.current.chat) { "请先打开对话" }
-        val options = chat.options.memory
-        if (text.isNotBlank()) return ModelService.utility(
-            host.current.prefs.utilityModel(chat, options.model, "摘要"),
-            utilityMessages(instruction ?: options.instruction, text),
-            options.maxTokens,
-        )
-        return refreshMemory(chat, true) ?: chat.messages.currentSummary()?.summary?.text.orEmpty()
+    internal suspend fun scriptSummarize(text: String, arguments: Map<String, String>): String {
+        val chat = host.current.chat
+        if (text.isBlank()) {
+            val active = requireNotNull(chat) { "请先打开对话" }
+            return refreshMemory(active, true) ?: active.messages.currentSummary()?.summary?.text.orEmpty()
+        }
+        val options = chat?.options?.memory ?: MemoryOptions()
+        val source = arguments["source"]?.let { value ->
+            requireNotNull(SummarySource.entries.firstOrNull { it.wire == value }) { "source= 可选 main 或 extras" }
+        } ?: options.source
+        val prefs = host.current.prefs
+        return when (source) {
+            SummarySource.MODEL -> ModelService.utility(prefs.utilityModel(chat, options.model, "摘要"),
+                utilityMessages(options.modelInstruction(arguments["prompt"]), text), options.maxTokens)
+            SummarySource.EXTRAS -> summarizeWithExtras(prefs.summaryExtras, text)
+        }
     }
 }

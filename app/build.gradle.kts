@@ -11,8 +11,8 @@ android {
         applicationId = "app.tavern.nativeclient"
         minSdk = 26
         targetSdk = 36
-        versionCode = 50
-        versionName = "0.48.0"
+        versionCode = 85
+        versionName = "0.83.0"
     }
 
     buildFeatures { compose = true }
@@ -54,8 +54,13 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.10.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     implementation("org.jruby.joni:joni:2.2.10")
+    implementation("com.github.jknack:handlebars:4.5.8") {
+        exclude(group = "org.openjdk.nashorn", module = "nashorn-core")
+    }
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.23.2")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    implementation("org.snakeyaml:snakeyaml-engine:2.10")
+    implementation("com.knuddels:jtokkit:1.1.0")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
 }

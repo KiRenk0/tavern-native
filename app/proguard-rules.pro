@@ -5,6 +5,13 @@
 -dontwarn androidx.window.extensions.**
 -dontwarn androidx.window.sidecar.**
 
+# Handlebars renders and compiles templates in Java. Its optional JS helper registration
+# and JavaScript precompiler are unused and Android does not ship JSR 223.
+-dontwarn javax.script.Bindings
+-dontwarn javax.script.ScriptContext
+-dontwarn javax.script.ScriptEngine
+-dontwarn javax.script.ScriptEngineManager
+
 # Preserve JS bridge methods for opt-in offline card script sandbox.
 -keepattributes *Annotation*
 -keepclassmembers class app.tavern.nativeclient.script.TavernHelperBridge {

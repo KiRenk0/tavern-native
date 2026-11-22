@@ -22,9 +22,10 @@ internal data class BackupExportResult(val cards: Int, val groups: Int, val chat
 
 internal fun writeOriginalBackup(
     output: OutputStream, store: TavernStore, documents: ChatDocumentStore, images: ChatImageStore,
+    videos: ChatVideoStore? = null,
     checkActive: () -> Unit,
 ): BackupExportResult = ZipOutputStream(output).use { zip ->
-    OriginalBackupWriter(zip, store, documents, images, checkActive).write()
+    OriginalBackupWriter(zip, store, documents, images, videos, checkActive).write()
 }
 
 private class BackupNames {
@@ -57,6 +58,7 @@ private class OriginalBackupWriter(
     private val store: TavernStore,
     private val documents: ChatDocumentStore,
     private val images: ChatImageStore,
+    private val videos: ChatVideoStore?,
     private val checkActive: () -> Unit,
 ) {
     private val prefs = store.prefs()
@@ -80,16 +82,21 @@ private class OriginalBackupWriter(
     private var chatCount = 0
 
     fun write(): BackupExportResult {
+        val filterNames = cards.uniqueLoreFilenames().mapValues { (_, id) -> avatars.getValue(id).loreFilenameStem() } +
+            avatars.mapValues { (_, filename) -> filename.loreFilenameStem() }
         for (book in books) addJson("worlds/${bookNames.getValue(book.id)}.json",
-            JSONObject(book.export().decodeToString()).put("tavern_native_backup_name", book.name).put(NATIVE_BACKUP_ID, book.id))
+            JSONObject(book.remapLoreFilters(filterNames).export().decodeToString())
+                .put("tavern_native_backup_name", book.name).put(NATIVE_BACKUP_ID, book.id))
         for (preset in presets) addJson("OpenAI Settings/${presetNames.getValue(preset.id)}.json",
             preset.json().put(NATIVE_BACKUP_ID, preset.id))
         val quickFiles = BackupNames()
         for (set in prefs.quickReplies.sets) addJson("QuickReplies/${quickFiles.unique(set.name)}.json", set.json().put(NATIVE_BACKUP_ID, set.id))
+        val themeFiles = BackupNames()
+        for (theme in prefs.chatThemes.items) addJson("themes/${themeFiles.unique(theme.name)}.json", theme.json())
         for (card in cards) writeCard(card)
         val groupChats = BackupNames()
         for (group in groups) writeGroup(group, groupChats)
-        addJson("settings.json", settings())
+        addJson("settings.json", settings().also(::writeBackgrounds))
         return BackupExportResult(cards.size, groups.size, chatCount, books.size, missing)
     }
 
@@ -174,24 +181,28 @@ private class OriginalBackupWriter(
         return summaries.map { files.getValue(it.id) }
     }
 
-    private fun originalMessage(message: Message, actor: Card?): Message {
+    private fun originalMessage(input: Message, actor: Card?): Message {
+        val message = input.withAvailableReplyImages(::writeImage)
         val added = message.images.filter(::writeImage)
         val attached = message.documents.filter(::writeDocument)
+        val clips = message.videos.filter(::writeVideo)
         val drawing = message.drawing?.availableBackupImages(::writeImage)
         val raw = message.raw?.let(::JSONObject) ?: JSONObject()
         if (message.role == "assistant") actor?.id?.let(avatars::get)?.let { raw.put("original_avatar", it) }
         val extra = raw.optJSONObject("extra") ?: JSONObject().also { raw.put("extra", it) }
-        val mediaRows = (added + listOfNotNull(drawing?.current)).distinctBy(ChatImage::id).map { image ->
+        val mediaRows = (added + message.replyMedia?.images.orEmpty() + listOfNotNull(drawing?.current)).distinctBy(ChatImage::id).map { image ->
             val caption = message.captionFor(image)
             jsonOf("url" to "$NATIVE_BACKUP_IMAGES/${image.filename}", "type" to "image", "title" to caption,
                 "source" to if (caption == null) "embedded" else "captioned", "captioned" to (caption != null))
         }
-        if (mediaRows.isNotEmpty()) extra.put("media", JSONArray(mediaRows)).put("image", mediaRows.first().string("url"))
+        val videoRows = clips.map { jsonOf("url" to "$NATIVE_BACKUP_IMAGES/${it.filename}", "type" to "video", "title" to it.name) }
+        if (videoRows.isNotEmpty() || mediaRows.isNotEmpty()) extra.put("media", JSONArray(mediaRows + videoRows))
+        if (mediaRows.isNotEmpty()) extra.put("image", mediaRows.first().string("url"))
         if (attached.isNotEmpty()) extra.put("files", JSONArray(attached.map {
             attachment(it.name, "user/files/${it.filename}", it.bytes, 0)
         }))
-        val displayed = (added + drawing?.images.orEmpty()).mapTo(hashSetOf(), ChatImage::id)
-        return message.copy(raw = raw.toString(), images = added, documents = attached, drawing = drawing, characterId = null,
+        val displayed = (added + message.replyMedia?.images.orEmpty() + drawing?.images.orEmpty()).mapTo(hashSetOf(), ChatImage::id)
+        return message.copy(raw = raw.toString(), images = added, documents = attached, videos = clips, drawing = drawing, characterId = null,
             personaId = message.personaId?.let(personaFiles::get),
             imageCaptions = message.imageCaptions.filterKeys(displayed::contains))
     }
@@ -240,14 +251,33 @@ private class OriginalBackupWriter(
             "quickReplyV2" to jsonOf("isEnabled" to prefs.quickReplies.enabled,
                 "config" to quickConfig(prefs.quickReplies.active.mapNotNull(quickNames::get))))
         val defaultPersona = personaFiles[prefs.defaultPersonaId].orEmpty()
-        return jsonOf(NATIVE_BACKUP_KEY to 1, "user_avatar" to defaultPersona,
+        return jsonOf(NATIVE_BACKUP_KEY to 1, "user_avatar" to defaultPersona, "swipes" to prefs.chatHandling.showSwipes,
             "power_user" to jsonOf("personas" to personas, "persona_descriptions" to descriptions,
                 "default_persona" to defaultPersona, "bogus_folders" to library.folders,
                 "tavern_native_chat_appearance" to prefs.chatAppearance.json(),
+                "theme" to prefs.chatThemes.items.firstOrNull { it.id == prefs.chatThemes.activeId }?.name,
+                "tavern_native_active_theme" to prefs.chatThemes.activeId,
+                "tavern_native_theme_mode" to prefs.theme,
+                "tavern_native_dynamic_color" to prefs.dynamicColor,
+                "waifuMode" to prefs.visualNovel,
+                "gestures" to prefs.swipeGestures,
+                "show_group_chat_queue" to prefs.showGroupQueue,
+                "prefer_character_prompt" to prefs.textSystem.preferCharacterPrompt,
+                "prefer_character_jailbreak" to prefs.textSystem.preferCharacterPostHistory,
+                "request_token_probabilities" to prefs.requestTokenProbabilities,
                 "tavern_native_connection_profiles" to JSONArray(prefs.connectionProfiles.map(ConnectionProfile::json)),
-                "tavern_native_active_profile" to prefs.activeProfileId).also(prefs.replyAutomation::applyTo),
+                "tavern_native_active_profile" to prefs.activeProfileId)
+                .also(prefs.chatAppearance::writeOriginal).also(prefs.chatHandling::writeOriginal)
+                .also(prefs.characterLibrary::write)
+                .also(prefs.replyAutomation::applyTo),
             "world_info_settings" to prefs.loreSettings.json().put("world_info",
-                jsonOf("globalSelect" to JSONArray(books.filter(WorldBook::enabled).map { bookNames.getValue(it.id) }))),
+                jsonOf("globalSelect" to JSONArray(books.filter(WorldBook::enabled).map { bookNames.getValue(it.id) }),
+                    "charLore" to JSONArray(cards.mapNotNull { card ->
+                        val extra = card.additionalWorldBookIds.mapNotNull(bookNames::get)
+                        extra.takeIf(List<String>::isNotEmpty)?.let {
+                            jsonOf("name" to avatars.getValue(card.id).loreFilenameStem(), "extraBooks" to JSONArray(it))
+                        }
+                    }))),
             "oai_settings" to jsonOf("preset_settings_openai" to presetNames[prefs.defaultPresetId].orEmpty()),
             "tags" to JSONArray(library.tags.map(LibraryTag::json)), "tag_map" to tagMap, "extension_settings" to extensions)
     }
@@ -273,6 +303,25 @@ private class OriginalBackupWriter(
 
     private fun writeImage(image: ChatImage) = writeMedia("$NATIVE_BACKUP_IMAGES/${image.filename}") { images.bytes(image) }
 
+    private fun writeVideo(video: ChatVideo): Boolean {
+        val path = "$NATIVE_BACKUP_IMAGES/${video.filename}"
+        return media.getOrPut(path) {
+            checkActive()
+            val input = videos?.input(video)
+            if (input == null) {
+                missing++
+                false
+            } else {
+                input.use {
+                    zip.putNextEntry(ZipEntry("$BACKUP_ROOT/$path"))
+                    require(copyVideo(it, zip, video.byteCount, checkActive) == video.byteCount) { "备份视频大小与记录不符" }
+                    zip.closeEntry()
+                }
+                true
+            }
+        }
+    }
+
     private fun writeGallery(owner: String, title: String, gallery: List<GalleryImage>) {
         val folder = title.takeIf {
             galleryNames[it.lowercase(Locale.ROOT)] == 1 && it == BackupNames().unique(it) &&
@@ -284,6 +333,27 @@ private class OriginalBackupWriter(
             jsonOf("image" to image.json(), "prompt" to entry.prompt, "created" to entry.created)
         }
         if (items.isNotEmpty()) addJson("TavernNative Gallery/$owner.json", jsonOf("items" to JSONArray(items)))
+    }
+
+    private fun writeBackgrounds(settings: JSONObject) {
+        val library = prefs.backgrounds
+        if (library == BackgroundLibrary()) return
+        val used = BackupNames()
+        used.unique("__transparent")
+        val files = JSONObject()
+        var selected = "__transparent.png"
+        for (entry in library.items) {
+            val image = entry.image
+            val stem = used.unique(entry.title.substringBeforeLast('.'))
+            val filename = "$stem.${image.format.suffix}"
+            if (writeMedia("backgrounds/$filename", entry.added) { images.bytes(image) }) {
+                files.put(filename, entry.json())
+                if (image.id == library.selectedId) selected = filename
+            }
+        }
+        val path = java.net.URI(null, null, "/backgrounds/$selected", null).toASCIIString().removePrefix("/")
+        settings.put("background", jsonOf("name" to selected, "url" to "url(\"$path\")", "fitting" to library.fit.original))
+        settings.put("tavern_native_background_files", files)
     }
 
     private fun writeMedia(path: String, time: Long = 0, bytes: () -> ByteArray?): Boolean = media.getOrPut(path) {

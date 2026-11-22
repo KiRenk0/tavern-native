@@ -16,6 +16,7 @@ import java.util.Locale
 import java.util.zip.ZipFile
 
 internal const val MAX_DOCUMENT_INPUT_BYTES = 24 * 1024 * 1024
+internal const val MAX_WEB_DOCUMENTS = 20
 private const val MAX_WEB_BYTES = 6 * 1024 * 1024
 private val invisibleHtml = Regex("(?is)<(script|style|noscript|template|svg|nav|footer|aside)\\b[^>]*>.*?</\\1\\s*>")
 private val pageTitle = Regex("(?is)<title\\b[^>]*>(.*?)</title\\s*>")
@@ -27,12 +28,14 @@ internal fun openDataDocument(name: String, mime: String?, bytes: ByteArray, cac
     val ext = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
     val markdownOrText = setOf("txt", "text", "md", "markdown", "log", "json", "csv", "tsv", "yaml", "yml", "xml", "srt", "vtt")
     val type = mime?.substringBefore(';')?.lowercase(Locale.ROOT)
+    val office = OfficeFormat.find(ext, type)
     val text = when {
         ext == "pdf" || type == "application/pdf" || bytes.hasPrefix(0x25, 0x50, 0x44, 0x46, 0x2d) -> {
             if (Build.VERSION.SDK_INT >= 35) withDocumentFile(cacheDirectory, bytes, ".pdf", ::pdfText)
             else error("提取 PDF 文本需要 Android 15 或更高版本")
         }
         ext == "epub" || type == "application/epub+zip" -> withDocumentFile(cacheDirectory, bytes, ".epub", ::epubText)
+        office != null -> withDocumentFile(cacheDirectory, bytes, ".${office.extension}") { officeText(it, office) }
         ext in setOf("html", "htm", "xhtml") || (ext !in markdownOrText && type in setOf("text/html", "application/xhtml+xml")) ->
             htmlText(decodeDocumentText(bytes, mime, inspectMarkup = true))
         else -> {
@@ -62,6 +65,9 @@ internal fun decodeDocumentText(bytes: ByteArray, mime: String? = null, inspectM
     }
     error("无法识别文件的文本编码")
 }
+
+internal fun webDocumentLinks(input: String): List<String> = input.lineSequence().map(String::trim)
+    .filter(String::isNotEmpty).distinct().take(MAX_WEB_DOCUMENTS + 1).toList()
 
 internal suspend fun importWebDocument(value: String): ImportedDocument {
     val url = runCatching { URI(value.trim()) }.getOrNull()

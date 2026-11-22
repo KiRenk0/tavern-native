@@ -109,9 +109,16 @@ internal class SpeechPlayback(private val context: Context, private val interrup
                     speakSegment(tts, part)
                 }
             }
-        } else for (part in speechChunks(narration.text, 3000)) {
-            val bytes = synthesizeBackendAudio(narration.copy(text = part))
-            withFocus { playBytes(bytes) }
+        } else {
+            val limit = when (narration.options.activeBackend) {
+                TtsBackend.NOVELAI -> 1_000
+                TtsBackend.STYLE_BERT_VITS2 -> 400
+                else -> 3_000
+            }
+            for (part in speechChunks(narration.text, limit)) {
+                val bytes = synthesizeBackendAudio(narration.copy(text = part))
+                withFocus { playBytes(bytes) }
+            }
         }
     }
 

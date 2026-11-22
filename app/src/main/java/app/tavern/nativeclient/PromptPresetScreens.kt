@@ -86,6 +86,7 @@ private fun PromptPresetEditor(
     var draft by remember { mutableStateOf(preset) }
     var edited by rememberSaveable { mutableStateOf<String?>(null) }
     var utilities by rememberSaveable { mutableStateOf(false) }
+    var contextLimit by rememberSaveable { mutableStateOf(preset.chatCompletion.contextLimit?.toString().orEmpty()) }
     val editingId = edited
     if (editingId != null) {
         val row = draft.prompts.firstOrNull { it.id == editingId } ?: PresetPrompt(id = editingId)
@@ -112,13 +113,16 @@ private fun PromptPresetEditor(
         val moved = ordered.toMutableList().apply { add(index + offset, removeAt(index)) }
         draft = draft.copy(prompts = moved + inactive)
     }
+    val maxContext = contextLimit.trim().toIntOrNull()?.takeIf { it in 1..MAX_CONTEXT_TOKENS }
+    val valid = draft.name.isNotBlank() && (contextLimit.isBlank() || maxContext != null) &&
+        draft.sampling.all { (key, value) -> value.isBlank() || key.number(value) != null }
+    fun saveDraft() = save(draft.copy(chatCompletion = draft.chatCompletion.copy(contextLimit = maxContext)))
     Form {
         TextButton(back, enabled = !busy) { Text("返回预设列表") }
         FormHeading(if (preset.name.isBlank()) "新建提示词预设" else "编辑提示词预设")
         Field("名称", draft.name, { draft = draft.copy(name = it) }, enabled = !busy)
-        val validSampling = draft.sampling.all { (key, value) -> value.isBlank() || key.number(value) != null }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Button({ save(draft) }, enabled = !busy && draft.name.isNotBlank() && validSampling) { Text("保存预设") }
+            Button(::saveDraft, enabled = !busy && valid) { Text("保存预设") }
             ActionIcon(Icons.Outlined.Add, "添加提示词", !busy) { edited = newId() }
             if (export != null) ActionIcon(Icons.Outlined.FileUpload, "导出已保存的预设", !busy, export)
             if (remove != null) ActionIcon(Icons.Outlined.DeleteOutline, "删除预设", !busy, remove)
@@ -139,6 +143,42 @@ private fun PromptPresetEditor(
             Text(if (utilities) "收起生成参数和模板" else "生成参数和模板")
         }
         if (utilities) {
+            val chat = draft.chatCompletion
+            OutlinedTextField(contextLimit, { contextLimit = it }, modifier = Modifier.fillMaxWidth(), singleLine = true,
+                enabled = !busy, label = { Text("聊天补全上下文 Token 上限") },
+                placeholder = { Text("留空沿用模型额度") }, isError = contextLimit.isNotBlank() && maxContext == null,
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Number))
+            SelectField("流式回复", chat.streaming, listOf(null, true, false), {
+                when (it) {
+                    true -> "开启"
+                    false -> "关闭"
+                    null -> "沿用提供商设置"
+                }
+            }, !busy) { draft = draft.copy(chatCompletion = chat.copy(streaming = it)) }
+            GroupToggle("启用联网搜索", chat.webSearch, !busy) {
+                draft = draft.copy(chatCompletion = chat.copy(webSearch = it))
+            }
+            if (chat.webSearch) {
+                Text("用于 Google Gemini、DeepSeek Flash、Claude 原生和支持工具调用的 OpenRouter 模型。",
+                    style = MaterialTheme.typography.bodySmall)
+                Text("Gemini 搜索回复在本次打开的聊天中显示。", style = MaterialTheme.typography.bodySmall)
+            }
+            GroupToggle("在回复中请求图片", chat.images.enabled, !busy) {
+                draft = draft.copy(chatCompletion = chat.copy(images = chat.images.copy(enabled = it)))
+            }
+            if (chat.images.enabled) {
+                Text("用于支持图片输出的 Gemini 原生或 OpenRouter 模型。", style = MaterialTheme.typography.bodySmall)
+                SelectField("回复图片比例", chat.images.ratio, replyImageRatios, { it.ifBlank { "模型默认" } }, !busy) {
+                    draft = draft.copy(chatCompletion = chat.copy(images = chat.images.copy(ratio = it)))
+                }
+                SelectField("回复图片分辨率", chat.images.size, replyImageSizes, { it.ifBlank { "模型默认" } }, !busy) {
+                    draft = draft.copy(chatCompletion = chat.copy(images = chat.images.copy(size = it)))
+                }
+            }
+            SelectField("发言者名称", chat.names, listOf(null) + ChatSpeakerNames.entries,
+                { it?.label ?: "沿用应用设置" }, !busy) { draft = draft.copy(chatCompletion = chat.copy(names = it)) }
+            SelectField("续写连接方式", chat.spacing, listOf(null) + ContinueSpacing.entries,
+                { it?.label ?: "自动" }, !busy) { draft = draft.copy(chatCompletion = chat.copy(spacing = it)) }
             PresetSampling.entries.forEach { option ->
                 val value = draft.sampling[option].orEmpty()
                 val integer = option == PresetSampling.MAX_TOKENS || option == PresetSampling.SEED
@@ -155,7 +195,7 @@ private fun PromptPresetEditor(
                 Field(utility.label, draft.text(utility), { draft = draft.copy(utilities = draft.utilities + (utility to it)) },
                     lines = 2, enabled = !busy)
             }
-            Button({ save(draft) }, enabled = !busy && draft.name.isNotBlank() && validSampling, modifier = Modifier.fillMaxWidth()) {
+            Button(::saveDraft, enabled = !busy && valid, modifier = Modifier.fillMaxWidth()) {
                 Text("保存预设")
             }
         }
@@ -274,6 +314,15 @@ internal fun PromptInspector(capture: PromptCapture, dismiss: () -> Unit) {
         text = {
             LazyColumn(Modifier.fillMaxWidth().heightIn(max = 480.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 item { Text(capture.model, style = MaterialTheme.typography.labelLarge) }
+                capture.contextBudget?.let { budget ->
+                    item {
+                        Text("输入 ${budget.used} / ${budget.limit} Token · ${budget.counter}",
+                            style = MaterialTheme.typography.labelMedium)
+                        Text("预留回复 ${budget.output} Token", style = MaterialTheme.typography.bodySmall)
+                        if (budget.omittedMessages > 0) Text("已省略 ${budget.omittedMessages} 条较早的消息",
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                }
                 capture.loreBudget?.let { budget ->
                     item {
                         Text("世界书额度 ${budget.used} / ${budget.limit} Token · ${budget.counter}",
@@ -284,7 +333,9 @@ internal fun PromptInspector(capture: PromptCapture, dismiss: () -> Unit) {
                 items(entries) { row ->
                     val role = PromptRole.entries.firstOrNull { it.wire == row.string("role") }
                     Column {
-                        Text(role?.label ?: row.string("role"), style = MaterialTheme.typography.titleSmall)
+                        val label = role?.label ?: row.string("role")
+                        val named = row.string("name").takeIf(String::isNotBlank)?.let { "$label · $it" } ?: label
+                        Text(named, style = MaterialTheme.typography.titleSmall)
                         val text = row.string("content")
                         SelectionContainer {
                             Text(if (text.length <= 16_000) text else text.take(16_000) + "\n…", style = MaterialTheme.typography.bodyMedium)

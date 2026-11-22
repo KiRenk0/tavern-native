@@ -3,6 +3,7 @@ package app.tavern.nativeclient
 import java.io.File
 import java.io.InputStream
 import java.util.zip.CRC32
+import java.util.zip.CheckedInputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 
@@ -21,6 +22,14 @@ internal data class OriginalLibraryFile(
             require(CRC32().apply { update(data) }.value == checksum) { "备份文件校验失败" }
         }
         return data
+    }
+
+    fun <T> streaming(read: (InputStream) -> T): T = open().use { input ->
+        if (checksum < 0) return@use read(input)
+        val checked = CheckedInputStream(input, CRC32())
+        val result = read(checked)
+        require(checked.checksum.value == checksum) { "备份文件校验失败" }
+        result
     }
 }
 
@@ -112,7 +121,8 @@ internal fun <T> readOriginalBackup(input: InputStream, cache: File, displayName
 
 private fun profileFile(path: List<String>): Boolean = when (path.firstOrNull()) {
     "settings.json" -> path.size == 1
-    "characters", "groups", "worlds", "group chats", "OpenAI Settings", "QuickReplies" ->
+    "characters", "groups", "worlds", "group chats", "OpenAI Settings", "QuickReplies", "themes" ->
         path.size == 2 && path[1].substringAfterLast('.').lowercase() in setOf("json", "jsonl", "png")
+    "backgrounds" -> path.size == 2 && path[1].substringAfterLast('.').lowercase() in originalImageExtensions
     else -> false
 }

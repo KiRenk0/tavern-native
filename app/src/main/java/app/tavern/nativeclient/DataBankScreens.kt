@@ -115,8 +115,8 @@ internal fun DataBankPanel(state: TavernState, model: TavernViewModel, fromChat:
             }, purge = { model.clearDataDocumentIndex(document.id) }, remove = { deleting = document.id })
         }
     }
-    if (web) WebDocumentDialog(enabled, close = { web = false }) { url ->
-        if (model.importDataUrl(owner, url)) web = false
+    if (web) WebDocumentDialog(enabled, close = { web = false }) { urls ->
+        if (model.importDataUrls(owner, urls)) web = false
     }
     if (settings) FileVectorDialog(state, model, close = { settings = false }, configure = { settings = false; configure() })
     val newDocument = draft?.let { DataDocument(it, "", owner) }
@@ -188,12 +188,16 @@ private fun DataDocumentEditor(value: DocumentText, choices: List<DataOwnerChoic
 }
 
 @Composable
-private fun WebDocumentDialog(enabled: Boolean, close: () -> Unit, import: (String) -> Unit) {
-    var url by rememberSaveable { mutableStateOf("") }
+private fun WebDocumentDialog(enabled: Boolean, close: () -> Unit, submit: (List<String>) -> Unit) {
+    var input by rememberSaveable { mutableStateOf("") }
+    val urls = remember(input) { webDocumentLinks(input) }
     AlertDialog(onDismissRequest = close, title = { Text("导入网页") }, text = {
-        Field("网页地址", url, { url = it }, placeholder = "https://example.com/article", type = KeyboardType.Uri, enabled = enabled)
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Field("每行一个网页地址", input, { input = it }, placeholder = "https://example.com/article", lines = 5, enabled = enabled)
+            if (urls.size > MAX_WEB_DOCUMENTS) Text("每批最多导入 $MAX_WEB_DOCUMENTS 个网页", color = MaterialTheme.colorScheme.error)
+        }
     }, dismissButton = { TextButton(close) { Text("取消") } }, confirmButton = {
-        Button({ import(url.trim()) }, enabled = enabled && url.isNotBlank()) { Text("导入") }
+        Button({ submit(urls) }, enabled = enabled && urls.size in 1..MAX_WEB_DOCUMENTS) { Text("导入") }
     })
 }
 

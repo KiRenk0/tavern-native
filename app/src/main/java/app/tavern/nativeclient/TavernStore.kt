@@ -11,10 +11,14 @@ import android.util.Base64
 import android.util.JsonReader
 import android.util.JsonToken
 import androidx.core.database.sqlite.transaction
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import java.io.Reader
 import java.io.StringReader
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -23,7 +27,7 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 internal object TavernSchema {
-    const val LATEST_VERSION = 9
+    const val LATEST_VERSION = 10
 
     val createLibrariesStatements = listOf(
         "CREATE TABLE character_groups (id TEXT PRIMARY KEY, payload TEXT NOT NULL)",
@@ -124,6 +128,7 @@ internal object TavernSchema {
         addAll(createGalleryStatements)
         add(createComfyWorkflowsSql)
         add(createGlobalScriptVariablesSql)
+        addAll(ChatBackupSchema.statements)
     }
 
     fun upgradeStatements(oldVersion: Int, newVersion: Int): List<String> {
@@ -145,13 +150,15 @@ internal object TavernSchema {
             if (oldVersion < 6) addAll(createGalleryStatements)
             if (oldVersion < 7) add(createComfyWorkflowsSql)
             if (oldVersion < 8) addAll(addChatWorldBindingsStatements)
-            add(createGlobalScriptVariablesSql)
+            if (oldVersion < 9) add(createGlobalScriptVariablesSql)
+            addAll(ChatBackupSchema.statements)
         }
     }
 }
 
 internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern.db", null, TavernSchema.LATEST_VERSION), VectorCache {
     private val settings = context.getSharedPreferences("tavern", Context.MODE_PRIVATE)
+    private val chatDrafts by lazy { context.getSharedPreferences("chat_drafts", Context.MODE_PRIVATE) }
     private val portraits = File(context.filesDir, "portraits")
     private val personaAvatars = File(context.filesDir, "persona-avatars")
 
@@ -162,7 +169,9 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        check(oldVersion in 1..8 && newVersion == TavernSchema.LATEST_VERSION) { "未知数据库版本 $oldVersion → $newVersion" }
+        check(oldVersion in 1 until TavernSchema.LATEST_VERSION && newVersion == TavernSchema.LATEST_VERSION) {
+            "未知数据库版本 $oldVersion → $newVersion"
+        }
         if (oldVersion == 1) {
             TavernSchema.createLibrariesStatements.forEach(db::execSQL)
             db.execSQL("ALTER TABLE chats RENAME TO chats_v1")
@@ -177,7 +186,8 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
         if (oldVersion < 6) TavernSchema.createGalleryStatements.forEach(db::execSQL)
         if (oldVersion < 7) db.execSQL(TavernSchema.createComfyWorkflowsSql)
         if (oldVersion < 8) migrateChatWorldBindings(db)
-        createGlobalScriptVariables(db)
+        if (oldVersion < 9) createGlobalScriptVariables(db)
+        ChatBackupSchema.statements.forEach(db::execSQL)
     }
 
     private fun migrateChatWorldBindings(db: SQLiteDatabase) {
@@ -399,6 +409,13 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
         return chatSummaries("$column = ?", arrayOf(id), maximum)
     }
 
+    fun statisticsChatIds(cardId: String?, groupId: String?): List<String> {
+        if (cardId != null || groupId != null) return chats(cardId, groupId).map(ChatSummary::id)
+        return readableDatabase.rawQuery("SELECT id FROM chats", null).use { cursor ->
+            buildList { while (cursor.moveToNext()) add(cursor.getString(0)) }
+        }
+    }
+
     fun sharedMemoryChats(card: Card, world: WorldBook, excludeId: String, groupId: String? = null): List<ChatSummary> {
         val (column, id) = if (groupId != null) "group_id" to groupId else "card_id" to card.id
         val inheritedName = card.worldName
@@ -416,6 +433,81 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
                 while (cursor.moveToNext()) add(ChatSummary(cursor.getString(0), cursor.getString(1), cursor.getLong(2)))
             }
         }
+
+    suspend fun searchChats(
+        scope: ChatArchiveScope, query: ChatArchiveQuery, after: ChatArchiveCursor?, pageSize: Int = 40,
+    ): ChatArchivePage {
+        require(pageSize > 0)
+        val context = currentCoroutineContext()
+        val args = mutableListOf<String>()
+        val filters = mutableListOf<String>()
+        scope.cardId?.let { filters += "card_id = ?"; args += it }
+        scope.groupId?.let { filters += "group_id = ?"; args += it }
+        if (after != null) {
+            filters += "(updated < ? OR (updated = ? AND id > ?))"
+            args += listOf(after.updated.toString(), after.updated.toString(), after.chatId)
+        }
+        val where = if (filters.isEmpty()) "" else filters.joinToString(" AND ", prefix = " WHERE ")
+        val db = readableDatabase
+        val hits = mutableListOf<ChatArchiveHit>()
+        db.rawQuery("SELECT id, title, updated, card_id, group_id FROM chats$where ORDER BY updated DESC, id",
+            args.toTypedArray()).use { rows ->
+            while (rows.moveToNext()) {
+                context.ensureActive()
+                val summary = ChatSummary(rows.getString(0), rows.getString(1), rows.getLong(2))
+                val match = if (query.terms.isEmpty()) null else {
+                    try {
+                        scanChatArchive(query, ArchivePayloadReader(db, summary) { context.ensureActive() })
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: IOException) {
+                        // A row that changed during the scan can be read on the next search.
+                        null
+                    } catch (_: IllegalStateException) {
+                        // Skip malformed chat data while continuing the search.
+                        null
+                    }
+                }
+                if (match == null && !query.matchesTitle(summary.title)) continue
+                if (hits.size == pageSize) {
+                    val last = hits.last().chat
+                    return ChatArchivePage(hits, ChatArchiveCursor(last.updated, last.id))
+                }
+                hits += ChatArchiveHit(summary, rows.getString(3), rows.getString(4), match)
+            }
+        }
+        return ChatArchivePage(hits)
+    }
+
+    private class ArchivePayloadReader(
+        private val db: SQLiteDatabase, private val chat: ChatSummary, private val checkActive: () -> Unit,
+    ) : Reader() {
+        private var start = 1
+        private var chunk = ""
+        private var index = 0
+
+        override fun read(cbuf: CharArray, off: Int, len: Int): Int {
+            if (len == 0) return 0
+            if (index == chunk.length) {
+                checkActive()
+                val count = 128_000
+                chunk = db.rawQuery("SELECT substr(payload, ?, ?) FROM chats WHERE id = ? AND updated = ?",
+                    arrayOf(start.toString(), count.toString(), chat.id, chat.updated.toString())).use { cursor ->
+                    if (!cursor.moveToFirst()) throw IOException("Chat was updated during the search")
+                    cursor.getString(0)
+                }
+                if (chunk.isEmpty()) return -1
+                start += count
+                index = 0
+            }
+            val copied = minOf(len, chunk.length - index)
+            chunk.toCharArray(cbuf, off, index, index + copied)
+            index += copied
+            return copied
+        }
+
+        override fun close() = Unit
+    }
 
     fun recentChats(pinnedIds: List<String>): List<RecentChat> {
         val pins = pinnedIds.take(RECENT_CHAT_LIMIT)
@@ -450,11 +542,27 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
 
     fun lastChatId(): String? = settings.getString("lastChatId", null)
 
-    fun chat(id: String): Chat =
-        readableDatabase.rawQuery("SELECT card_id, title, updated, length(payload), group_id, world_book_id, world_book_name FROM chats WHERE id = ?",
+    fun chatDraft(id: String): String = chatDrafts.getString(id, "").orEmpty()
+
+    fun saveChatDraft(id: String, draft: String) {
+        if (chatDraft(id) == draft) return
+        chatDrafts.edit().apply {
+            if (draft.isEmpty()) remove(id) else putString(id, draft)
+        }.apply()
+    }
+
+    fun chat(id: String): Chat = readChat("chats", id)
+
+    fun chatBackup(id: Long): Chat = readableDatabase.transaction {
+        readChat("chat_backups", id.toString(), this)
+    }
+
+    private fun readChat(table: String, id: String, db: SQLiteDatabase = readableDatabase): Chat {
+        val original = if (table == "chats") "id" else "chat_id"
+        return db.rawQuery("SELECT card_id, title, updated, length(payload), group_id, world_book_id, world_book_name, $original FROM $table WHERE id = ?",
             arrayOf(id)).use { cursor ->
             check(cursor.moveToFirst()) { "找不到聊天记录" }
-            val payload = JSONObject(readPayload("chats", id, cursor.getInt(3)))
+            val payload = JSONObject(readPayload(table, id, cursor.getInt(3), db))
             val header = payload.string("header").ifBlank { null }
             val metadata = header?.let { JSONObject(it).optJSONObject("chat_metadata") }
             val saved = payload.optJSONObject("options")
@@ -469,11 +577,46 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
                 imported.copy(personaId = imported.personaId
                     ?: metadata?.string("persona")?.takeIf(String::isNotBlank)?.let(::previewPersonaId))
             }
-            Chat(id, cursor.getString(0), cursor.getString(1), cursor.getLong(2),
+            Chat(cursor.getString(7), cursor.getString(0), cursor.getString(1), cursor.getLong(2),
                 payload.optJSONArray("messages")?.objects().orEmpty().map(Message::from).bindImportedSummaries(),
                 header, ModelSelection.fromJson(payload.optJSONObject("modelOverride")), cursor.getString(4),
                 options.copy(worldBookId = cursor.getString(5), worldBookName = cursor.getString(6)))
         }
+    }
+
+    fun chatBackups(): ChatBackupLibrary = readableDatabase.transaction {
+        val enabled = rawQuery("SELECT enabled FROM chat_backup_policy WHERE id = 1", null).use { cursor ->
+            cursor.moveToFirst() && cursor.getInt(0) != 0
+        }
+        val entries = rawQuery("SELECT id, card_id, group_id, title, saved_at, byte_count FROM chat_backups ORDER BY id DESC", null)
+            .use { cursor ->
+                buildList {
+                    while (cursor.moveToNext()) add(ChatBackup(cursor.getLong(0), cursor.getString(1), cursor.getString(2),
+                        cursor.getString(3), cursor.getLong(4), cursor.getLong(5)))
+                }
+            }
+        ChatBackupLibrary(enabled, entries)
+    }
+
+    fun setAutomaticChatBackups(enabled: Boolean) {
+        writableDatabase.execSQL("UPDATE chat_backup_policy SET enabled = ? WHERE id = 1", arrayOf(if (enabled) 1 else 0))
+    }
+
+    fun saveChatBackup(id: String) {
+        writableDatabase.transaction {
+            rawQuery("SELECT length(CAST(payload AS BLOB)) FROM chats WHERE id = ?", arrayOf(id)).use {
+                check(it.moveToFirst()) { "找不到要备份的聊天记录" }
+                check(it.getLong(0) <= ChatBackupSchema.maxTotalBytes) {
+                    "这段聊天超过本机快照存储上限，可导出聊天及附件 ZIP"
+                }
+            }
+            execSQL(ChatBackupSchema.captureCurrent, arrayOf(id))
+        }
+    }
+
+    fun deleteChatBackup(id: Long) {
+        writableDatabase.delete("chat_backups", "id = ?", arrayOf(id.toString()))
+    }
 
     // Slice the payload without placing a full chat or world book in one cursor row.
     private fun readPayload(table: String, id: String, length: Int, db: SQLiteDatabase = readableDatabase): String = buildString {
@@ -543,16 +686,28 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
         }
     }
 
-    fun save(chat: Chat, drawing: GalleryImage? = null) {
+    fun save(chat: Chat, drawing: GalleryImage? = null, replyGallery: List<GalleryImage> = emptyList()) {
         writableDatabase.transaction {
             writeChat(chat)
             if (drawing != null) addDrawing(chat, drawing)
+            replyGallery.forEach { addDrawing(chat, it) }
         }
     }
 
     private fun SQLiteDatabase.writeChat(chat: Chat) {
         val values = chat.values()
         if (update("chats", values, "id = ?", arrayOf(chat.id)) == 0) insertOrThrow("chats", null, values)
+    }
+
+    fun importChats(entries: List<Chat>, cardId: String?, groupId: String?): List<Chat> = writableDatabase.transaction {
+        val titles = chats(cardId, groupId).mapTo(hashSetOf(), ChatSummary::title)
+        entries.map { chat ->
+            check(chat.cardId == cardId && chat.groupId == groupId) { "聊天归属不匹配" }
+            val saved = chat.copy(title = chat.availableTitle(titles), messages = chat.messages.removeInvalidSummaries())
+            insertOrThrow("chats", null, saved.values())
+            titles += saved.title
+            saved
+        }
     }
 
     fun addDrawing(chat: Chat, drawing: GalleryImage) = addGalleryImage(chat.cardId, chat.groupId, drawing)
@@ -574,18 +729,69 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
         Unit
     }
 
-    fun deleteChat(id: String) {
-        writableDatabase.delete("chats", "id = ?", arrayOf(id))
+    fun refreshCheckpoint(sourceId: String, targetId: String, position: Int): Chat = writableDatabase.transaction {
+        val source = readChat("chats", sourceId, this)
+        val target = readChat("chats", targetId, this)
+        val history = chats(source.cardId, source.groupId)
+        val (parent, refreshed) = source.refreshCheckpoint(position, target, history)
+        writeChat(refreshed)
+        if (parent != source) writeChat(parent)
+        parent
     }
 
-    fun deleteCard(id: String) {
-        writableDatabase.transaction {
-            delete("cards", "id = ?", arrayOf(id))
+    fun renameChatFile(id: String, title: String, cardId: String?, groupId: String?): List<ChatSummary> = writableDatabase.transaction {
+        val history = chats(cardId, groupId)
+        val original = requireNotNull(history.firstOrNull { it.id == id }) { "找不到所选聊天" }
+        if (original.title == title) return@transaction history
+        require(history.none { it.id != id && it.title.equals(title, ignoreCase = true) }) { "聊天名称已存在" }
+        val values = ContentValues().apply { put("title", title) }
+        check(update("chats", values, "id = ?", arrayOf(id)) == 1) { "找不到所选聊天" }
+        if (history.count { it.title == original.title } == 1) {
+            val (column, ownerId) = if (groupId == null) "card_id" to requireNotNull(cardId) else "group_id" to groupId
+            val quoted = JSONObject.quote(original.title)
+            val embedded = JSONObject.quote(quoted).removeSurrounding("\"")
+            val linkedIds = rawQuery("SELECT id FROM chats WHERE $column = ? AND (instr(payload, ?) > 0 OR instr(payload, ?) > 0)",
+                arrayOf(ownerId, quoted, embedded)).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getString(0)) } }
+            for (linkedId in linkedIds) {
+                val chat = readChat("chats", linkedId, this)
+                val updated = chat.retargetLegacyChatLinks(original, title)
+                if (chat != updated) writeChat(updated)
+            }
+        }
+        chats(cardId, groupId)
+    }
+
+    fun deleteChat(id: String) {
+        writableDatabase.delete("chats", "id = ?", arrayOf(id))
+        saveChatDraft(id, "")
+    }
+
+    fun deleteCard(id: String, retained: TavernGroup? = null, inheritedWorld: String = ""): TavernGroup? {
+        val archive = writableDatabase.transaction {
+            val destination = retained?.takeIf {
+                rawQuery("SELECT 1 FROM chats WHERE card_id = ? UNION ALL SELECT 1 FROM chat_backups WHERE card_id = ? LIMIT 1",
+                    arrayOf(id, id)).use { cursor -> cursor.moveToFirst() }
+            }
+            if (destination != null) {
+                save(destination)
+                for (table in listOf("chats", "chat_backups")) {
+                    execSQL(
+                        "UPDATE $table SET card_id = NULL, group_id = ?, " +
+                            "world_book_name = CASE WHEN world_book_id = '' AND world_book_name = '' THEN ? ELSE world_book_name END " +
+                            "WHERE card_id = ?",
+                        arrayOf(destination.id, inheritedWorld, id),
+                    )
+                }
+                execSQL("UPDATE drawing_gallery SET card_id = NULL, group_id = ? WHERE card_id = ?", arrayOf(destination.id, id))
+            }
+            check(delete("cards", "id = ?", arrayOf(id)) == 1) { "角色已不存在" }
             groups().filter { id in it.memberIds }.forEach { group ->
                 save(group.copy(memberIds = group.memberIds - id, mutedIds = group.mutedIds - id))
             }
+            destination
         }
         AtomicFile(portraitFile(id)).delete()
+        return archive
     }
 
     fun groups(): List<TavernGroup> = readableDatabase.rawQuery("SELECT id, payload FROM character_groups", null).use { c ->
@@ -600,9 +806,29 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
         }
     }
 
+    internal fun updateGroupRoster(id: String, transform: (TavernGroup) -> TavernGroup): Boolean = writableDatabase.transaction {
+        val existing = rawQuery("SELECT payload FROM character_groups WHERE id = ?", arrayOf(id)).use {
+            check(it.moveToFirst()) { "群组已不存在" }
+            TavernGroup.from(id, it.getString(0))
+        }
+        val updated = transform(existing)
+        if (updated == existing) return@transaction false
+        val values = ContentValues().apply { put("payload", updated.json().toString()) }
+        update("character_groups", values, "id = ?", arrayOf(id)) == 1
+    }
+
     fun import(group: TavernGroup, chats: List<Chat>): Int = writableDatabase.transaction {
         val values = ContentValues().apply { put("id", group.id); put("payload", group.json().toString()) }
-        insertWithOnConflict("character_groups", null, values, SQLiteDatabase.CONFLICT_IGNORE)
+        val inserted = insertWithOnConflict("character_groups", null, values, SQLiteDatabase.CONFLICT_IGNORE) != -1L
+        if (!inserted && group.avatar != null) {
+            val existing = rawQuery("SELECT payload FROM character_groups WHERE id = ?", arrayOf(group.id)).use { row ->
+                if (row.moveToFirst()) JSONObject(row.getString(0)) else null
+            }
+            if (existing != null && !existing.has("avatar_url")) {
+                val updated = ContentValues().apply { put("payload", existing.put("avatar_url", group.avatar.dataUrl).toString()) }
+                update("character_groups", updated, "id = ?", arrayOf(group.id))
+            }
+        }
         chats.count { insertWithOnConflict("chats", null, it.values(), SQLiteDatabase.CONFLICT_IGNORE) != -1L }
     }
 
@@ -645,7 +871,55 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
 
     fun deleteBook(book: WorldBook) = writableDatabase.transaction {
         delete("world_books", "id = ?", arrayOf(book.id))
-        cards().filter { it.worldName == book.name }.forEach { save(it.withWorld("")) }
+        for (card in cards()) {
+            val primary = card.worldName == book.name
+            if (!primary && book.id !in card.additionalWorldBookIds) continue
+            val updated = if (primary) card.withWorld("") else card
+            save(updated.withAdditionalWorldBooks(updated.additionalWorldBookIds - book.id))
+        }
+    }
+
+    fun transferWorldEntry(sourceId: String, targetId: String, entryId: Int, move: Boolean): Int = writableDatabase.transaction {
+        val catalog = books().associateBy(WorldBook::id)
+        val source = requireNotNull(catalog[sourceId]) { "找不到来源世界书" }
+        val target = requireNotNull(catalog[targetId]) { "找不到目标世界书" }
+        val result = source.transferEntry(target, entryId, move)
+        for (book in listOfNotNull(result.destination, result.source.takeIf { move })) {
+            val values = ContentValues().apply { put("payload", book.raw) }
+            check(update("world_books", values, "id = ?", arrayOf(book.id)) == 1) { "世界书已不存在" }
+        }
+        result.entryId
+    }
+
+    fun updateWorldActivation(changes: List<WorldBook>) = writableDatabase.transaction {
+        for (book in changes) {
+            val values = ContentValues().apply { put("enabled", if (book.enabled) 1 else 0) }
+            check(update("world_books", values, "id = ?", arrayOf(book.id)) == 1) { "世界书已不存在" }
+        }
+    }
+
+    fun createBoundWorldBook(book: WorldBook, binding: app.tavern.nativeclient.script.ScriptWorldBinding) {
+        writableDatabase.transaction {
+            require(books().none { it.name.equals(book.name, true) }) { "世界书名称已存在" }
+            save(book)
+            when (binding) {
+                is app.tavern.nativeclient.script.ScriptWorldBinding.Conversation ->
+                    if (!binding.chat.isTemporary) writeChat(binding.chat) else Unit
+                is app.tavern.nativeclient.script.ScriptWorldBinding.Character -> {
+                    val card = binding.card
+                    check(update("cards", card.values(), "id = ?", arrayOf(card.id)) == 1) { "找不到要关联的角色" }
+                }
+                is app.tavern.nativeclient.script.ScriptWorldBinding.Persona -> Unit
+            }
+        }
+        if (binding is app.tavern.nativeclient.script.ScriptWorldBinding.Persona) {
+            try {
+                save(binding.prefs)
+            } catch (e: Exception) {
+                writableDatabase.delete("world_books", "id = ?", arrayOf(book.id))
+                throw e
+            }
+        }
     }
 
     fun promptPresets(): List<PromptPreset> =
@@ -682,80 +956,18 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
     fun deletePersonaAvatar(id: String) = AtomicFile(personaAvatar(id)).delete()
 
     fun prefs(): Preferences {
-        val j = JSONObject(settings.getString("preferences", "{}") ?: "{}")
-        val legacy = if (j.has("providers")) null else Provider.legacy(j, ::unseal)
-        val personas = j.optJSONArray("personas")?.objects().orEmpty().mapNotNull(PersonaProfile::fromJson)
-            .distinctBy(PersonaProfile::id).ifEmpty { listOf(PersonaProfile.legacy(j.string("persona"), j.string("personaDescription"))) }
-        val links = j.optJSONObject("personaConnections")
-        return Preferences(
-            temperature = j.string("temperature"), maxTokens = j.string("maxTokens"),
-            theme = j.string("theme").ifBlank { "system" }, dynamicColor = j.optBoolean("dynamicColor"),
-            server = j.string("server"), handle = j.string("handle"),
-            providers = j.optJSONArray("providers")?.objects()?.map { Provider.fromJson(it, ::unseal) }
-                ?: listOfNotNull(legacy),
-            defaultSelection = ModelSelection.fromJson(j.optJSONObject("defaultSelection"))
-                ?: legacy?.takeIf { it.ready }?.defaultSelection,
-            fullTavernAddress = j.string("fullTavernAddress"),
-            personas = personas,
-            defaultPersonaId = j.string("defaultPersonaId").takeIf { id -> personas.any { it.id == id } } ?: personas.first().id,
-            personaConnections = links?.keys()?.asSequence()?.associateWith(links::string).orEmpty(),
-            defaultAuthorNote = AuthorNote.fromMetadata(j.optJSONObject("defaultAuthorNote")) ?: AuthorNote(),
-            loreSettings = LoreSettings.from(j.optJSONObject("loreSettings")),
-            defaultPresetId = j.string("defaultPresetId").takeIf(String::isNotBlank),
-            regex = RegexConfig.from(j.optJSONObject("regex")),
-            includeReasoning = j.optBoolean("includeReasoning"),
-            quickReplies = QuickReplies.from(j.optJSONObject("quickReplies")),
-            scriptVariables = globalScriptVariables(),
-            voice = VoicePreferences.from(j.optJSONObject("voice"), ::unseal),
-            sync = app.tavern.nativeclient.backup.SyncSettings.from(j.optJSONObject("sync"), ::unseal),
-            cardScriptsEnabled = j.optBoolean("cardScriptsEnabled", false),
-            vectors = VectorPreferences.from(j.optJSONObject("vectors")),
-            drawing = DrawingSettings.from(j.optJSONObject("drawing")),
-            toolCalling = j.optBoolean("toolCalling"),
-            visualNovel = j.optBoolean("visualNovel"),
-            welcome = WelcomePreferences.from(j.optJSONObject("welcome")),
-            replyAutomation = ReplyAutomation.from(j.optJSONObject("replyAutomation")),
-            captions = CaptionSettings.from(j.optJSONObject("captions")),
-            translationServices = TranslationServices.from(j.optJSONObject("translationServices"), ::unseal),
-            library = LibraryPreferences.from(j.optJSONObject("library")),
-            chatAppearance = ChatAppearance.from(j.optJSONObject("chatAppearance")),
-            connectionProfiles = j.optJSONArray("connectionProfiles")?.objects()?.mapNotNull(ConnectionProfile::fromJson).orEmpty(),
-            activeProfileId = j.string("activeProfileId").takeIf(String::isNotBlank),
-        )
+        val saved = JSONObject(settings.getString("preferences", "{}") ?: "{}")
+        return decodePreferences(saved, ::unseal, globalScriptVariables())
     }
 
+    fun captureSettingsSnapshot(name: String, prefs: Preferences) =
+        app.tavern.nativeclient.backup.SettingsSnapshot.capture(name, prefs, ::seal)
+
+    fun preferencesFromSnapshot(snapshot: app.tavern.nativeclient.backup.SettingsSnapshot, current: Preferences) =
+        snapshot.restore(current, ::unseal)
+
     fun save(prefs: Preferences) {
-        val json = jsonOf(
-            "providers" to JSONArray(prefs.providers.map { it.storageJson(::seal) }),
-            "defaultSelection" to prefs.defaultSelection?.json(),
-            "personas" to JSONArray(prefs.personas.map(PersonaProfile::json)),
-            "defaultPersonaId" to prefs.defaultPersonaId, "personaConnections" to JSONObject(prefs.personaConnections),
-            "defaultAuthorNote" to prefs.defaultAuthorNote.json(),
-            "loreSettings" to prefs.loreSettings.json(),
-            "defaultPresetId" to prefs.defaultPresetId,
-            "regex" to prefs.regex.json(),
-            "includeReasoning" to prefs.includeReasoning,
-            "quickReplies" to prefs.quickReplies.json(),
-            "voice" to prefs.voice.json(::seal),
-            "sync" to prefs.sync.json(::seal),
-            "cardScriptsEnabled" to prefs.cardScriptsEnabled,
-            "vectors" to prefs.vectors.json(),
-            "drawing" to prefs.drawing.json(),
-            "toolCalling" to prefs.toolCalling,
-            "visualNovel" to prefs.visualNovel,
-            "welcome" to prefs.welcome.json(),
-            "replyAutomation" to prefs.replyAutomation.json(),
-            "captions" to prefs.captions.json(),
-            "translationServices" to prefs.translationServices.json(::seal),
-            "library" to prefs.library.json(),
-            "chatAppearance" to prefs.chatAppearance.json(),
-            "connectionProfiles" to JSONArray(prefs.connectionProfiles.map(ConnectionProfile::json)),
-            "activeProfileId" to prefs.activeProfileId,
-            "temperature" to prefs.temperature, "maxTokens" to prefs.maxTokens,
-            "theme" to prefs.theme, "dynamicColor" to prefs.dynamicColor,
-            "server" to prefs.server, "handle" to prefs.handle,
-            "fullTavernAddress" to prefs.fullTavernAddress,
-        )
+        val json = encodePreferences(prefs, ::seal)
         val updatedGlobals = prefs.scriptVariables.takeUnless { it == globalScriptVariables() }
         check(settings.edit().putString("preferences", json.toString()).commit()) { "无法保存设置" }
         if (updatedGlobals != null) commitScriptVariables(null, updatedGlobals)

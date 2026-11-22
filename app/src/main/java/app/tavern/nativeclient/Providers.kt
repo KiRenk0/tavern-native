@@ -9,7 +9,9 @@ internal enum class ApiProtocol(val wire: String, val label: String) {
     GEMINI_NATIVE("gemini", "Google Gemini 原生"),
     OPENROUTER("openrouter", "OpenRouter"),
     OLLAMA("ollama", "Ollama 本地"),
-    KOBOLD_TEXT("kobold", "KoboldCPP / Text Completion");
+    KOBOLD_TEXT("kobold", "KoboldCPP / llama.cpp 文本补全"),
+    NOVELAI_TEXT("novelai", "NovelAI 文本补全"),
+    HORDE_TEXT("horde", "AI Horde");
 
     companion object {
         fun from(wire: String): ApiProtocol? = entries.firstOrNull { it.wire == wire }
@@ -61,6 +63,10 @@ internal enum class ProviderTemplate(
         id, label, endpoint, defaultModel = defaultModel, template = this,
         models = starterModels, protocol = defaultProtocol(),
     )
+
+    companion object {
+        val builtIn = listOf(DEEPSEEK, GOOGLE)
+    }
 }
 
 internal data class Provider(
@@ -82,10 +88,23 @@ internal data class Provider(
     val openRouterAllowFallbacks: Boolean = true,
     val openRouterReasoningEffort: String = "",
     val textCompletion: Boolean = false,
+    val instruct: InstructTemplate? = null,
+    val textContext: TextContextTemplate? = null,
+    val modelFormatting: ModelFormatting = ModelFormatting(),
+    val textSampling: TextSamplingSettings = TextSamplingSettings(),
+    val requestOptions: ProviderRequestOptions = ProviderRequestOptions(),
+    val tokenBias: TokenBiasSettings = TokenBiasSettings(),
+    val textTokenizer: TextTokenizer = TextTokenizer.MODEL,
+    val novelAi: NovelAiSettings = NovelAiSettings(),
+    val horde: HordeSettings = HordeSettings(),
 ) {
-    val ready get() = endpoint.isNotBlank() && defaultModel.isNotBlank() && (template == null || apiKey.isNotBlank())
+    val requiresApiKey get() = template != null || protocol == ApiProtocol.NOVELAI_TEXT
+    val ready get() = endpoint.isNotBlank() && defaultModel.isNotBlank() && (!requiresApiKey || apiKey.isNotBlank())
     val choices get() = (listOf(defaultModel) + models).filter(String::isNotBlank).distinct()
     val defaultSelection get() = ModelSelection(id, defaultModel)
+    val usesTextCompletion get() = protocol in setOf(ApiProtocol.KOBOLD_TEXT, ApiProtocol.NOVELAI_TEXT, ApiProtocol.HORDE_TEXT) ||
+        protocol == ApiProtocol.OLLAMA && textCompletion
+    val supportsTextSampling get() = protocol in setOf(ApiProtocol.KOBOLD_TEXT, ApiProtocol.OLLAMA, ApiProtocol.HORDE_TEXT)
 
     fun validated(): Provider {
         val profile = template?.profile()
@@ -102,12 +121,22 @@ internal data class Provider(
             thinkingBudget = thinkingBudget?.takeIf { it > 0 }?.coerceAtMost(128_000),
             openRouterProviders = openRouterProviders.map(String::trim).filter(String::isNotBlank).distinct(),
             openRouterReasoningEffort = openRouterReasoningEffort.trim().lowercase().takeIf { it in setOf("low", "medium", "high") }.orEmpty(),
+            instruct = instruct?.validated(),
+            textContext = textContext?.validated(),
         )
         require(clean.name.isNotBlank()) { "请填写提供商名称" }
         require(clean.defaultModel.isNotBlank()) { "请填写默认模型 ID" }
-        require(clean.template == null || clean.apiKey.isNotBlank()) { "请填写 API Key" }
+        require(!clean.requiresApiKey || clean.apiKey.isNotBlank()) { "请填写 API Key" }
+        if (clean.protocol == ApiProtocol.NOVELAI_TEXT) {
+            require(NovelAiModel.from(clean.defaultModel) != null && clean.models.all { NovelAiModel.from(it) != null }) {
+                "请选择 NovelAI 的模型 ID。可使用「读取模型列表」查看。"
+            }
+        }
         require(clean.contextLimit == null || clean.contextLimit in 1..MAX_CONTEXT_TOKENS) { "上下文 Token 上限无效" }
         checkedAddress(clean.endpoint)
+        if (clean.supportsRequestOptions && !requestOptions.isEmpty) {
+            requestOptions.compile()
+        }
         return clean
     }
 
@@ -124,18 +153,30 @@ internal data class Provider(
         "openRouterAllowFallbacks" to openRouterAllowFallbacks,
         "openRouterReasoningEffort" to openRouterReasoningEffort,
         "textCompletion" to textCompletion,
+        "instruct" to instruct?.json(),
+        "textContext" to textContext?.json(),
+        "modelFormatting" to modelFormatting.json(),
+        "textSampling" to textSampling.json(),
+        "requestOptions" to requestOptions.takeIf(ProviderRequestOptions::hasYaml)?.settingsJson()?.toString()?.let(seal),
+        "requestPromptProcessing" to requestOptions.processing.wire.takeIf(String::isNotEmpty),
+        "tokenBias" to tokenBias.takeUnless { it == TokenBiasSettings() }?.json(),
+        "textTokenizer" to textTokenizer.name.takeUnless { textTokenizer == TextTokenizer.MODEL },
+        "novelAi" to novelAi.takeUnless { it == NovelAiSettings() }?.json(),
+        "horde" to horde.takeUnless { it == HordeSettings() }?.json(),
     )
 
     companion object {
         fun fromJson(json: JSONObject, unseal: (String) -> String): Provider {
-            val template = ProviderTemplate.entries.firstOrNull { it.id == json.string("template") }
+            val storedTemplate = ProviderTemplate.entries.firstOrNull { it.id == json.string("template") }
+            val template = storedTemplate?.takeIf { it in ProviderTemplate.builtIn }
             val contexts = json.optJSONObject("modelContexts")
-            val parsedProtocol = ApiProtocol.from(json.string("protocol")) ?: template?.defaultProtocol() ?: ApiProtocol.OPENAI_COMPATIBLE
+            val parsedProtocol = ApiProtocol.from(json.string("protocol")) ?: storedTemplate?.defaultProtocol()
+                ?: ApiProtocol.OPENAI_COMPATIBLE
             val safeProtocol = if (template != null && parsedProtocol !in template.allowedProtocols()) template.defaultProtocol() else parsedProtocol
             return Provider(
-                json.getString("id"), template?.label ?: json.string("name"),
-                template?.endpoint ?: json.string("endpoint"), unseal(json.string("apiKey")),
-                json.string("defaultModel").ifBlank { template?.defaultModel.orEmpty() },
+                json.getString("id"), template?.label ?: json.string("name").ifBlank { storedTemplate?.label.orEmpty() },
+                template?.endpoint ?: json.string("endpoint").ifBlank { storedTemplate?.endpoint.orEmpty() },
+                unseal(json.string("apiKey")), json.string("defaultModel").ifBlank { storedTemplate?.defaultModel.orEmpty() },
                 json.optJSONArray("models").strings(), template, json.optBoolean("streaming", true),
                 json.optInt("contextLimit").takeIf { it in 1..MAX_CONTEXT_TOKENS },
                 contexts?.keys()?.asSequence()?.mapNotNull { id ->
@@ -149,6 +190,19 @@ internal data class Provider(
                 openRouterAllowFallbacks = json.optBoolean("openRouterAllowFallbacks", true),
                 openRouterReasoningEffort = json.string("openRouterReasoningEffort"),
                 textCompletion = json.optBoolean("textCompletion", false),
+                instruct = json.optJSONObject("instruct")?.let { runCatching { InstructTemplate.fromJson(it) }.getOrNull() },
+                textContext = json.optJSONObject("textContext")?.let {
+                    runCatching { TextContextTemplate.fromJson(it, checkStory = false) }.getOrNull()
+                },
+                modelFormatting = ModelFormatting.read(json.optJSONObject("modelFormatting")),
+                textSampling = TextSamplingSettings.read(json.optJSONObject("textSampling")),
+                requestOptions = ProviderRequestOptions.fromJson(json.string("requestOptions").takeIf(String::isNotBlank)
+                    ?.let { runCatching { JSONObject(unseal(it)) }.getOrNull() })
+                    .copy(processing = PromptPostProcessing.from(json.string("requestPromptProcessing"))),
+                tokenBias = TokenBiasSettings.read(json.optJSONObject("tokenBias")),
+                textTokenizer = TextTokenizer.from(json.string("textTokenizer")),
+                novelAi = NovelAiSettings.read(json.optJSONObject("novelAi")),
+                horde = HordeSettings.read(json.optJSONObject("horde")),
             )
         }
 
@@ -175,7 +229,10 @@ internal data class ModelSelection(val providerId: String, val model: String) {
 
 internal data class ModelConnection(val provider: Provider, val model: String)
 
-internal data class DiscoveredModels(val ids: List<String>, val contexts: Map<String, Int>) {
+internal data class DiscoveredModels(
+    val ids: List<String>, val contexts: Map<String, Int>, val novelAiTier: Int? = null,
+    val hordeOutputs: Map<String, Int>? = null,
+) {
     companion object {
         fun read(json: JSONObject, googleAliases: Boolean = false): DiscoveredModels {
             val google = json.has("models")

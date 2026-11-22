@@ -57,7 +57,8 @@ internal fun MessageImage(image: ChatImage, file: File, preview: () -> Unit) {
 
 @Composable
 internal fun ChatImageContent(image: ChatImage, file: File, maxEdge: Int, modifier: Modifier, crop: Boolean = false,
-                             decorative: Boolean = false, alignment: Alignment = Alignment.Center) {
+                             decorative: Boolean = false, alignment: Alignment = Alignment.Center,
+                             scale: ContentScale = if (crop) ContentScale.Crop else ContentScale.Fit) {
     val loaded = rememberImagePreview(file, maxEdge)
     if (loaded == null && !decorative) {
         Box(modifier.defaultMinSize(minHeight = 64.dp), contentAlignment = Alignment.Center) {
@@ -66,7 +67,7 @@ internal fun ChatImageContent(image: ChatImage, file: File, maxEdge: Int, modifi
     } else if (loaded != null) {
         val graphic = remember(loaded) { loaded.asImageBitmap() }
         Image(graphic, if (decorative) null else image.name.ifBlank { "聊天图片" }, modifier,
-            alignment = alignment, contentScale = if (crop) ContentScale.Crop else ContentScale.Fit)
+            alignment = alignment, contentScale = scale)
     }
 }
 
@@ -78,8 +79,15 @@ internal fun rememberImagePreview(file: File, maxEdge: Int): Bitmap? = key(file,
 }
 
 @Composable
-internal fun ConversationBackground(image: ChatImage, file: File, modifier: Modifier) {
-    ChatImageContent(image, file, 1440, modifier.alpha(0.4f), crop = true, decorative = true)
+internal fun ConversationBackground(image: ChatImage, file: File, modifier: Modifier,
+                                    fit: BackgroundFit = BackgroundFit.COVER, opacity: Float = 0.4f) {
+    val scale = when (fit) {
+        BackgroundFit.COVER -> ContentScale.Crop
+        BackgroundFit.CONTAIN -> ContentScale.Fit
+        BackgroundFit.STRETCH -> ContentScale.FillBounds
+        BackgroundFit.CENTER -> ContentScale.Inside
+    }
+    ChatImageContent(image, file, 1440, modifier.alpha(opacity), decorative = true, scale = scale)
 }
 
 @Composable
@@ -97,6 +105,7 @@ internal fun ImageGalleryDialog(gallery: ImageGallery, model: TavernViewModel, e
                         if (item.prompt.isNotBlank()) Text(item.prompt, Modifier.padding(top = 4.dp),
                             style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
                         if (setBackground != null) TextButton({ setBackground(item.image) }, enabled = enabled) { Text("设为对话背景") }
+                        TextButton({ model.addLibraryBackground(item.image) }, enabled = enabled) { Text("加入背景库") }
                     }
                 }
             }
@@ -117,7 +126,8 @@ private fun loadPreview(file: File, maxEdge: Int): Bitmap? {
 
 @Composable
 internal fun ImagePreviewDialog(image: ChatImage, model: TavernViewModel, enabled: Boolean, dismiss: () -> Unit,
-                                useAsReference: (() -> Unit)?, description: String = "", editDescription: (() -> Unit)? = null) {
+                                useAsReference: (() -> Unit)?, description: String = "", remove: (() -> Unit)? = null,
+                                editDescription: (() -> Unit)? = null) {
     val file = model.imageFile(image)
     val export = rememberLauncherForActivityResult(CreateDocument(image.format.mime)) { uri ->
         if (uri != null) model.exportImage(uri, image)
@@ -130,6 +140,7 @@ internal fun ImagePreviewDialog(image: ChatImage, model: TavernViewModel, enable
                 else Text("此对话缺少图片文件。可用含图片的 ZIP 归档重新导入。")
                 if (description.isNotBlank()) Text(description, style = MaterialTheme.typography.bodyMedium)
                 if (editDescription != null) TextButton(editDescription, enabled = enabled) { Text("图片描述") }
+                if (remove != null) TextButton(remove, enabled = enabled) { Text("从消息移除图片") }
             }
         },
         dismissButton = { TextButton(dismiss) { Text("关闭") } },
@@ -217,6 +228,7 @@ internal fun ImageGenerationDialog(state: TavernState, chat: Chat, viewModel: Ta
     }
     var availableParameters by remember(provider.id) { mutableStateOf<ComfyCatalog?>(null) }
     val comfyCatalog = availableParameters.takeIf { protocol == ImageProtocol.COMFY }
+    var hordeModels by remember(provider.id) { mutableStateOf(emptyList<String>()) }
     val supportsReference = !protocol.usesWorkflow || keys?.any { it.startsWith("reference_image") } == true
     val tuningDefaults = saved?.takeIf { it.providerId == provider.id && it.protocol == protocol }?.tuning ?: ImageTuning()
     var negative by rememberSaveable(provider.id, protocol) { mutableStateOf(tuningDefaults.negative) }
@@ -287,10 +299,17 @@ internal fun ImageGenerationDialog(state: TavernState, chat: Chat, viewModel: Ta
                 if (!protocol.usesWorkflow || keys?.contains("model") != false) {
                     val label = when {
                         protocol == ImageProtocol.DIFFUSION -> "检查点（留空使用服务当前模型）"
+                        protocol == ImageProtocol.HORDE -> "AI Horde 图像模型（可选）"
                         protocol.usesWorkflow -> "检查点 / UNet 文件名"
                         else -> "图像模型 ID"
                     }
-                    DrawingInput(label, model, comfyCatalog?.checkpoints.orEmpty()) { model = it }
+                    if (protocol == ImageProtocol.HORDE) {
+                        TextButton({ viewModel.loadHordeImageModels(provider) { hordeModels = it } },
+                            enabled = !state.busy) { Text("读取在线图像模型") }
+                    }
+                    DrawingInput(label, model, if (protocol == ImageProtocol.HORDE) hordeModels else comfyCatalog?.checkpoints.orEmpty()) {
+                        model = it
+                    }
                 }
                 if (target == null) SelectField("提示词来源", mode, DrawingMode.entries, DrawingMode::label, !state.busy) {
                     if (it != mode) text = if (it == DrawingMode.FREE) initialPrompt else ""
@@ -357,7 +376,8 @@ internal fun ImageGenerationDialog(state: TavernState, chat: Chat, viewModel: Ta
                     workflow.id.takeIf { protocol.usesWorkflow })
                 if (viewModel.generateImage(chat.id, request, mode, target, rememberService)) dismiss()
             }, enabled = !state.busy && text.isNotBlank() && tuning.isSuccess &&
-                (model.isNotBlank() || protocol == ImageProtocol.DIFFUSION || protocol.usesWorkflow && keys?.contains("model") == false)) { Text("生成") }
+                (model.isNotBlank() || protocol in setOf(ImageProtocol.DIFFUSION, ImageProtocol.HORDE) ||
+                    protocol.usesWorkflow && keys?.contains("model") == false)) { Text("生成") }
         },
     )
 }

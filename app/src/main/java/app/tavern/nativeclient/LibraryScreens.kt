@@ -4,14 +4,18 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts.CreateDocument
 import androidx.activity.result.contract.ActivityResultContracts.OpenDocument
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridItemScope
+import androidx.compose.foundation.lazy.grid.LazyGridScope
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Label
@@ -44,6 +48,8 @@ internal fun OrganizedLibrary(
     var selecting by rememberSaveable { mutableStateOf(false) }
     var selected by rememberSaveable { mutableStateOf(emptyArray<String>()) }
     var sortPicker by remember { mutableStateOf(false) }
+    val options = state.prefs.characterLibrary
+    val grid = options.grid
     val entries = remember(catalog, state.cards, state.groups, groupsOnly, kind) {
         catalog.entities(state.cards, state.groups).filter {
             (!groupsOnly || it.group != null) && (kind != "card" || it.card != null) && (kind != "group" || it.group != null)
@@ -53,13 +59,13 @@ internal fun OrganizedLibrary(
     val include = remember(included, tagIds) { included.filterTo(hashSetOf()) { it in tagIds } }
     val exclude = remember(excluded, tagIds) { excluded.filterTo(hashSetOf()) { it in tagIds } }
     val folder = catalog.tags.firstOrNull { catalog.folders && it.id == folderId && it.folder != TagFolder.NONE }
-    val matches = remember(entries, catalog, state.libraryUsage, query, include, exclude, folder, favorites) {
-        browseLibrary(entries, catalog, state.libraryUsage, query, include, exclude, folder?.id, favorites)
+    val matches = remember(entries, catalog, state.libraryUsage, query, include, exclude, folder, favorites, options.advancedSearch) {
+        browseLibrary(entries, catalog, state.libraryUsage, query, include, exclude, folder?.id, favorites, options.advancedSearch)
     }
-    val folders = remember(entries, catalog, state.libraryUsage, query, include, exclude, folder, favorites) {
+    val folders = remember(entries, catalog, state.libraryUsage, query, include, exclude, folder, favorites, options.advancedSearch) {
         if (!catalog.folders || folder != null) emptyList() else catalog.tags.mapNotNull { tag ->
             if (tag.folder == TagFolder.NONE || tag.id in include || tag.id in exclude) return@mapNotNull null
-            val count = browseLibrary(entries, catalog, state.libraryUsage, query, include, exclude, tag.id, favorites).size
+            val count = browseLibrary(entries, catalog, state.libraryUsage, query, include, exclude, tag.id, favorites, options.advancedSearch).size
             val searched = query.isNotBlank() && tag.name.contains(query.trim(), true)
             if (count > 0 || searched) tag to count else null
         }
@@ -78,24 +84,26 @@ internal fun OrganizedLibrary(
     }
 
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
-        LazyColumn(Modifier.widthIn(max = 760.dp).fillMaxWidth(),
+        LazyVerticalGrid(if (grid) GridCells.Adaptive(144.dp) else GridCells.Fixed(1),
+            Modifier.widthIn(max = 760.dp).fillMaxWidth(),
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 100.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (groupsOnly) item {
+            if (groupsOnly) fullWidthItem {
                 OutlinedButton(createGroup, enabled = !busy && state.cards.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Outlined.GroupAdd, null)
                     Spacer(Modifier.width(8.dp))
                     Text("新建群组")
                 }
             }
-            if (folder != null) item {
+            if (folder != null) fullWidthItem {
                 TextButton(onClick = { folderId = null }, enabled = !busy) {
                     Icon(Icons.Outlined.Folder, null)
                     Spacer(Modifier.width(8.dp))
                     Text("返回全部 · ${folder.name}", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
-            item {
+            fullWidthItem {
                 OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth(), enabled = !busy, singleLine = true,
                     label = { Text(if (groupsOnly) "搜索群组" else "搜索角色或群组") },
                     leadingIcon = { Icon(Icons.Outlined.Search, null) },
@@ -103,7 +111,7 @@ internal fun OrganizedLibrary(
                         { ActionIcon(Icons.Outlined.Close, "清除搜索", !busy) { query = "" } }
                     }, shape = RoundedCornerShape(24.dp))
             }
-            item {
+            fullWidthItem {
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     item {
                         FilterChip(favorites, { favorites = !favorites }, enabled = !busy,
@@ -127,7 +135,7 @@ internal fun OrganizedLibrary(
                     }
                 }
             }
-            item {
+            fullWidthItem {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     if (selecting) {
                         Text("已选择 ${chosen.size} 项", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
@@ -152,13 +160,17 @@ internal fun OrganizedLibrary(
                                 }
                             }
                         }
+                        ActionIcon(if (grid) Icons.Outlined.ViewList else Icons.Outlined.GridView,
+                            if (grid) "切换列表" else "切换网格", !busy) {
+                            model.setCharacterLibrary(options.copy(grid = !grid))
+                        }
                         TextButton({ selecting = true }, enabled = !busy && matches.isNotEmpty()) { Text("批量打标") }
                     }
                 }
             }
             val shortcuts = if (!selecting && !favorites && query.isBlank() && folder == null && include.isEmpty() && exclude.isEmpty())
                 entries.filter(LibraryItem::favorite) else emptyList()
-            if (shortcuts.isNotEmpty()) item {
+            if (shortcuts.isNotEmpty()) fullWidthItem {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("收藏快捷入口", style = MaterialTheme.typography.labelLarge)
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -170,7 +182,7 @@ internal fun OrganizedLibrary(
                     }
                 }
             }
-            items(folders, key = { (tag, _) -> "folder:${tag.id}" }) { (tag, count) ->
+            items(folders, key = { (tag, _) -> "folder:${tag.id}" }, span = { GridItemSpan(maxLineSpan) }) { (tag, count) ->
                 OutlinedCard(onClick = { folderId = tag.id }, enabled = !busy && !selecting, modifier = Modifier.fillMaxWidth()) {
                     ListItem(
                         headlineContent = { LibraryTagLabel(tag) },
@@ -180,13 +192,19 @@ internal fun OrganizedLibrary(
                     )
                 }
             }
-            if (folders.isEmpty() && matches.isEmpty() && !busy) item {
+            if (folders.isEmpty() && matches.isEmpty() && !busy) fullWidthItem {
                 Text(if (entries.isEmpty() && groupsOnly) "还没有群组。" else "未找到匹配的项目。",
                     modifier = Modifier.padding(8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             items(matches, key = LibraryItem::id) { item ->
-                LibraryResult(item, item.tags.mapNotNull(byTag::get).filterNot(LibraryTag::hidden), model, busy, selecting,
-                    item.id in chosen) { open(item) }
+                val card = item.card
+                val subtitle = if (card == null) item.detail
+                    else if (options.spoilerFree && options.subtitle == CharacterSubtitle.DESCRIPTION) card.creator
+                    else options.subtitle.text(card)
+                val tags = item.tags.mapNotNull(byTag::get).filterNot(LibraryTag::hidden)
+                val avatarName = card?.takeIf { options.showAvatarFilename && it.hasAvatar }?.scriptAvatarKey
+                if (grid) LibraryGridResult(item, subtitle, avatarName, tags, state.cards, model, busy, selecting, item.id in chosen) { open(item) }
+                else LibraryResult(item, subtitle, avatarName, tags, state.cards, model, busy, selecting, item.id in chosen) { open(item) }
             }
         }
     }
@@ -202,8 +220,33 @@ internal fun OrganizedLibrary(
     }
 }
 
+private fun LazyGridScope.fullWidthItem(content: @Composable LazyGridItemScope.() -> Unit) =
+    item(span = { GridItemSpan(maxLineSpan) }, content = content)
+
 @Composable
-private fun LibraryResult(item: LibraryItem, tags: List<LibraryTag>, model: TavernViewModel, busy: Boolean,
+private fun LibraryGridResult(item: LibraryItem, subtitle: String, avatarName: String?, tags: List<LibraryTag>, cards: List<Card>, model: TavernViewModel,
+                              busy: Boolean, selecting: Boolean, checked: Boolean, open: () -> Unit) {
+    Card(onClick = open, enabled = !busy, modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                item.card?.let { Portrait(it, model.portrait(it), 80.dp) }
+                item.group?.let { GroupPortrait(it, cards, model::portrait, 80.dp) }
+            }
+            Text(item.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (subtitle.isNotBlank()) Text(subtitle, style = MaterialTheme.typography.bodySmall,
+                maxLines = 2, overflow = TextOverflow.Ellipsis)
+            AvatarFilename(avatarName)
+            if (tags.isNotEmpty()) Text(tags.joinToString(" · ", transform = LibraryTag::name),
+                style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (selecting) Checkbox(checked, { open() }, enabled = !busy)
+            else LibraryFavorite(item.favorite, busy) { model.toggleLibraryFavorite(item.id) }
+        }
+    }
+}
+
+@Composable
+private fun LibraryResult(item: LibraryItem, subtitle: String, avatarName: String?, tags: List<LibraryTag>, cards: List<Card>, model: TavernViewModel, busy: Boolean,
                           selecting: Boolean, checked: Boolean, open: () -> Unit) {
     Card(onClick = open, enabled = !busy, modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
@@ -211,12 +254,12 @@ private fun LibraryResult(item: LibraryItem, tags: List<LibraryTag>, model: Tave
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             if (selecting) Checkbox(checked, { open() }, enabled = !busy)
             else if (item.card != null) Portrait(item.card, model.portrait(item.card), 54.dp)
-            else Box(Modifier.size(54.dp).background(MaterialTheme.colorScheme.secondaryContainer, CircleShape),
-                contentAlignment = Alignment.Center) { Icon(Icons.Outlined.Groups, null) }
+            else if (item.group != null) GroupPortrait(item.group, cards, model::portrait, 54.dp)
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(item.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (item.detail.isNotBlank()) Text(item.detail, style = MaterialTheme.typography.bodyMedium, maxLines = 2,
+                if (subtitle.isNotBlank()) Text(subtitle, style = MaterialTheme.typography.bodyMedium, maxLines = 2,
                     color = MaterialTheme.colorScheme.onSurfaceVariant, overflow = TextOverflow.Ellipsis)
+                AvatarFilename(avatarName)
                 if (tags.isNotEmpty()) Text(tags.joinToString(" · ", transform = LibraryTag::name),
                     style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     color = MaterialTheme.colorScheme.primary)
@@ -224,6 +267,12 @@ private fun LibraryResult(item: LibraryItem, tags: List<LibraryTag>, model: Tave
             if (!selecting) LibraryFavorite(item.favorite, busy) { model.toggleLibraryFavorite(item.id) }
         }
     }
+}
+
+@Composable
+private fun AvatarFilename(filename: String?) {
+    if (filename != null) Text(filename, style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
 }
 
 @Composable

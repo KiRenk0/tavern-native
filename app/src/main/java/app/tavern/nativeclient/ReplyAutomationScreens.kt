@@ -75,6 +75,8 @@ internal fun ReplyAutomationDialog(current: ReplyAutomation, busy: Boolean, dism
 @Composable
 internal fun ReplyAlternativePicker(
     message: Message, busy: Boolean, dismiss: () -> Unit, select: (Int) -> Unit, delete: (Int) -> Unit,
+    branch: ((Int) -> Unit)? = null,
+    confirmDelete: Boolean = true,
 ) {
     var expanded by remember { mutableStateOf<Int?>(null) }
     var deleting by rememberSaveable { mutableStateOf<Int?>(null) }
@@ -92,7 +94,13 @@ internal fun ReplyAlternativePicker(
                             Text("第 ${option + 1} 条" + if (selected) " · 当前" else "",
                                 Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
                             ActionIcon(Icons.Outlined.DeleteOutline, "删除第 ${option + 1} 条备选回复",
-                                !busy && message.variants.size > 1) { deleting = option }
+                                !busy && message.variants.size > 1) {
+                                if (confirmDelete) deleting = option
+                                else {
+                                    expanded = null
+                                    delete(option)
+                                }
+                            }
                         }
                         SelectionContainer {
                             Text(text.ifBlank { "（空消息）" }, maxLines = if (open) Int.MAX_VALUE else 5,
@@ -103,6 +111,9 @@ internal fun ReplyAlternativePicker(
                                 TextButton({ expanded = if (open) null else option }) { Text(if (open) "收起" else "展开") }
                             }
                             if (!selected) TextButton({ select(option) }, enabled = !busy) { Text("切换到此回复") }
+                        }
+                        if (branch != null) {
+                            TextButton({ branch(option) }, enabled = !busy) { Text("从此回复创建分支") }
                         }
                     }
                 }

@@ -9,9 +9,11 @@ internal class EmbeddedLibrary(
     private val attachmentStore: ChatDocumentStore? = null,
     private val images: ChatImageStore? = null,
     private val account: String = "default-user",
+    private val videos: ChatVideoStore? = null,
 ) {
-    constructor(profile: File, attachmentStore: ChatDocumentStore? = null, images: ChatImageStore? = null) :
-        this(FolderOriginalLibrary(profile), attachmentStore, images)
+    constructor(profile: File, attachmentStore: ChatDocumentStore? = null, images: ChatImageStore? = null,
+                videos: ChatVideoStore? = null) :
+        this(FolderOriginalLibrary(profile), attachmentStore, images, videos = videos)
 
     val exists: Boolean
         get() = listOf("characters", "groups", "worlds", "User Avatars", "OpenAI Settings", "QuickReplies").any {
@@ -22,7 +24,7 @@ internal class EmbeddedLibrary(
         var errors = 0
         var chatCount = 0
         var documentCount = 0
-        val media = OriginalLibraryMedia(source, attachmentStore, images, checkActive)
+        val media = OriginalLibraryMedia(source, attachmentStore, images, checkActive, videos)
         val avatars = mutableMapOf<String, String>()
         val groupIds = mutableMapOf<String, String>()
         val savedData = store.dataDocuments().mapTo(hashSetOf(), DataDocument::id)
@@ -85,12 +87,16 @@ internal class EmbeddedLibrary(
                 } ?: sourceId("persona:$name")
             }.orEmpty()
         val loreSettings = settings?.optJSONObject("world_info_settings")
-        val enabled = loreSettings?.optJSONObject("world_info")?.optJSONArray("globalSelect").strings()
-        val scanDepth = loreSettings?.optInt("world_info_depth", 4)?.coerceIn(0, 80) ?: 4
+        val originalWorldSettings = loreSettings?.optJSONObject("world_info")
+        val enabled = originalWorldSettings?.optJSONArray("globalSelect").strings()
+        val additionalBooks = originalWorldSettings?.optJSONArray("charLore")?.objects().orEmpty().associate {
+            it.string("name") to it.optJSONArray("extraBooks").strings()
+        }
         val knownBooks = store.books().associateByTo(mutableMapOf(), WorldBook::id)
         val homeBooks = knownBooks.values.associateBy { it.name.lowercase() }
         val usedBookNames = homeBooks.keys.toMutableSet()
         val importedBooks = mutableMapOf<String, WorldBook>()
+        val newBooks = mutableListOf<WorldBook>()
         var bookCount = 0
         for (file in files("worlds", "json")) attempt {
             val name = file.nameWithoutExtension
@@ -102,9 +108,9 @@ internal class EmbeddedLibrary(
                 val title = if (nativeBackup) content.string("tavern_native_backup_name").ifBlank { name } else name
                 val uniqueName = generateSequence(1) { it + 1 }.map { if (it == 1) title else "$title ($it)" }
                     .first { it.lowercase() !in usedBookNames }
-                var value = WorldBook.import(content, name).copy(id = id, name = uniqueName, enabled = name in enabled)
-                if (!content.has("scan_depth")) value = value.withScanDepth(scanDepth)
+                val value = WorldBook.import(content, name).copy(id = id, name = uniqueName, enabled = name in enabled)
                 store.save(value)
+                newBooks += value
                 knownBooks[id] = value
                 usedBookNames += uniqueName.lowercase()
                 bookCount++
@@ -176,13 +182,16 @@ internal class EmbeddedLibrary(
             val source = CardFile.read(file.bytes(), sourceId("card:${file.name}"))
             val extensions = if (nativeBackup) source.card.portableJson().optJSONObject("data")?.optJSONObject("extensions") else null
             val id = savedId(extensions) ?: source.card.id
-            val parsed = source.copy(card = source.card.copy(id = id))
+            val identified = source.card.copy(id = id)
+            val parsed = source.copy(card = if (nativeBackup) identified else identified.withScriptAvatarKey(file.name))
             val sourceNote = characterNotes[file.name] ?: characterNotes[file.nameWithoutExtension]
             val card = if (sourceNote == null) parsed else parsed.copy(card = parsed.card.withAuthorNote(
                 CharacterNote(sourceNote.string("prompt"),
                     CharacterNoteOrder.entries.getOrElse(sourceNote.optInt("position")) { CharacterNoteOrder.REPLACE })))
             val book = worldFor(card.card.worldName)
-            val linked = if (book == null || book.name == card.card.worldName) card else card.copy(card = card.card.withWorld(book.name))
+            val linkedPrimary = if (book == null || book.name == card.card.worldName) card.card else card.card.withWorld(book.name)
+            val extraIds = additionalBooks[file.nameWithoutExtension].orEmpty().mapNotNull { worldFor(it)?.id }
+            val linked = card.copy(card = linkedPrimary.withAdditionalWorldBooks(linkedPrimary.additionalWorldBookIds + extraIds))
             val portable = if (nativeBackup) {
                 val value = linked.card
                 val hasAvatar = extensions?.optBoolean("tavern_native_placeholder_avatar") != true
@@ -214,6 +223,7 @@ internal class EmbeddedLibrary(
             groupIds[data.string("id").ifBlank { file.nameWithoutExtension }] = id
             val original = TavernGroup.from(id, data.toString())
             val group = original.copy(name = original.name.ifBlank { file.nameWithoutExtension },
+                avatar = original.avatar.takeIf { nativeBackup } ?: media.groupAvatar(data.string("avatar_url")),
                 memberIds = original.memberIds.mapNotNull(avatars::get),
                 mutedIds = original.mutedIds.mapNotNull(avatars::get).toSet())
             if (data.has("fav")) groupFavorites[libraryGroupId(id)] = group.favorite
@@ -335,36 +345,88 @@ internal class EmbeddedLibrary(
         val scriptVariables = oldExtensions?.optJSONObject("variables")?.optJSONObject("global").variableStrings() +
             prefs.scriptVariables
         val automation = if (prefs.replyAutomation == ReplyAutomation()) ReplyAutomation.from(power) else prefs.replyAutomation
-        val appearance = if (prefs.chatAppearance == ChatAppearance() && power?.has("tavern_native_chat_appearance") == true) {
-            ChatAppearance.from(power.optJSONObject("tavern_native_chat_appearance"))
+        val importedBackgrounds = media.backgroundLibrary(settings?.optJSONObject("background"),
+            settings?.optJSONObject("tavern_native_background_files").takeIf { nativeBackup })
+        val backgrounds = if (prefs.backgrounds == BackgroundLibrary()) importedBackgrounds else
+            prefs.backgrounds.add(importedBackgrounds.items)
+        val incomingThemes = mutableListOf<ChatTheme>()
+        for (file in files("themes", "json")) attempt {
+            val row = JSONObject(file.bytes(MAX_THEME_JSON).decodeToString().trimStart('\uFEFF'))
+            val id = savedId(row) ?: sourceId("theme:${file.name}")
+            incomingThemes += ChatTheme.read(row, file.nameWithoutExtension, id)
+        }
+        val useSourceAppearance = prefs.chatAppearance == ChatAppearance() && prefs.chatThemes.activeId == null
+        val sourceTheme = incomingThemes.firstOrNull {
+            if (nativeBackup) power?.string("tavern_native_active_theme") == it.id
+            else power?.string("theme") == it.name
+        }
+        var themes = incomingThemes.fold(prefs.chatThemes) { current, theme -> current.add(theme) }
+        if (useSourceAppearance && sourceTheme != null) themes = themes.copy(activeId = sourceTheme.id)
+        val appearance = if (useSourceAppearance) {
+            power?.optJSONObject("tavern_native_chat_appearance")?.let(ChatAppearance::from)
+                ?: ChatAppearance.fromOriginal(power, sourceTheme?.appearance ?: prefs.chatAppearance)
         } else prefs.chatAppearance
+        val themeMode = if (useSourceAppearance && nativeBackup) {
+            power?.string("tavern_native_theme_mode")?.takeIf { it in listOf("system", "light", "dark") } ?: prefs.theme
+        } else prefs.theme
+        val dynamicColor = if (useSourceAppearance && nativeBackup) {
+            power?.optBoolean("tavern_native_dynamic_color", prefs.dynamicColor) ?: prefs.dynamicColor
+        } else prefs.dynamicColor
+        val visualNovel = if (useSourceAppearance) {
+            power?.optBoolean("waifuMode", sourceTheme?.visualNovel ?: prefs.visualNovel) ?: prefs.visualNovel
+        } else prefs.visualNovel
+        val swipeGestures = if (useSourceAppearance && !prefs.swipeGestures) power?.optBoolean("gestures") == true else prefs.swipeGestures
+        val showGroupQueue = if (useSourceAppearance && !prefs.showGroupQueue) power?.optBoolean("show_group_chat_queue") == true else prefs.showGroupQueue
+        val chatHandling = if (prefs.chatHandling == ChatHandling()) ChatHandling.fromOriginal(settings) else prefs.chatHandling
+        val characterLibrary = if (prefs.characterLibrary == CharacterLibraryOptions())
+            CharacterLibraryOptions.from(power) else prefs.characterLibrary
+        val textSystem = if (prefs.textSystem == TextSystemSettings()) prefs.textSystem.copy(
+            preferCharacterPrompt = power?.optBoolean("prefer_character_prompt", true) ?: true,
+            preferCharacterPostHistory = power?.optBoolean("prefer_character_jailbreak", true) ?: true,
+        ) else prefs.textSystem
         val profilesImported = if (prefs.connectionProfiles.isEmpty() && power?.has("tavern_native_connection_profiles") == true) {
             power.optJSONArray("tavern_native_connection_profiles")?.objects()?.mapNotNull(ConnectionProfile::fromJson).orEmpty()
         } else prefs.connectionProfiles
         val activeProfileImported = prefs.activeProfileId ?: power?.string("tavern_native_active_profile")?.takeIf(String::isNotBlank)
-        val tags = settings?.let { settingsJson ->
+        val tokenProbabilities = prefs.requestTokenProbabilities || power?.optBoolean("request_token_probabilities") == true
+        val importedTags = settings?.let { settingsJson ->
             prefs.library.mergeTags(settingsJson, ownerFor = { key ->
                 avatars[key]?.let(::libraryCardId) ?: groupIds[key]?.let(::libraryGroupId)
-            }, preserveAssignments = true).preferences
-        } ?: prefs.library
+            }, preserveAssignments = true, preserveEmptyAssignments = nativeBackup)
+        }
+        val rulesNames = avatars.entries.associate { (filename, id) -> filename.loreFilenameStem() to id }
+        for (book in newBooks) attempt {
+            val mapped = book.remapLoreFilters(rulesNames, importedTags?.idMap.orEmpty())
+            if (mapped != book) store.save(mapped)
+        }
+        val tags = importedTags?.preferences ?: prefs.library
         val library = tags.copy(favorites = groupFavorites + tags.favorites,
             folders = tags.folders || prefs.library == LibraryPreferences() && power?.optBoolean("bogus_folders") == true)
         if (profiles != prefs.personas || links != prefs.personaConnections || (defaultNote != null && prefs.defaultAuthorNote == AuthorNote()) ||
             (importedLore != null && importedLore != prefs.loreSettings) || defaultPreset != prefs.defaultPresetId ||
             regex != prefs.regex || quickReplies != quick || scriptVariables != prefs.scriptVariables ||
             library != prefs.library || automation != prefs.replyAutomation || appearance != prefs.chatAppearance ||
-            profilesImported != prefs.connectionProfiles || activeProfileImported != prefs.activeProfileId) {
+            themes != prefs.chatThemes || themeMode != prefs.theme || dynamicColor != prefs.dynamicColor || visualNovel != prefs.visualNovel ||
+            swipeGestures != prefs.swipeGestures || showGroupQueue != prefs.showGroupQueue || chatHandling != prefs.chatHandling ||
+            characterLibrary != prefs.characterLibrary || textSystem != prefs.textSystem ||
+            tokenProbabilities != prefs.requestTokenProbabilities ||
+            profilesImported != prefs.connectionProfiles || activeProfileImported != prefs.activeProfileId || backgrounds != prefs.backgrounds) {
             store.save(prefs.copy(personas = profiles, personaConnections = links,
                 defaultPersonaId = sourceDefaultId.takeIf { useSourceDefaults } ?: prefs.defaultPersonaId,
                 defaultAuthorNote = defaultNote?.takeIf { prefs.defaultAuthorNote == AuthorNote() } ?: prefs.defaultAuthorNote,
                 loreSettings = importedLore ?: prefs.loreSettings, defaultPresetId = defaultPreset, regex = regex,
                 quickReplies = quickReplies, scriptVariables = scriptVariables, library = library,
-                replyAutomation = automation, chatAppearance = appearance,
-                connectionProfiles = profilesImported, activeProfileId = activeProfileImported))
+                replyAutomation = automation, chatAppearance = appearance, requestTokenProbabilities = tokenProbabilities,
+                chatThemes = themes, theme = themeMode, dynamicColor = dynamicColor, visualNovel = visualNovel,
+                swipeGestures = swipeGestures, showGroupQueue = showGroupQueue,
+                chatHandling = chatHandling,
+                characterLibrary = characterLibrary,
+                textSystem = textSystem,
+                connectionProfiles = profilesImported, activeProfileId = activeProfileImported, backgrounds = backgrounds))
         }
         return "已读取 ${avatars.size} 个角色、$groupCount 个群组、新增 $chatCount 个聊天、$bookCount 本世界书、" +
             "${profiles.size - prefs.personas.size} 个人设、$addedPresets 个提示词预设和 $addedQuickSets 个快捷回复集" +
-            "。读取 ${media.imageCount} 张图片，新增 $documentCount 份资料" +
+            "。读取 ${media.imageCount} 张图片，新增 $documentCount 份资料和 ${themes.items.size - prefs.chatThemes.items.size} 个聊天主题" +
             if (errors + media.missing > 0) "。${errors + media.missing} 项文件缺失或无法读取" else ""
     }
 

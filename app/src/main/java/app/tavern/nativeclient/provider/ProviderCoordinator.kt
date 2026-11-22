@@ -2,13 +2,81 @@ package app.tavern.nativeclient.provider
 
 import android.net.Uri
 import app.tavern.nativeclient.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 internal class ProviderCoordinator(private val host: CoordinatorHost) {
+    private data class ProbeKey(val provider: String, val endpoint: String, val account: Int, val model: String)
+    private data class HordeProbeKey(val endpoint: String, val account: Int, val trustedOnly: Boolean)
+    private val templateCatalog by lazy { ModelFormatCatalog.load(host.app.assets) }
+    private val shippedThemes by lazy {
+        host.app.assets.open("st-theme-presets.json").use { readBuiltInChatThemes(JSONArray(it.readLimited(MAX_THEME_JSON).decodeToString())) }
+    }
+    private val probes = linkedMapOf<ProbeKey, Pair<Long, BackendModelFormatting?>>()
+    private val hordeProbes = linkedMapOf<HordeProbeKey, Pair<Long, HordeWorkerLimits?>>()
+
+    private suspend fun inspect(connection: ModelConnection): BackendModelFormatting? = withTimeoutOrNull(4_500) {
+        ProviderProtocols.modelProperties(connection, withContext(Dispatchers.IO) { templateCatalog })
+    }
+
+    fun loadFormattingMetadata(provider: Provider, model: String, done: (BackendModelFormatting) -> Unit) = host.work {
+        require(model.isNotBlank()) { "请输入模型 ID" }
+        val result = inspect(ModelConnection(provider, model.trim())) ?: error("读取模型属性超时")
+        done(result)
+        host.notice(if (result.hash.isEmpty() && result.contextTokens == null) "服务未报告模板或上下文长度" else "已读取模型属性")
+    }
+
+    suspend fun formattedConnection(connection: ModelConnection): ModelConnection {
+        val provider = connection.provider
+        if (provider.protocol == ApiProtocol.HORDE_TEXT) return refreshHordeLimits(connection)
+        val config = provider.modelFormatting
+        if (provider.protocol != ApiProtocol.KOBOLD_TEXT || !config.usesMetadata ||
+            config.backend[connection.model]?.current() == true) return connection
+        val key = ProbeKey(provider.id, provider.endpoint, provider.apiKey.hashCode(), connection.model)
+        val now = System.currentTimeMillis()
+        val cached = synchronized(probes) { probes[key]?.takeIf { (time, _) -> now - time in 0..300_000L } }
+        val metadata = if (cached != null) cached.second else {
+            val checked = try {
+                inspect(connection)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+            synchronized(probes) {
+                if (probes.size >= 32) probes.remove(probes.keys.first())
+                probes[key] = now to checked
+            }
+            checked
+        }
+        if (metadata == null) return connection
+        return connection.copy(provider = provider.copy(modelFormatting = config.withBackend(connection.model, metadata)))
+    }
+
+    private suspend fun refreshHordeLimits(connection: ModelConnection): ModelConnection {
+        val provider = connection.provider
+        if (!provider.horde.adjustContext && !provider.horde.adjustOutput) return connection
+        val key = HordeProbeKey(provider.endpoint, provider.apiKey.hashCode(), provider.horde.trustedOnly)
+        val now = System.currentTimeMillis()
+        val cached = synchronized(hordeProbes) { hordeProbes[key]?.takeIf { (time, _) -> now - time in 0..30_000L } }
+        val limits = if (cached != null) cached.second else {
+            val found = withTimeoutOrNull(3_500L) { Horde(provider).workerLimits() }
+            synchronized(hordeProbes) {
+                if (hordeProbes.size >= 16) hordeProbes.remove(hordeProbes.keys.first())
+                hordeProbes[key] = now to found
+            }
+            found
+        } ?: return connection
+        return connection.copy(provider = provider.copy(modelContexts = limits.contexts,
+            horde = provider.horde.copy(modelOutputs = limits.outputs)))
+    }
+
     fun clearModels() = host.mutable.update { it.copy(catalog = null) }
 
     fun savePrefs(prefs: Preferences) = host.work {
@@ -16,6 +84,24 @@ internal class ProviderCoordinator(private val host: CoordinatorHost) {
         val checked = valid.copy(server = valid.server.trim().also { if (it.isNotBlank()) checkedAddress(it) })
         host.persistPreferences(checked)
         host.notice("设置已保存")
+    }
+
+    fun saveTextSystem(settings: TextSystemSettings, done: () -> Unit) = host.work {
+        host.persistPreferences(host.current.prefs.copy(textSystem = settings))
+        host.notice("系统提示设置已保存")
+        done()
+    }
+
+    fun saveCustomStops(settings: CustomStoppingStrings, done: () -> Unit) = host.work {
+        host.persistPreferences(host.current.prefs.copy(customStops = settings))
+        host.notice("停止序列已保存")
+        done()
+    }
+    fun saveReplyFormatting(value: ReplyFormatting, includeReasoning: Boolean?, done: () -> Unit) = host.work {
+        val current = host.current.prefs
+        host.persistPreferences(current.copy(replyFormatting = value, includeReasoning = includeReasoning ?: current.includeReasoning))
+        host.notice("回复格式已保存")
+        done()
     }
 
     fun setVisualNovel(enabled: Boolean) = host.work {
@@ -30,8 +116,70 @@ internal class ProviderCoordinator(private val host: CoordinatorHost) {
         host.persistPreferences(host.current.prefs.copy(chatAppearance = appearance.clamped()))
     }
 
+    fun setSwipeGestures(enabled: Boolean) = host.work {
+        host.persistPreferences(host.current.prefs.copy(swipeGestures = enabled))
+    }
+
+    fun setShowGroupQueue(enabled: Boolean) = host.work {
+        host.persistPreferences(host.current.prefs.copy(showGroupQueue = enabled))
+    }
+
+    fun setChatHandling(handling: ChatHandling) = host.work {
+        host.persistPreferences(host.current.prefs.copy(chatHandling = handling))
+    }
+
+    suspend fun builtInChatThemes(): List<ChatTheme> = withContext(Dispatchers.IO) { shippedThemes }
+
+    fun saveChatTheme(name: String?, existingId: String? = null) = host.work {
+        val prefs = host.current.prefs
+        val library = prefs.chatThemes
+        val existing = existingId?.let { id -> requireNotNull(library.items.firstOrNull { it.id == id }) { "找不到主题" } }
+        val title = themeName(name ?: existing?.name.orEmpty())
+        val source = existing ?: library.items.firstOrNull { it.id == library.activeId }
+        val theme = ChatTheme(existingId ?: UUID.randomUUID().toString(), title, prefs.chatAppearance,
+            prefs.theme, prefs.dynamicColor, prefs.visualNovel, source?.originalExtras)
+        val updated = if (existing == null) library.add(theme) else
+            library.copy(items = library.items.map { if (it.id == existing.id) theme else it })
+        host.persistPreferences(prefs.copy(chatThemes = updated.copy(activeId = theme.id)))
+        host.notice("主题已保存")
+    }
+
+    fun applyChatTheme(id: String) = host.work {
+        val prefs = host.current.prefs
+        val theme = requireNotNull(prefs.chatThemes.items.firstOrNull { it.id == id }
+            ?: builtInChatThemes().firstOrNull { it.id == id }) { "找不到主题" }
+        host.persistPreferences(prefs.copy(chatAppearance = theme.appearance, theme = theme.mode,
+            dynamicColor = theme.dynamicColor, visualNovel = theme.visualNovel,
+            chatThemes = prefs.chatThemes.add(theme).copy(activeId = id)))
+    }
+
+    fun deleteChatTheme(id: String) = host.work {
+        val prefs = host.current.prefs
+        val library = prefs.chatThemes
+        host.persistPreferences(prefs.copy(chatThemes = library.copy(items = library.items.filterNot { it.id == id },
+            activeId = library.activeId?.takeUnless { it == id })))
+    }
+
+    fun importChatTheme(uri: Uri) = host.work {
+        val theme = withContext(Dispatchers.IO) {
+            val raw = requireNotNull(host.resolver.openInputStream(uri)) { "无法打开主题文件" }
+                .use { it.readLimited(MAX_THEME_JSON).decodeToString().trimStart('\uFEFF') }
+            val filename = host.app.documentName(uri).substringBeforeLast('.').takeUnless { it == "导入的聊天" }.orEmpty()
+            ChatTheme.read(JSONObject(raw), filename)
+        }
+        val prefs = host.current.prefs
+        host.persistPreferences(prefs.copy(chatThemes = prefs.chatThemes.add(theme)))
+        host.notice("主题已导入")
+    }
+
+    fun exportChatTheme(uri: Uri, id: String) = host.work {
+        val theme = requireNotNull(host.current.prefs.chatThemes.items.firstOrNull { it.id == id }) { "找不到主题" }
+        withContext(Dispatchers.IO) { host.writeUri(uri, theme.portable().toString(2).encodeToByteArray()) }
+        host.notice("主题已导出")
+    }
+
     fun tokenCounterFor(connection: ModelConnection?): TextTokenCounter =
-        if (connection == null) estimatedTokens else host.loreTokenizers.counterFor(connection)
+        host.chatTokenizers.counterFor(connection)
 
     fun setWelcomeAssistant(card: Card?) = host.work {
         val preferences = host.current.prefs.welcome
@@ -252,15 +400,18 @@ internal class ProviderCoordinator(private val host: CoordinatorHost) {
     }
 
     fun loadModels(provider: Provider, persistCatalog: Boolean = false) = host.work {
-        require(provider.template == null || provider.apiKey.isNotBlank()) { "请填写 API Key" }
+        require(!provider.requiresApiKey || provider.apiKey.isNotBlank()) { "请填写 API Key" }
         val discovered = ModelService.discoverModels(provider)
         if (persistCatalog) {
             val prefs = host.current.prefs
             host.persistPreferences(prefs.copy(providers = prefs.providers.map {
-                if (it.id == provider.id) it.copy(models = discovered.ids, modelContexts = discovered.contexts) else it
+                if (it.id == provider.id) it.copy(models = discovered.ids, modelContexts = discovered.contexts,
+                    novelAi = it.novelAi.copy(tier = discovered.novelAiTier ?: it.novelAi.tier),
+                    horde = it.horde.copy(modelOutputs = discovered.hordeOutputs ?: it.horde.modelOutputs)) else it
             }))
         } else host.mutable.update {
-            it.copy(catalog = ModelCatalog(provider.id, provider.endpoint.trim(), discovered.ids, discovered.contexts))
+            it.copy(catalog = ModelCatalog(provider.id, provider.endpoint.trim(), discovered.ids, discovered.contexts,
+                discovered.novelAiTier, discovered.hordeOutputs))
         }
         if (discovered.ids.isEmpty()) host.notice("连接成功，服务没有返回模型 ID")
     }

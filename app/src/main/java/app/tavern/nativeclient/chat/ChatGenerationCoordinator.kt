@@ -14,13 +14,33 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
     private var generator: Job? = null
     private var autoTimer: Job? = null
 
-    fun send(text: String, interpretCommands: Boolean = true): Boolean {
-        val chat = host.current.chat ?: return false
-        val attachments = host.current.draftImages[chat.id].orEmpty()
-        val documents = host.current.draftDocuments[chat.id].orEmpty()
-        if ((text.isBlank() && attachments.isEmpty() && documents.isEmpty()) ||
-            host.current.busy || host.current.generation != null || host.current.scriptRunning
-        ) return false
+    internal fun owns(job: Job?) = job != null && generator === job
+
+    fun send(text: String, interpretCommands: Boolean = true, allowContinueWhenEmpty: Boolean = false): Boolean {
+        val state = host.current
+        val chat = state.chat ?: return false
+        if (state.busy || state.generation != null || state.scriptRunning) return false
+        val attachments = state.draftImages[chat.id].orEmpty()
+        val documents = state.draftDocuments[chat.id].orEmpty()
+        if (allowContinueWhenEmpty && state.prefs.chatHandling.shouldContinueOnSend(
+                chat, text, attachments.isNotEmpty() || documents.isNotEmpty(),
+            ) && chat.messages.lastOrNull()?.let(state::replyingCharacter) != null) {
+            return generateForLastReply(ReplyAction.CONTINUE)
+        }
+        val input = if (text.isBlank() && attachments.isEmpty() && documents.isEmpty()) {
+            if (!interpretCommands) return false
+            val connection = state.prefs.connectionFor(chat)
+            val substitute = state.presetFor(chat).emptyChatInput(connection)
+            if (substitute.isBlank()) return false
+            val group = state.group
+            val members = group?.members(state.cards).orEmpty()
+            val prompt = group?.let { GroupPrompt(it, members, members.map(Card::name),
+                it.participants(state.cards).map(Card::name)) }
+            val actor = state.card ?: chat.messages.lastOrNull { it.role == "assistant" }?.let(state::replyingCharacter)
+                ?: members.firstOrNull()
+            ConversationMacros(actor, state.persona, chat.messages, prompt, chat.options, state.prefs.scriptVariables,
+                connection?.model.orEmpty(), chat.id).expand(substitute).takeIf(String::isNotBlank) ?: return false
+        } else text
         if (interpretCommands && text.trimStart().startsWith('/')) return host.script.runScript(text, text)
         val functionsDraw = host.current.prefs.toolCalling && host.current.prefs.connectionFor(chat) != null &&
             host.media.drawingTool(host.current.prefs, chat, host.media.drawingCard(chat)) != null
@@ -47,8 +67,8 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
         var accepted = false
         val submit: suspend () -> Unit = {
             val content = withContext(Dispatchers.Default) {
-                val input = text.trim()
-                val raw = if (interpretCommands && input.startsWith("\\/")) input.drop(1) else input
+                val trimmed = input.trim()
+                val raw = if (interpretCommands && trimmed.startsWith("\\/")) trimmed.drop(1) else trimmed
                 rules.transform(raw, RegexSite.INPUT, RegexStage.STORAGE)
             }
             val translation = chat.options.translation
@@ -77,7 +97,7 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
             attachments.any { it.id !in host.current.draftImageCaptions[chat.id].orEmpty() }
         val preparationLabel = when {
             autoCaption -> "正在生成图片描述…"
-            chat.options.translation.mode.input && text.isNotBlank() -> "正在翻译输入…"
+            chat.options.translation.mode.input && input.isNotBlank() -> "正在翻译输入…"
             else -> null
         }
         if (preparationLabel != null) return host.utilityWork(preparationLabel) {
@@ -128,14 +148,15 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
         val group = host.current.group
         if (!readyToGenerate() || (chat.messages.isEmpty() && group == null)) return
         val last = chat.messages.lastOrNull()
+        val previousSpeaker = last?.let(host.current::replyingCharacter)
         val replacedMessages = when {
             last?.role != "assistant" -> 0
-            group == null -> if (host.current.replyingCharacter(last) == null) 0 else 1
+            group == null -> if (previousSpeaker == null) 0 else 1
             else -> chat.messages.asReversed().takeWhile {
                 it.groupTurnId == last.groupTurnId && (it.role == "assistant" || last.groupTurnId != null && it.role == "system")
             }.size
         }
-        val speakers = if (group == null) listOfNotNull(host.current.card)
+        val speakers = if (group == null) listOfNotNull(previousSpeaker ?: host.current.card)
         else group.nextTurn(host.current.cards, chat.messages.dropLast(replacedMessages))
         if (speakers.isEmpty()) {
             host.notice("请选择发言角色")
@@ -145,17 +166,30 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
         generate(chat, speakers, replacedMessages = replacedMessages, action = action)
     }
 
-    fun continueReply() = generateForLastReply(ReplyAction.CONTINUE)
+    fun continueReply() { generateForLastReply(ReplyAction.CONTINUE) }
 
-    fun nextAlternative() = generateForLastReply(ReplyAction.SWIPE)
+    fun nextAlternative() { generateForLastReply(ReplyAction.SWIPE) }
 
-    private fun generateForLastReply(action: ReplyAction) {
-        val chat = host.current.chat ?: return
-        val last = chat.messages.lastOrNull()?.takeIf { !it.hidden && it.text.isNotBlank() } ?: return
-        val character = host.current.replyingCharacter(last) ?: return host.notice("找不到这条回复的发言角色")
-        if (!readyToGenerate()) return
+    private fun generateForLastReply(action: ReplyAction): Boolean {
+        val chat = host.current.chat ?: return false
+        val last = chat.messages.lastOrNull()?.takeIf { !it.hidden && it.text.isNotBlank() } ?: return false
+        val character = host.current.replyingCharacter(last)
+        if (character == null) {
+            host.notice("找不到这条回复的发言角色")
+            return false
+        }
+        if (!readyToGenerate()) return false
         stopAuto()
-        generate(chat, listOf(character), replacedMessages = 1, action = action)
+        return generate(chat, listOf(character), replacedMessages = 1, action = action) != null
+    }
+
+    fun rerollToken(chatId: String, message: Message, token: Int, candidate: ReplyTokenCandidate) {
+        val chat = host.current.chat?.takeIf { it.id == chatId && it.messages.lastOrNull() == message } ?: return
+        if (message.hidden || !readyToGenerate() || host.current.prefs.connectionFor(chat)?.provider?.canRerollToken != true) return
+        val character = host.current.replyingCharacter(message) ?: return host.notice("找不到这条回复的发言角色")
+        val prefix = message.replyTokens?.replacement(token, candidate) ?: return
+        stopAuto()
+        generate(chat, listOf(character), replacedMessages = 1, action = ReplyAction.CONTINUE, rerollPrefix = prefix)
     }
 
     fun impersonate() {
@@ -238,37 +272,48 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
         addUser: Boolean = false,
         replacedMessages: Int = 0,
         action: ReplyAction = ReplyAction.NORMAL,
+        rerollPrefix: String? = null,
+        preserveDraftAttachments: Boolean = false,
+        onSavedReply: (Message) -> Unit = {},
     ): Job? {
         val prefs = host.current.prefs
-        val connection = prefs.connectionFor(chat) ?: return null
+        val selectedConnection = prefs.connectionFor(chat) ?: return null
         val persona = host.current.persona
         val group = host.current.group
         val cards = host.current.cards
         val books = host.current.books
         val groups = host.current.groups
         val preset = host.current.presetFor(chat)
-        val initialText = chat.messages.lastOrNull()?.text.orEmpty().takeIf { action == ReplyAction.CONTINUE }.orEmpty()
+        val initialText = rerollPrefix ?: chat.messages.lastOrNull()?.text.orEmpty().takeIf { action == ReplyAction.CONTINUE }.orEmpty()
         val generation = Generation(
             chat.id, text = initialText, replacedMessages = replacedMessages,
             characterId = speakers.first().id,
             speaker = if (action == ReplyAction.IMPERSONATE) persona.name else speakers.first().name,
             action = action,
+            groupQueue = if (group != null && action != ReplyAction.IMPERSONATE) speakers else emptyList(),
         )
         autoTimer?.cancel()
         autoTimer = null
         host.mutable.update { it.copy(generation = generation) }
         generator = host.scope.launch {
             var completed = false
+            var receivedReply = false
             try {
-                val loreCounter = withContext(Dispatchers.Default) { host.loreTokenizers.counterFor(connection) }
+                val connection = host.provider.formattedConnection(selectedConnection)
+                val presetSpacing = preset.chatCompletionFor(connection)?.spacing
+                val loreCounter = withContext(Dispatchers.Default) { host.chatTokenizers.counterFor(connection) }
                 if (addUser) {
                     withContext(NonCancellable) { host.persist(chat) }
-                    host.clearDraftAttachments(chat.id)
+                    if (!preserveDraftAttachments) host.clearDraftAttachments(chat.id)
                     host.media.narrate(chat.messages.last(), automatic = true)
                     host.script.quickEvent(QuickEvent.USER)
                 }
                 var ongoing = host.current.chat?.takeIf { it.id == chat.id } ?: chat
                 for ((index, card) in speakers.withIndex()) {
+                    val turn = if (index == 0) generation else generation.copy(groupQueue = generation.groupQueue.drop(index))
+                    if (index > 0 && turn.groupQueue.isNotEmpty()) host.mutable.update { state ->
+                        state.copy(generation = state.generation?.copy(groupQueue = turn.groupQueue))
+                    }
                     if (group != null) host.script.quickEvent(QuickEvent.GROUP)
                     host.script.quickEvent(QuickEvent.BEFORE)
                     ongoing = host.current.chat?.takeIf { it.id == chat.id } ?: ongoing
@@ -277,17 +322,24 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                     var followups = 0
                     var toolAttempted = false
                     while (true) {
-                        val continued = ongoing.messages.lastOrNull()?.takeIf { passAction == ReplyAction.CONTINUE }
+                        val replacement = rerollPrefix.takeIf { index == 0 && followups == 0 }
+                        val continueSpacing = if (replacement != null) ContinueSpacing.NONE else presetSpacing
+                        val continued = ongoing.messages.lastOrNull()?.takeIf { passAction == ReplyAction.CONTINUE }?.let { last ->
+                            if (replacement == null) last else last.withText(replacement).copy(
+                                reasoning = null, images = emptyList(), documents = emptyList(), drawing = null, replyMedia = null,
+                            )
+                        }
                         val context = ongoing.messages.dropLast(replace)
                         val removed = ongoing.messages.takeLast(replace)
                         val speaker = if (action == ReplyAction.IMPERSONATE) persona.name else card.name
                         host.mutable.update {
-                            it.copy(generation = generation.copy(
+                            it.copy(generation = turn.copy(
                                 text = continued?.text.orEmpty(),
                                 speaker = speaker,
                                 replacedMessages = replace,
                                 characterId = card.id,
                                 action = passAction,
+                                hiddenReplyPrefix = continued?.hiddenReplyPrefix,
                             ))
                         }
                         val buffer = StringBuilder()
@@ -295,7 +347,7 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                         val scene = group?.let {
                             GroupPrompt(it, it.promptMembers(cards, card), it.members(cards).map(Card::name), it.participants(cards).map(Card::name))
                         }
-                        val promptHistory = if (continued == null) context else ongoing.messages
+                        val promptHistory = if (continued == null) context else context + continued
                         val activePrefs = prefs.copy(scriptVariables = host.current.prefs.scriptVariables)
                         val vectors = host.world.promptVectors(activePrefs, ongoing, card, persona, books, promptHistory)
                         val sharedMemory = if (action == ReplyAction.IMPERSONATE) "" else
@@ -309,6 +361,7 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                                 if (running?.id == generation.id) state.copy(generation = running.copy(
                                     text = continued?.text.orEmpty(),
                                     reasoning = "",
+                                    hiddenReplyPrefix = continued?.hiddenReplyPrefix,
                                 )) else state
                             }
                         }
@@ -331,11 +384,17 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                             }
                         } else null
                         var loreBudget: LoreBudgetUsage? = null
+                        var contextBudget: PromptBudgetUsage? = null
+                        val started = System.currentTimeMillis()
+                        val startedNano = System.nanoTime()
+                        var firstText: Long? = null
                         val result = ModelService.reply(
                             activePrefs, connection, card, promptHistory, books, scene,
                             persona, ongoing.options, passAction.trigger, preset,
+                            forcedContinuation = replacement,
                             onPrompt = { messages ->
-                                host.mutable.update { it.copy(lastPrompt = PromptCapture(chat.id, connection.model, messages, loreBudget)) }
+                                host.mutable.update { it.copy(lastPrompt = PromptCapture(chat.id, connection.model, messages,
+                                    loreBudget, contextBudget, connection.provider.id)) }
                             },
                             onReasoning = { fragment ->
                                 reasoningBuffer.append(fragment)
@@ -351,8 +410,16 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                             vectors = vectors,
                             tools = tools,
                             onRetry = ::resetReply,
+                            onQueueProgress = { label ->
+                                host.mutable.update { state ->
+                                    if (state.generation?.id == generation.id) {
+                                        state.copy(toolProgress = label.takeIf(String::isNotEmpty))
+                                    } else state
+                                }
+                            },
                             sharedMemory = sharedMemory,
                             loreCounter = loreCounter,
+                            onContextBudget = { contextBudget = it },
                             onLoreBudget = {
                                 loreBudget = it
                                 if (it.blocked && activePrefs.loreSettings.overflowAlert) {
@@ -362,26 +429,93 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                             chatId = ongoing.id,
                             onVariables = { host.persistMacroVariables(ongoing.id, it) },
                             effectiveSampling = activePrefs.effectiveConfig(ongoing).sampling,
+                            onHiddenPrefix = { prefix ->
+                                host.mutable.update { state ->
+                                    val running = state.generation
+                                    if (running?.id == generation.id) state.copy(generation = running.copy(hiddenReplyPrefix = prefix))
+                                    else state
+                                }
+                            },
                         ) { fragment ->
+                            if (firstText == null && fragment.isNotBlank()) firstText = (System.nanoTime() - startedNano) / 1_000_000L
                             buffer.append(fragment)
-                            val text = if (continued == null) buffer.toString() else joinContinuation(continued.text, buffer.toString())
+                            val text = if (continued == null) buffer.toString()
+                                else joinContinuation(continued.text, buffer.toString(), continueSpacing)
                             host.mutable.update { state ->
                                 val running = state.generation
                                 if (running?.id == generation.id) state.copy(generation = running.copy(text = text)) else state
                             }
                         }
-                        val response = buffer.toString().trimEnd()
-                        if (response.isBlank() && toolSucceeded) {
+                        val grounded = result.googleGrounded
+                        if (grounded != null) {
+                            stopAuto()
+                            val display = OpenGoogleReply(newId(), ongoing.id, context.lastOrNull()?.date,
+                                speaker, grounded, result.incomplete)
+                            host.mutable.update { state ->
+                                if (state.chat?.id == display.chatId && state.generation?.id == generation.id) {
+                                    state.copy(googleReplies = (state.googleReplies + display).takeLast(12),
+                                        generation = state.generation.copy(replacedMessages = 0))
+                                } else state
+                            }
+                            receivedReply = receivedReply || result.incomplete == null
+                            break
+                        }
+                        val finished = System.currentTimeMillis()
+                        val elapsed = (System.nanoTime() - startedNano) / 1_000_000L
+                        val keepCompleteSentences = result.incomplete == null && connection.provider.usesTextCompletion &&
+                            connection.resolvedTextTemplates().context?.trimSentences == true
+                        val response = buffer.toString().trimEnd().let {
+                            val body = if (prefs.chatHandling.collapseNewlines) {
+                                collapseChatNewlines(it, result.hiddenReplyPrefix)
+                            } else it
+                            if (keepCompleteSentences) trimToCompleteSentence(body) else body
+                        }
+                        val stored = withContext(Dispatchers.IO) {
+                            result.images.mapIndexedNotNull { imageIndex, image ->
+                                try {
+                                    image.key to host.imageStore.importReply(image, "模型回复-${generation.id.take(6)}-${imageIndex + 1}")
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: Exception) {
+                                    null
+                                }
+                            }.toMap()
+                        }
+                        val renderedImages = stored.values.distinctBy(ChatImage::id)
+                        val replayParts = result.geminiReplayParts.mapNotNull { part ->
+                            if (part.imageKey == null) part else stored[part.imageKey]?.let { part.copy(imageKey = it.id) }
+                        }
+                        val replay = if (replayParts.isEmpty() || replayParts.size != result.geminiReplayParts.size) null
+                            else GeminiReplyReplay(connection.provider.id, connection.model.removePrefix("models/"), replayParts)
+                        val replyMedia = if (renderedImages.isEmpty() && replay == null) null else StoredReplyMedia(renderedImages, replay)
+                        val failedImages = result.imageWarning || stored.size != result.images.size
+                        if (response.isBlank() && renderedImages.isEmpty() && toolSucceeded) {
                             ongoing = host.current.chat?.takeIf { it.id == chat.id } ?: ongoing
                             break
                         }
-                        check(response.isNotBlank()) { "模型没有返回可显示的回复" }
+                        if (response.isBlank() && renderedImages.isEmpty() && result.stoppedBySequence && !result.hasReasoning) {
+                            host.notice("回复开头匹配了停止序列")
+                            return@launch
+                        }
+                        if (response.isBlank() && result.hasReasoning && action == ReplyAction.IMPERSONATE) {
+                            host.notice("模型返回了推理，尚未生成草稿")
+                            return@launch
+                        }
+                        check(response.isNotBlank() || result.hasReasoning || renderedImages.isNotEmpty()) {
+                            if (failedImages) "模型返回的图片无法保存" else "模型没有返回可显示的回复"
+                        }
                         val rules = prefs.regex.runtime(card, persona.name, preset, scene?.roster.orEmpty())
                         val site = if (action == ReplyAction.IMPERSONATE) RegexSite.INPUT else RegexSite.REPLY
                         val (content, reasoning) = withContext(Dispatchers.Default) {
-                            val body = joinContinuation(continued?.text.orEmpty(), if (continued == null) response.trimStart() else response) {
+                            val joined = joinContinuation(continued?.text.orEmpty(),
+                                if (continued == null) response.trimStart() else response, continueSpacing) {
                                 rules.transform(it, site, RegexStage.STORAGE)
                             }
+                            val body = if (prefs.chatHandling.repairMarkdown) {
+                                val prefix = result.hiddenReplyPrefix.trimStart().takeIf { it.isNotEmpty() && joined.startsWith(it) }
+                                    ?: continued?.hiddenReplyPrefix?.takeIf { joined.startsWith(it) }.orEmpty()
+                                prefix + repairReplyMarkdown(joined.removePrefix(prefix))
+                            } else joined
                             val details = rules.transform(reasoningBuffer.toString().trim(), RegexSite.REASONING, RegexStage.STORAGE)
                             body to details.takeIf(String::isNotBlank)
                         }
@@ -394,15 +528,43 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                             break
                         }
                         val old = ongoing.messages.lastOrNull()?.takeIf { replace == 1 }
+                        val measured = ReplyMetrics(
+                            started = started, finished = finished, elapsed = elapsed, firstText = firstText,
+                            provider = connection.provider.name, model = connection.model, api = connection.provider.protocol.wire,
+                            bodyTokens = withContext(Dispatchers.Default) { loreCounter.count(content).toLong() },
+                            counter = loreCounter.label, usage = result.usage,
+                        )
+                        val hiddenPrefix = result.hiddenReplyPrefix.trimStart().takeIf { it.isNotEmpty() && content.startsWith(it) }
+                            ?: continued?.hiddenReplyPrefix?.takeIf { content.startsWith(it) }
+                        val tokens = result.replyTokens?.stored(content, continued?.text.orEmpty())
+                        val webReply = if (continued == null) result.webReply else {
+                            val sources = combineReplySources(continued.webReply?.sources.orEmpty() + result.webReply?.sources.orEmpty())
+                            StoredWebReply(sources).takeIf { sources.isNotEmpty() }
+                        }
                         val reply = when {
+                            replacement != null && old != null -> old.withAlternative(content, reasoning, measured,
+                                hiddenPrefix, replyMedia, webReply, tokens)
                             continued != null -> continued.withText(content).withReasoning(
                                 listOfNotNull(continued.reasoning, reasoning).joinToString("\n").takeIf(String::isNotBlank),
-                            )
-                            old != null && (group == null || passAction == ReplyAction.SWIPE) -> old.withAlternative(content, reasoning)
+                            ).copy(replyMetrics = continued.replyMetrics?.continued(measured) ?: measured, webReply = webReply,
+                                replyTokens = tokens,
+                                replyMedia = (continued.replyMedia?.images.orEmpty() + renderedImages)
+                                    .distinctBy(ChatImage::id).take(MAX_CHAT_IMAGES).takeIf(List<ChatImage>::isNotEmpty)
+                                    ?.let { StoredReplyMedia(it) })
+                            old != null && (group == null || passAction == ReplyAction.SWIPE) ->
+                                old.withAlternative(content, reasoning, measured, hiddenPrefix, replyMedia, webReply, tokens)
                             else -> Message(
                                 "assistant", card.name, content,
+                                raw = if (chat.groupId == null && chat.cardId != null && chat.cardId != card.id) jsonOf(
+                                    "original_avatar" to card.scriptAvatarKey, "force_avatar" to card.scriptAvatarKey,
+                                ).toString() else null,
                                 groupTurnId = generation.id.takeIf { group != null },
                                 reasoning = reasoning,
+                                replyMetrics = measured,
+                                hiddenReplyPrefix = hiddenPrefix,
+                                replyMedia = replyMedia,
+                                webReply = webReply,
+                                replyTokens = tokens,
                             )
                         }
                         val effects = result.loreEffects.takeIf {
@@ -412,22 +574,29 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                         val retained = if (latest === ongoing) context else latest.messages.filterNot { message ->
                             removed.any { it === message }
                         }
+                        val savedReply = reply.copy(characterId = card.id, loreEffects = effects)
                         ongoing = latest.copy(
-                            messages = retained + reply.copy(characterId = card.id, loreEffects = effects),
+                            messages = retained + savedReply,
                             updated = System.currentTimeMillis(),
                         )
                         withContext(NonCancellable) {
-                            host.persist(ongoing)
+                            host.persist(ongoing, replyGallery = renderedImages.map { GalleryImage(it, content.take(1500)) })
+                            onSavedReply(savedReply)
                             ongoing = host.current.chat?.takeIf { it.id == chat.id } ?: ongoing
                             host.mutable.update {
-                                it.copy(generation = generation.copy(
+                                it.copy(generation = turn.copy(
                                     text = "", speaker = card.name,
                                     replacedMessages = 0, characterId = card.id, action = passAction,
                                 ))
                             }
                         }
+                        if (response.isBlank() && renderedImages.isEmpty()) {
+                            host.notice(result.incomplete?.let { "$it，已保留收到的推理" } ?: "模型未生成正文，已保留收到的推理")
+                            return@launch
+                        }
                         val automation = prefs.replyAutomation
-                        val next = if ((automation.autoContinue || automation.autoSwipe) && followups < automation.extraRequests &&
+                        val next = if (renderedImages.isEmpty() && (automation.autoContinue || automation.autoSwipe) &&
+                            followups < automation.extraRequests &&
                             host.draftInProgress != chat.id && result.continuable
                         ) {
                             withContext(Dispatchers.Default) {
@@ -447,12 +616,15 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                             continue
                         }
                         if (result.incomplete != null) {
-                            host.notice("${result.incomplete}，已保留收到的正文。可使用「续写最后一条回复」")
+                            host.notice(if (renderedImages.isEmpty()) {
+                                "${result.incomplete}，已保留收到的正文。可使用「续写最后一条回复」"
+                            } else "${result.incomplete}，已保留收到的图片及正文")
                             return@launch
                         }
+                        if (failedImages) host.notice("部分图片无法保存，已保留其余回复")
                         val translation = ongoing.options.translation
-                        if (translation.mode.replies) {
-                            val translated = host.chats.automaticTranslation(activePrefs, ongoing, content, translation.target)
+                        if (translation.mode.replies && reply.displayText.isNotBlank()) {
+                            val translated = host.chats.automaticTranslation(activePrefs, ongoing, reply.displayText, translation.target)
                             if (translated != null) {
                                 val saved = host.current.chat ?: ongoing
                                 val messages = saved.messages.dropLast(1) + saved.messages.last().copy(translation = translated)
@@ -460,13 +632,18 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                             }
                         }
                         ongoing = host.current.chat ?: ongoing
+                        receivedReply = true
                         host.media.narrate(ongoing.messages.last(), automatic = true)
                         host.script.quickEvent(QuickEvent.AI)
                         break
                     }
                 }
+                if (generation.groupQueue.isNotEmpty()) host.mutable.update { state ->
+                    state.copy(generation = state.generation?.copy(groupQueue = emptyList()))
+                }
                 if (action != ReplyAction.IMPERSONATE) host.current.chat?.let { host.chats.summarizeAutomatically(it) }
                 completed = true
+                if (receivedReply && action != ReplyAction.IMPERSONATE) host.media.playReplySound()
             } catch (e: CancellationException) {
                 if (host.current.generation?.chatId == chat.id) host.notice("已停止生成")
                 throw e

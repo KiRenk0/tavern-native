@@ -114,17 +114,19 @@ internal data class DrawingSettings(
     val interactive: Boolean = false,
     val comfyWorkflowId: String? = null,
     val functionTool: Boolean = false,
+    val video: VideoProfile = VideoProfile(),
 ) {
     val style get() = styles.firstOrNull { it.name == activeStyle }
     fun json() = jsonOf("profile" to profile?.json(), "styles" to JSONArray(styles.map(ImageStyle::json)),
         "activeStyle" to activeStyle, "characterPrefixes" to JSONObject(characterPrefixes), "templates" to JSONObject(templates),
-        "extendFree" to extendFree, "interactive" to interactive, "comfyWorkflow" to comfyWorkflowId, "functionTool" to functionTool)
+        "extendFree" to extendFree, "interactive" to interactive, "comfyWorkflow" to comfyWorkflowId, "functionTool" to functionTool,
+        "video" to video.json())
 
     fun defaultProfile(providers: List<Provider>): ImageProfile? {
         profile?.takeIf { it.resolve(providers, "") != null }?.let { return it }
         val google = providers.firstOrNull(ImageProtocol.GEMINI::available)
         if (google != null) return ImageProfile(google.id, ImageProtocol.GEMINI, DEFAULT_GEMINI_IMAGE)
-        return null
+        return providers.firstOrNull(ImageProtocol.HORDE::available)?.let { ImageProfile(it.id, ImageProtocol.HORDE, "") }
     }
 
     companion object {
@@ -134,7 +136,8 @@ internal data class DrawingSettings(
                 value.optJSONArray("styles")?.objects().orEmpty().mapNotNull(ImageStyle::from), value.string("activeStyle"),
                 value.optJSONObject("characterPrefixes").variableStrings(), value.optJSONObject("templates").variableStrings(),
                 value.optBoolean("extendFree"), value.optBoolean("interactive"),
-                value.string("comfyWorkflow").takeIf(String::isNotBlank), value.optBoolean("functionTool"))
+                value.string("comfyWorkflow").takeIf(String::isNotBlank), value.optBoolean("functionTool"),
+                VideoProfile.from(value.optJSONObject("video")))
         }
     }
 }

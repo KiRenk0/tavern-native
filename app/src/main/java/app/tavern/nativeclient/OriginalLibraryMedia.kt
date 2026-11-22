@@ -4,7 +4,7 @@ import org.json.JSONObject
 import java.net.URI
 import java.util.Base64
 
-private val imageExtensions = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "avif", "heic", "heif")
+internal val originalImageExtensions = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "avif", "heic", "heif")
 private val localImageRoots = listOf("user/images/", "backgrounds/", "characters/")
 
 internal class OriginalLibraryMedia(
@@ -12,10 +12,13 @@ internal class OriginalLibraryMedia(
     private val documents: ChatDocumentStore?,
     private val images: ChatImageStore?,
     private val checkActive: () -> Unit,
+    private val videos: ChatVideoStore? = null,
 ) {
     private val restoredImages = mutableMapOf<String, ChatImage?>()
     private val nativeImages = mutableMapOf<String, Boolean>()
     private val nativeDocuments = mutableMapOf<String, Boolean>()
+    private val nativeVideos = mutableMapOf<String, Boolean>()
+    private val restoredVideos = mutableMapOf<String, ChatVideo?>()
     private var inlineCount = 0
     var missing = 0
         private set
@@ -28,8 +31,9 @@ internal class OriginalLibraryMedia(
         val message = if (nativeBackup) raw.copy(
             images = raw.images.filter { nativeImage(it) != null },
             documents = raw.documents.filter(::nativeDocument),
+            videos = raw.videos.filter(::nativeVideo),
             drawing = raw.drawing?.availableBackupImages { nativeImage(it) != null },
-        ) else raw
+        ).withAvailableReplyImages { nativeImage(it) != null } else raw
         val restored = documents?.let { store ->
             message.originalChatFiles().mapNotNull { ref ->
                 val attachment = asset {
@@ -39,7 +43,7 @@ internal class OriginalLibraryMedia(
                 attachment?.let { ref.index to it }
             }.toMap()
         }.orEmpty()
-        val withDocuments = message.withOriginalDocuments(restored)
+        val withDocuments = message.withOriginalDocuments(restored).withOriginalVideos(nativeBackup)
         if (images == null || withDocuments.images.size >= MAX_CHAT_IMAGES) return withDocuments
         val extra = withDocuments.raw?.let(::JSONObject)?.optJSONObject("extra") ?: return withDocuments
         val references = extra.optJSONArray("media")?.objects().orEmpty().mapNotNull { value ->
@@ -65,18 +69,84 @@ internal class OriginalLibraryMedia(
         return withDocuments.copy(images = attachments, imageCaptions = captions)
     }
 
+    private fun Message.withOriginalVideos(nativeBackup: Boolean): Message {
+        val store = this@OriginalLibraryMedia.videos ?: return this
+        val rows = raw?.let(::JSONObject)?.optJSONObject("extra")?.optJSONArray("media")?.objects().orEmpty()
+        if (rows.isEmpty() || videos.size == MAX_VIDEOS_PER_MESSAGE) return this
+        val attached = videos.associateByTo(linkedMapOf(), ChatVideo::id)
+        for (row in rows) {
+            if (attached.size == MAX_VIDEOS_PER_MESSAGE) break
+            if (!row.string("type").equals("video", true)) continue
+            val uri = runCatching { URI(row.string("url")) }.getOrNull() ?: continue
+            val path = uri.path?.removePrefix("./")?.removePrefix("/") ?: continue
+            if (uri.isAbsolute || uri.rawAuthority != null || !safeOriginalPath(path) || !path.startsWith("user/images/") ||
+                !path.endsWith(".mp4", true) || nativeBackup && path.startsWith("$NATIVE_BACKUP_IMAGES/")) continue
+            val video = restoredVideos.getOrPut(path) {
+                asset { source.file(path)?.let { file -> file.streaming { store.import(it, file.name, checkActive) } } }
+            } ?: continue
+            attached.putIfAbsent(video.id, video)
+        }
+        return copy(videos = attached.values.toList())
+    }
+
+    private fun nativeVideo(video: ChatVideo): Boolean {
+        val store = videos ?: return false
+        return nativeVideos.getOrPut(video.filename) {
+            asset {
+                val file = source.file("$NATIVE_BACKUP_IMAGES/${video.filename}") ?: return@asset null
+                file.streaming { store.restore(video, it, checkActive) }
+            } != null
+        }
+    }
+
     fun background(value: String): ChatImage? =
         value.trim().removePrefix("url(").removeSuffix(")").trim().trim('"', '\'').takeIf(String::isNotBlank)?.let(::image)
+
+    fun backgroundLibrary(settings: JSONObject?, portableFiles: JSONObject?): BackgroundLibrary {
+        val store = images ?: return BackgroundLibrary()
+        val configured = settings?.string("name").orEmpty()
+        var active: String? = null
+        val items = source.files("backgrounds").filter {
+            it.name != "__transparent.png" && it.extension.lowercase() in originalImageExtensions
+        }.mapNotNull { file ->
+            val saved = portableFiles?.optJSONObject(file.name)?.let(BackgroundEntry::from)
+            val entry = if (saved == null) imageAt("backgrounds/${file.name}")?.let { BackgroundEntry(it, file.modified) } else {
+                asset {
+                    store.restore(saved.image, file.bytes(saved.image.storageLimit))
+                    nativeImages[saved.image.filename] = true
+                    saved
+                }
+            }
+            if (entry != null && file.name == configured) active = entry.image.id
+            entry
+        }
+        return BackgroundLibrary(items.distinctBy { it.image.id }, active, BackgroundFit.from(settings?.string("fitting").orEmpty()))
+    }
 
     fun nativeImage(image: ChatImage): ChatImage? {
         val store = images ?: return null
         val available = nativeImages.getOrPut(image.filename) {
             asset {
                 val file = source.file("$NATIVE_BACKUP_IMAGES/${image.filename}") ?: return@asset null
-                store.restore(image, file.bytes(MAX_STORED_IMAGE))
+                store.restore(image, file.bytes(image.storageLimit))
             } != null
         }
         return image.takeIf { available }
+    }
+
+    fun groupAvatar(reference: String): GroupAvatar? {
+        if (reference.isBlank()) return null
+        return asset {
+            val bytes = originalGroupAvatarData(reference) ?: originalGroupAvatarPath(reference)?.let {
+                source.file(it)?.bytes(MAX_IMAGE_SOURCE)
+            } ?: return@asset null
+            val bitmap = decodeBoundedImage(bytes, 1024)
+            try {
+                GroupAvatar.create(bitmap).also { inlineCount++ }
+            } finally {
+                bitmap.recycle()
+            }
+        }
     }
 
     private fun nativeDocument(document: ChatDocument): Boolean {
@@ -102,7 +172,7 @@ internal class OriginalLibraryMedia(
         if (images == null) return emptyList()
         return names.filter { safeOriginalPath(it) && '/' !in it }.distinct().flatMap { name ->
             val path = "user/images/$name"
-            source.files(path).filter { it.extension.lowercase() in imageExtensions }.mapNotNull { entry ->
+            source.files(path).filter { it.extension.lowercase() in originalImageExtensions }.mapNotNull { entry ->
                 imageAt("$path/${entry.name}")?.let { GalleryImage(it, "", entry.modified.coerceAtLeast(0)) }
             }
         }.distinctBy { it.image.id }
@@ -125,7 +195,7 @@ internal class OriginalLibraryMedia(
         val candidates = listOfNotNull(decoded, reference).distinct().map { it.removePrefix("./").removePrefix("/") }
         val path = candidates.firstOrNull { candidate ->
             safeOriginalPath(candidate) && localImageRoots.any(candidate::startsWith) &&
-                candidate.substringAfterLast('.').lowercase() in imageExtensions
+                candidate.substringAfterLast('.').lowercase() in originalImageExtensions
         } ?: return null
         return imageAt(path)
     }

@@ -1,9 +1,11 @@
 package app.tavern.nativeclient
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import org.json.JSONArray
 import org.json.JSONObject
@@ -75,7 +77,11 @@ internal class StScript(private val host: StScriptHost, private val random: Rand
     }
 
     private suspend fun execute(node: ScriptCommand, frame: Frame, pipe: Value, implicit: Value, depth: Int): Result {
-        suspend fun args() = node.named.mapValues { (_, value) -> value(value, frame, pipe).text() }
+        suspend fun args() = node.named.mapValues { (key, argument) ->
+            if (key == "tag" && node.repeatedTags.size > 1) {
+                JSONArray(node.repeatedTags.flatMap { scriptFindTags(value(it, frame, pipe).text()) }).toString()
+            } else value(argument, frame, pipe).text()
+        }
         suspend fun body(from: Int = 0, fallback: Value = empty): Value {
             val items = node.args.drop(from)
             if (items.isEmpty()) return fallback
@@ -242,8 +248,14 @@ internal class StScript(private val host: StScriptHost, private val random: Rand
                 val array = JSONArray(body(fallback = implicit).text())
                 text((0 until array.length()).joinToString(args()["separator"] ?: ",") { array.optString(it) })
             }
+            name in scriptTextCommands -> {
+                val input = body(fallback = implicit)
+                require(input is Value.Text) { "此命令需要文本或 JSON 参数" }
+                val options = args()
+                text(withContext(Dispatchers.Default) { scriptTextCommand(name, options, input.text) })
+            }
             else -> {
-                val value = body(fallback = implicit).text()
+                val value = body(fallback = if (name == "char-get" || name == "char-data") empty else implicit).text()
                 text(host.command(name, args(), value) ?: error("未实现的命令"))
             }
         }

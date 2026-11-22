@@ -388,10 +388,12 @@ internal fun buildRichInline(
     quoteColor: Color,
     codeBg: Color,
     linkColor: Color,
+    italicsColor: Color = Color.Unspecified,
+    underlineColor: Color = Color.Unspecified,
 ): AnnotatedString {
     val codeRanges = mutableListOf<IntRange>()
     val built = buildAnnotatedString {
-        appendInlineTokens(text, codeRanges, codeBg, linkColor, depth = 0)
+        appendInlineTokens(text, codeRanges, InlineColors(codeBg, linkColor, italicsColor, underlineColor), depth = 0)
     }
     if (!highlightQuotes) return built
     val plain = built.text
@@ -408,11 +410,12 @@ internal fun buildRichInline(
     }
 }
 
+private data class InlineColors(val code: Color, val link: Color, val italics: Color, val underline: Color)
+
 private fun AnnotatedString.Builder.appendInlineTokens(
     text: String,
     codeRanges: MutableList<IntRange>,
-    codeBg: Color,
-    linkColor: Color,
+    colors: InlineColors,
     depth: Int,
 ) {
     if (depth > 8 || text.isEmpty()) {
@@ -429,7 +432,7 @@ private fun AnnotatedString.Builder.appendInlineTokens(
             token.startsWith("`") -> {
                 val content = token.removeSurrounding("`")
                 val start = length
-                withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = codeBg)) {
+                withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = colors.code)) {
                     append(content)
                 }
                 if (length > start) codeRanges += start until length
@@ -438,13 +441,13 @@ private fun AnnotatedString.Builder.appendInlineTokens(
                 val label = match.groupValues[2]
                 val url = match.groupValues[3]
                 val safeUrl = url.takeIf { it.startsWith("https://", true) || it.startsWith("http://", true) }
-                val style = SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline)
+                val style = SpanStyle(color = colors.link, textDecoration = TextDecoration.Underline)
                 if (safeUrl != null) {
                     withLink(LinkAnnotation.Url(safeUrl)) {
-                        withStyle(style) { appendInlineTokens(label, codeRanges, codeBg, linkColor, depth + 1) }
+                        withStyle(style) { appendInlineTokens(label, codeRanges, colors, depth + 1) }
                     }
                 } else {
-                    withStyle(style) { appendInlineTokens(label, codeRanges, codeBg, linkColor, depth + 1) }
+                    withStyle(style) { appendInlineTokens(label, codeRanges, colors, depth + 1) }
                 }
             }
             token.startsWith("<br", ignoreCase = true) -> append('\n')
@@ -454,10 +457,10 @@ private fun AnnotatedString.Builder.appendInlineTokens(
                 val parsedColor = parseCssColor(colorAttrRegex.find(attrs)?.groupValues?.get(1))
                 if (parsedColor != null) {
                     withStyle(SpanStyle(color = parsedColor)) {
-                        appendInlineTokens(inner, codeRanges, codeBg, linkColor, depth + 1)
+                        appendInlineTokens(inner, codeRanges, colors, depth + 1)
                     }
                 } else {
-                    appendInlineTokens(inner, codeRanges, codeBg, linkColor, depth + 1)
+                    appendInlineTokens(inner, codeRanges, colors, depth + 1)
                 }
             }
             match.groupValues[6].isNotEmpty() -> {
@@ -465,45 +468,45 @@ private fun AnnotatedString.Builder.appendInlineTokens(
                 val inner = match.groupValues[7]
                 when (tag) {
                     "b", "strong" -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                        appendInlineTokens(inner, codeRanges, codeBg, linkColor, depth + 1)
+                        appendInlineTokens(inner, codeRanges, colors, depth + 1)
                     }
-                    "i", "em" -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-                        appendInlineTokens(inner, codeRanges, codeBg, linkColor, depth + 1)
+                    "i", "em" -> withStyle(SpanStyle(fontStyle = FontStyle.Italic, color = colors.italics)) {
+                        appendInlineTokens(inner, codeRanges, colors, depth + 1)
                     }
-                    "u" -> withStyle(SpanStyle(textDecoration = TextDecoration.Underline)) {
-                        appendInlineTokens(inner, codeRanges, codeBg, linkColor, depth + 1)
+                    "u" -> withStyle(SpanStyle(textDecoration = TextDecoration.Underline, color = colors.underline)) {
+                        appendInlineTokens(inner, codeRanges, colors, depth + 1)
                     }
                     "s", "del", "strike" -> withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) {
-                        appendInlineTokens(inner, codeRanges, codeBg, linkColor, depth + 1)
+                        appendInlineTokens(inner, codeRanges, colors, depth + 1)
                     }
                     "code" -> {
                         val start = length
-                        withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = codeBg)) { append(inner) }
+                        withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = colors.code)) { append(inner) }
                         if (length > start) codeRanges += start until length
                     }
-                    "mark" -> withStyle(SpanStyle(background = codeBg, fontWeight = FontWeight.Medium)) {
-                        appendInlineTokens(inner, codeRanges, codeBg, linkColor, depth + 1)
+                    "mark" -> withStyle(SpanStyle(background = colors.code, fontWeight = FontWeight.Medium)) {
+                        appendInlineTokens(inner, codeRanges, colors, depth + 1)
                     }
-                    else -> appendInlineTokens(inner, codeRanges, codeBg, linkColor, depth + 1)
+                    else -> appendInlineTokens(inner, codeRanges, colors, depth + 1)
                 }
             }
             match.groupValues[8].isNotEmpty() -> withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) {
-                appendInlineTokens(match.groupValues[8], codeRanges, codeBg, linkColor, depth + 1)
+                appendInlineTokens(match.groupValues[8], codeRanges, colors, depth + 1)
             }
-            match.groupValues[9].isNotEmpty() -> withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic)) {
-                appendInlineTokens(match.groupValues[9], codeRanges, codeBg, linkColor, depth + 1)
+            match.groupValues[9].isNotEmpty() -> withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic, color = colors.italics)) {
+                appendInlineTokens(match.groupValues[9], codeRanges, colors, depth + 1)
             }
             match.groupValues[10].isNotEmpty() -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                appendInlineTokens(match.groupValues[10], codeRanges, codeBg, linkColor, depth + 1)
+                appendInlineTokens(match.groupValues[10], codeRanges, colors, depth + 1)
             }
-            match.groupValues[11].isNotEmpty() -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-                appendInlineTokens(match.groupValues[11], codeRanges, codeBg, linkColor, depth + 1)
+            match.groupValues[11].isNotEmpty() -> withStyle(SpanStyle(fontStyle = FontStyle.Italic, color = colors.italics)) {
+                appendInlineTokens(match.groupValues[11], codeRanges, colors, depth + 1)
             }
             match.groupValues[12].isNotEmpty() -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                appendInlineTokens(match.groupValues[12], codeRanges, codeBg, linkColor, depth + 1)
+                appendInlineTokens(match.groupValues[12], codeRanges, colors, depth + 1)
             }
-            match.groupValues[13].isNotEmpty() -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-                appendInlineTokens(match.groupValues[13], codeRanges, codeBg, linkColor, depth + 1)
+            match.groupValues[13].isNotEmpty() -> withStyle(SpanStyle(fontStyle = FontStyle.Italic, color = colors.italics)) {
+                appendInlineTokens(match.groupValues[13], codeRanges, colors, depth + 1)
             }
             else -> append(token)
         }

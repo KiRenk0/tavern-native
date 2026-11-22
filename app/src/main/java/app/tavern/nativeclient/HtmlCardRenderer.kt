@@ -7,6 +7,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import app.tavern.nativeclient.chat.StreamingFadeText
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -28,6 +29,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
@@ -51,6 +53,7 @@ internal fun RichMessageContent(
     cardScriptsEnabled: Boolean = false,
     mvuStateJson: String = "{}",
     onRunScript: ((String) -> Unit)? = null,
+    streamFadeIn: Boolean = false,
 ) {
     val scheme = MaterialTheme.colorScheme
     val blocks = remember(text, appearance.renderHtmlCards) {
@@ -58,9 +61,14 @@ internal fun RichMessageContent(
     }
     val baseSize = appearance.fontSizeSp.sp
     val baseLineHeight = (appearance.fontSizeSp * appearance.lineHeightMultiplier).sp
-    val quoteColor = scheme.primary
+    val palette = appearance.palette
+    val quoteColor = palette.color(ThemeColor.QUOTE) ?: scheme.primary
     val codeBg = scheme.surfaceContainerHighest.copy(alpha = 0.72f)
     val linkColor = scheme.primary
+    val shadow = palette.shadowWidth.takeIf { it > 0 && !palette.noShadows }?.let {
+        Shadow(palette.color(ThemeColor.SHADOW) ?: Color.Black, blurRadius = it.toFloat())
+    }
+    val bodyStyle = TextStyle(fontSize = baseSize, lineHeight = baseLineHeight, color = textColor, shadow = shadow)
 
     fun inline(raw: String) = buildRichInline(
         text = raw,
@@ -68,6 +76,8 @@ internal fun RichMessageContent(
         quoteColor = quoteColor,
         codeBg = codeBg,
         linkColor = linkColor,
+        italicsColor = palette.color(ThemeColor.ITALICS) ?: Color.Unspecified,
+        underlineColor = palette.color(ThemeColor.UNDERLINE) ?: Color.Unspecified,
     )
 
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -82,14 +92,14 @@ internal fun RichMessageContent(
                     }
                     val size = (appearance.fontSizeSp * scale).sp
                     SelectionContainer {
-                        Text(
+                        StreamingFadeText(
                             text = remember(block.text, appearance, quoteColor, codeBg, linkColor) { inline(block.text) },
-                            style = TextStyle(
+                            style = bodyStyle.copy(
                                 fontSize = size,
                                 lineHeight = (appearance.fontSizeSp * scale * 1.25f).sp,
                                 fontWeight = FontWeight.Bold,
-                                color = textColor,
                             ),
+                            enabled = streamFadeIn,
                         )
                     }
                 }
@@ -106,13 +116,10 @@ internal fun RichMessageContent(
                         )
                         val body = block.lines.joinToString("\n")
                         SelectionContainer {
-                            Text(
+                            StreamingFadeText(
                                 text = remember(body, appearance, quoteColor, codeBg, linkColor) { inline(body) },
-                                style = TextStyle(
-                                    fontSize = baseSize,
-                                    lineHeight = baseLineHeight,
-                                    color = textColor.copy(alpha = 0.85f),
-                                ),
+                                style = bodyStyle.copy(color = textColor.copy(alpha = 0.85f)),
+                                enabled = streamFadeIn,
                             )
                         }
                     }
@@ -123,9 +130,10 @@ internal fun RichMessageContent(
                             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Text("•", style = TextStyle(fontSize = baseSize, lineHeight = baseLineHeight, color = scheme.primary))
                                 SelectionContainer(Modifier.weight(1f)) {
-                                    Text(
+                                    StreamingFadeText(
                                         text = remember(item, appearance, quoteColor, codeBg, linkColor) { inline(item) },
-                                        style = TextStyle(fontSize = baseSize, lineHeight = baseLineHeight, color = textColor),
+                                        style = bodyStyle,
+                                        enabled = streamFadeIn,
                                     )
                                 }
                             }
@@ -146,9 +154,10 @@ internal fun RichMessageContent(
                                     ),
                                 )
                                 SelectionContainer(Modifier.weight(1f)) {
-                                    Text(
+                                    StreamingFadeText(
                                         text = remember(item, appearance, quoteColor, codeBg, linkColor) { inline(item) },
-                                        style = TextStyle(fontSize = baseSize, lineHeight = baseLineHeight, color = textColor),
+                                        style = bodyStyle,
+                                        enabled = streamFadeIn,
                                     )
                                 }
                             }
@@ -182,9 +191,10 @@ internal fun RichMessageContent(
                 }
                 is RichBlock.Paragraph -> {
                     SelectionContainer {
-                        Text(
+                        StreamingFadeText(
                             text = remember(block.text, appearance, quoteColor, codeBg, linkColor) { inline(block.text) },
-                            style = TextStyle(fontSize = baseSize, lineHeight = baseLineHeight, color = textColor),
+                            style = bodyStyle,
+                            enabled = streamFadeIn,
                         )
                     }
                 }
@@ -261,9 +271,12 @@ private fun CodeBlockCard(block: RichBlock.CodeBlock) {
 private fun MarkdownTableView(block: RichBlock.MarkdownTable, appearance: ChatAppearance, textColor: Color) {
     val scheme = MaterialTheme.colorScheme
     val columns = maxOf(block.headers.size, block.rows.maxOfOrNull { it.size } ?: 0).coerceAtLeast(1)
-    val quoteColor = scheme.primary
+    val palette = appearance.palette
+    val quoteColor = palette.color(ThemeColor.QUOTE) ?: scheme.primary
     val codeBg = scheme.surfaceContainerHighest.copy(alpha = 0.72f)
     val linkColor = scheme.primary
+    fun inline(cell: String) = buildRichInline(cell, appearance.highlightQuotes, quoteColor, codeBg, linkColor,
+        palette.color(ThemeColor.ITALICS) ?: Color.Unspecified, palette.color(ThemeColor.UNDERLINE) ?: Color.Unspecified)
     Surface(
         shape = RoundedCornerShape(10.dp),
         border = BorderStroke(1.dp, scheme.outlineVariant),
@@ -276,7 +289,7 @@ private fun MarkdownTableView(block: RichBlock.MarkdownTable, appearance: ChatAp
                         val cell = block.headers.getOrNull(col).orEmpty()
                         Box(Modifier.widthIn(min = 84.dp, max = 220.dp).padding(horizontal = 10.dp, vertical = 6.dp)) {
                             Text(
-                                text = buildRichInline(cell, appearance.highlightQuotes, quoteColor, codeBg, linkColor),
+                                text = inline(cell),
                                 style = MaterialTheme.typography.labelLarge,
                                 fontWeight = FontWeight.SemiBold,
                                 color = textColor,
@@ -296,7 +309,7 @@ private fun MarkdownTableView(block: RichBlock.MarkdownTable, appearance: ChatAp
                             Box(Modifier.widthIn(min = 84.dp, max = 220.dp).padding(horizontal = 10.dp, vertical = 6.dp)) {
                                 SelectionContainer {
                                     Text(
-                                        text = buildRichInline(cell, appearance.highlightQuotes, quoteColor, codeBg, linkColor),
+                                        text = inline(cell),
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = textColor,
                                     )

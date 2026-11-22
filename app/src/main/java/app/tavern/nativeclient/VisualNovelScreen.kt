@@ -37,13 +37,13 @@ internal fun ConversationLayout(chat: Chat, state: TavernState, model: TavernVie
     }
     BoxWithConstraints(modifier.fillMaxWidth()) {
         val wide = maxWidth >= 600.dp
-        val background = chat.options.background
+        val background = state.prefs.backgrounds.effective(chat)
         val hasSpace = maxHeight >= if (wide) 120.dp else 192.dp
         val cast = if (showStage && hasSpace) {
             remember(chat, state.cards, state.group, state.cardId) { state.visualNovelCast(chat) }
         } else null
         if (cast == null || (cast.subjects.isEmpty() && background == null)) {
-            background?.let { ConversationBackground(it, model.imageFile(it), Modifier.matchParentSize()) }
+            background?.let { ConversationBackground(it, model.backgroundFile(it), Modifier.matchParentSize(), state.prefs.backgrounds.fit) }
             transcript()
         } else if (wide) {
             Row(Modifier.fillMaxSize()) {
@@ -66,8 +66,8 @@ private fun VisualNovelStage(chat: Chat, state: TavernState, model: TavernViewMo
     val active = cast.focusedSpeaker(speakerId)
     val colors = MaterialTheme.colorScheme
     BoxWithConstraints(modifier.background(colors.surfaceContainerHighest)) {
-        chat.options.background?.let { image ->
-            ChatImageContent(image, model.imageFile(image), 960, Modifier.matchParentSize(), crop = true, decorative = true)
+        state.prefs.backgrounds.effective(chat)?.let { image ->
+            ConversationBackground(image, model.backgroundFile(image), Modifier.matchParentSize(), state.prefs.backgrounds.fit, opacity = 1f)
         }
         val count = cast.subjects.size
         if (count == 0) return@BoxWithConstraints

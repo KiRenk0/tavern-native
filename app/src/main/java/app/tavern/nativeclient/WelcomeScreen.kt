@@ -70,15 +70,19 @@ internal fun WelcomeScreen(state: TavernState, model: TavernViewModel, busy: Boo
             if (prefs.showRecent && state.recentChats.isNotEmpty()) {
                 item { Text("最近聊天", style = MaterialTheme.typography.titleLarge) }
                 items(visible, key = { it.summary.id }) { entry ->
+                    val group = state.groups.firstOrNull { it.id == entry.groupId }
                     val owner = state.cards.firstOrNull { it.id == entry.cardId }?.name
-                        ?: state.groups.firstOrNull { it.id == entry.groupId }?.name.orEmpty()
+                        ?: group?.name.orEmpty()
                     val saved = entry.summary.id in prefs.pinnedIds
                     Card(onClick = { model.openChat(entry.summary.id) }, enabled = !busy, modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
                         ListItem(
                             headlineContent = { Text(entry.summary.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                             supportingContent = { Text(owner, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                            leadingContent = { Icon(if (entry.groupId == null) Icons.Outlined.ChatBubbleOutline else Icons.Outlined.Groups, null) },
+                            leadingContent = {
+                                if (group == null) Icon(Icons.Outlined.ChatBubbleOutline, null)
+                                else GroupPortrait(group, state.cards, model::portrait, 40.dp)
+                            },
                             trailingContent = {
                                 IconButton({ model.toggleRecentPin(entry.summary.id) }, enabled = !busy) {
                                     Icon(Icons.Outlined.PushPin, if (saved) "取消置顶 ${entry.summary.title}" else "置顶 ${entry.summary.title}",

@@ -22,9 +22,9 @@ class BackupAndMigrationTest {
     )
 
     @Test
-    fun databaseSchemaCreateAndUpgradePaths1Through8ReachV9Cleanly() {
+    fun databaseSchemaCreateAndUpgradePaths1Through9ReachV10Cleanly() {
         val createSql = TavernSchema.createStatements().joinToString("\n")
-        assertEquals(9, TavernSchema.LATEST_VERSION)
+        assertEquals(10, TavernSchema.LATEST_VERSION)
         assertTrue(createSql.contains("CREATE TABLE cards"))
         assertTrue(createSql.contains("CREATE TABLE character_groups"))
         assertTrue(createSql.contains("CREATE TABLE world_books"))
@@ -36,25 +36,30 @@ class BackupAndMigrationTest {
         assertTrue(createSql.contains("CREATE TABLE drawing_gallery"))
         assertTrue(createSql.contains("CREATE TABLE comfy_workflows"))
         assertTrue(createSql.contains("CREATE TABLE script_globals"))
+        assertTrue(createSql.contains("CREATE TABLE chat_backups"))
+        assertTrue(createSql.contains("capture_chat_before_update"))
+        assertTrue(createSql.contains("capture_chat_before_delete"))
 
-        for (oldVersion in 1..8) {
+        for (oldVersion in 1..9) {
             val steps = TavernSchema.upgradeStatements(oldVersion, TavernSchema.LATEST_VERSION)
-            assertTrue("v$oldVersion->9 must create script_globals", steps.any { "script_globals" in it })
+            assertEquals("Only v1–8 need the globals table", oldVersion < 9, steps.any { "script_globals" in it })
+            assertTrue(steps.containsAll(ChatBackupSchema.statements))
             if (oldVersion == 1) {
                 assertTrue(steps.any { "ALTER TABLE chats RENAME TO chats_v1" in it })
                 assertTrue(steps.any { "world_books" in it })
             }
             if (oldVersion < 8) {
-                assertTrue("v$oldVersion->9 must add chat world binding columns", steps.any { "world_book_id" in it })
+                assertTrue("v$oldVersion->10 must add chat world binding columns", steps.any { it.startsWith("ALTER TABLE chats ADD COLUMN world_book_id") })
             } else {
-                assertFalse("v8->9 must not duplicate world_book_id", steps.any { "world_book_id" in it })
+                assertFalse("Newer schemas already have world bindings", steps.any { it.startsWith("ALTER TABLE chats ADD COLUMN world_book_id") })
             }
         }
+        assertEquals(ChatBackupSchema.statements, TavernSchema.upgradeStatements(9, 10))
 
-        for (badOld in listOf(0, 9, 10)) {
+        for (badOld in listOf(0, 10, 11)) {
             var threw = false
             try {
-                TavernSchema.upgradeStatements(badOld, 9)
+                TavernSchema.upgradeStatements(badOld, 10)
             } catch (_: IllegalStateException) {
                 threw = true
             }

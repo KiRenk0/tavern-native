@@ -20,8 +20,12 @@ internal object ChatMediaArchive {
     private fun documents(chat: Chat) = chat.messages.flatMap(Message::documents).distinctBy(ChatDocument::filename)
         .associateBy { "documents/${it.filename}" }
 
+    private fun videos(chat: Chat) = chat.messages.flatMap(Message::videos).distinctBy(ChatVideo::filename)
+        .associateBy { "videos/${it.filename}" }
+
     fun write(output: OutputStream, transcript: ByteArray, chat: Chat,
-              readDocument: (ChatDocument) -> ByteArray? = { null }, read: (ChatImage) -> ByteArray?) {
+              readDocument: (ChatDocument) -> ByteArray? = { null },
+              readVideo: (ChatVideo) -> InputStream? = { null }, read: (ChatImage) -> ByteArray?) {
         require(transcript.size <= TRANSCRIPT_LIMIT) { "聊天文本超过归档大小限制" }
         var total = 0L
         ZipOutputStream(output).use { zip ->
@@ -35,17 +39,27 @@ internal object ChatMediaArchive {
             add(TRANSCRIPT, transcript, TRANSCRIPT_LIMIT)
             for ((name, image) in images(chat)) {
                 val data = requireNotNull(read(image)) { "归档缺少图片 ${image.name}" }
-                add(name, data, MAX_STORED_IMAGE)
+                add(name, data, image.storageLimit)
             }
             for ((name, document) in documents(chat)) {
                 val data = requireNotNull(readDocument(document)) { "归档缺少文档 ${document.name}" }
                 add(name, data, MAX_STORED_CHAT_DOCUMENT)
+            }
+            for ((name, video) in videos(chat)) {
+                require(total + video.byteCount <= TOTAL_LIMIT) { "聊天归档超过大小限制" }
+                requireNotNull(readVideo(video)) { "归档缺少视频 ${video.name}" }.use { input ->
+                    zip.putNextEntry(ZipEntry(name))
+                    require(copyVideo(input, zip, video.byteCount) == video.byteCount) { "归档视频大小与记录不符" }
+                    zip.closeEntry()
+                }
+                total += video.byteCount
             }
         }
     }
 
     fun read(input: InputStream, parse: (ByteArray) -> Chat,
              restoreDocument: (ChatDocument, ByteArray) -> Unit = { _, _ -> error("缺少文档写入目标") },
+             restoreVideo: (ChatVideo, InputStream) -> Unit = { _, _ -> error("缺少视频写入目标") },
              restore: (ChatImage, ByteArray) -> Unit): Chat =
         ZipInputStream(input).use { zip ->
             require(zip.nextEntry?.name == TRANSCRIPT) { "无法读取聊天 ZIP 归档" }
@@ -54,17 +68,27 @@ internal object ChatMediaArchive {
             val chat = parse(transcript)
             val remainingImages = images(chat).toMutableMap()
             val remainingDocuments = documents(chat).toMutableMap()
+            val remainingVideos = videos(chat).toMutableMap()
             while (true) {
                 val entry = zip.nextEntry ?: break
+                val video = remainingVideos.remove(entry.name)
+                if (video != null) {
+                    total += video.byteCount
+                    require(total <= TOTAL_LIMIT) { "聊天归档超过 256 MB" }
+                    restoreVideo(video, zip)
+                    continue
+                }
                 val image = remainingImages.remove(entry.name)
                 val document = remainingDocuments.remove(entry.name)
                 require(image != null || document != null) { "聊天归档包含无效的附件条目" }
-                val bytes = zip.readLimited(if (image != null) MAX_STORED_IMAGE else MAX_STORED_CHAT_DOCUMENT)
+                val bytes = zip.readLimited(image?.storageLimit ?: MAX_STORED_CHAT_DOCUMENT)
                 total += bytes.size
                 require(total <= TOTAL_LIMIT) { "聊天归档超过 256 MB" }
                 if (image != null) restore(image, bytes) else restoreDocument(requireNotNull(document), bytes)
             }
-            require(remainingImages.isEmpty() && remainingDocuments.isEmpty()) { "聊天归档不含完整的附件文件" }
+            require(remainingImages.isEmpty() && remainingDocuments.isEmpty() && remainingVideos.isEmpty()) {
+                "聊天归档不含完整的附件文件"
+            }
             chat
         }
 }

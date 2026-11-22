@@ -63,7 +63,7 @@ internal fun PersonaSettings(state: TavernState, model: TavernViewModel, close: 
                     Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        AvatarBadge(item.name, model.personaAvatar(item), 44.dp, true)
+                        AvatarBadge(item.name, model.personaAvatar(item), 44.dp)
                         Column(Modifier.weight(1f)) {
                             Text(item.name, style = MaterialTheme.typography.titleMedium, maxLines = 1,
                                 overflow = TextOverflow.Ellipsis)
@@ -115,7 +115,7 @@ private fun PersonaEditor(persona: PersonaProfile, state: TavernState, model: Ta
         FormHeading(if (persona.name.isBlank()) "创建人设" else "编辑人设")
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            AvatarBadge(name, model.personaAvatar(persona).takeIf { keepAvatar }, 64.dp, true)
+            AvatarBadge(name, model.personaAvatar(persona).takeIf { keepAvatar }, 64.dp)
             Column(Modifier.weight(1f)) {
                 val selectedPhoto = photo
                 if (selectedPhoto != null) {

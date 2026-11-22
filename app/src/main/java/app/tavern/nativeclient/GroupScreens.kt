@@ -1,5 +1,8 @@
 package app.tavern.nativeclient
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts.OpenDocument
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -15,9 +18,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import java.io.File
 
 @Composable
-internal fun GroupEditor(group: TavernGroup, state: TavernState, save: (TavernGroup) -> Unit) {
+internal fun GroupEditor(group: TavernGroup, state: TavernState, portrait: (Card) -> File, save: (TavernGroup) -> Unit) {
     var name by rememberSaveable { mutableStateOf(group.name) }
     var chosen by rememberSaveable { mutableStateOf(group.memberIds.toTypedArray()) }
     var muted by rememberSaveable { mutableStateOf(group.mutedIds.toTypedArray()) }
@@ -29,9 +33,20 @@ internal fun GroupEditor(group: TavernGroup, state: TavernState, save: (TavernGr
     var suffix by rememberSaveable { mutableStateOf(group.suffix) }
     var autoDelay by rememberSaveable { mutableStateOf(group.autoDelaySeconds.toString()) }
     var query by rememberSaveable { mutableStateOf("") }
+    var avatarUrl by rememberSaveable { mutableStateOf(group.avatar?.dataUrl.orEmpty()) }
+    var cropUri by remember { mutableStateOf<Uri?>(null) }
+    val avatar = remember(avatarUrl) { GroupAvatar.fromDataUrl(avatarUrl) }
+    val pickAvatar = rememberLauncherForActivityResult(OpenDocument()) { uri -> cropUri = uri }
     val delaySeconds = autoDelay.toIntOrNull()?.takeIf { it in 1..999 }
     val cards = state.cards.associateBy(Card::id)
     Form {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            GroupPortrait(group.copy(memberIds = chosen.toList(), avatar = avatar), state.cards, portrait, 64.dp)
+            Column {
+                TextButton({ pickAvatar.launch(arrayOf("image/*")) }, enabled = !state.busy) { Text("选择群组头像") }
+                if (avatar != null) TextButton({ avatarUrl = "" }, enabled = !state.busy) { Text("使用成员拼图") }
+            }
+        }
         Field("群组名称", name, { name = it }, enabled = !state.busy)
         SelectField("发言顺序", order, ReplyOrder.entries, ReplyOrder::label, !state.busy) { order = it }
         SelectField("角色上下文", mode, GroupPromptMode.entries, GroupPromptMode::label, !state.busy) { mode = it }
@@ -69,28 +84,43 @@ internal fun GroupEditor(group: TavernGroup, state: TavernState, save: (TavernGr
         }
         Button(onClick = { save(group.copy(name = name, memberIds = chosen.toList(), mutedIds = muted.toSet(),
             order = order, promptMode = mode, allowSelf = allowSelf, prefix = prefix, suffix = suffix,
-            autoDelaySeconds = requireNotNull(delaySeconds), hideMutedSprites = hideMutedSprites)) },
+            autoDelaySeconds = requireNotNull(delaySeconds), hideMutedSprites = hideMutedSprites, avatar = avatar)) },
             enabled = !state.busy && name.isNotBlank() && chosen.isNotEmpty() && delaySeconds != null,
             modifier = Modifier.fillMaxWidth()) {
             Text("保存群组")
         }
     }
+    cropUri?.let { uri ->
+        GroupAvatarCropDialog(uri, dismiss = { cropUri = null }) { selected ->
+            avatarUrl = selected.dataUrl
+            cropUri = null
+        }
+    }
 }
 
 @Composable
-internal fun GroupDetails(group: TavernGroup, state: TavernState, newChat: () -> Unit,
+internal fun GroupDetails(group: TavernGroup, state: TavernState, portrait: (Card) -> File, newChat: () -> Unit,
                           openChat: (String) -> Unit, deleteChat: (ChatSummary) -> Unit, importHistory: () -> Unit,
-                          tags: List<LibraryTag>) {
+                          tags: List<LibraryTag>, editMember: (Card) -> Unit) {
+    val members = group.members(state.cards)
     GroupList {
         item {
-            FormHeading(group.name, "${group.order.label} · ${group.promptMode.label}")
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                GroupPortrait(group, state.cards, portrait, 72.dp)
+                FormHeading(group.name, "${group.order.label} · ${group.promptMode.label}")
+            }
             LibraryDetailsTags(tags)
-            val members = group.members(state.cards).joinToString("、") {
-                if (it.id in group.mutedIds) "${it.name}（静音）" else it.name
-            }.ifBlank { "群组还没有角色。" }
-            Text(members, Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (members.isEmpty()) Text("群组还没有角色。", Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
             Button(newChat, enabled = !state.busy && group.memberIds.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
                 Icon(Icons.Outlined.AddComment, null); Spacer(Modifier.width(8.dp)); Text("新建群聊")
+            }
+        }
+        if (members.isNotEmpty()) item { Text("群组成员", style = MaterialTheme.typography.titleLarge) }
+        items(members, key = { "member:${it.id}" }) { member ->
+            OutlinedCard(onClick = { editMember(member) }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
+                ListItem(headlineContent = { Text(member.name) }, leadingContent = { Portrait(member, portrait(member), 40.dp) },
+                    supportingContent = if (member.id in group.mutedIds) ({ Text("已静音") }) else null,
+                    trailingContent = { Icon(Icons.Outlined.Edit, "编辑角色设定") })
             }
         }
         item { ChatHistoryImportButton(state.busy, importHistory) }

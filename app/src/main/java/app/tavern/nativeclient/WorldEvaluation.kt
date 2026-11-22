@@ -28,6 +28,7 @@ internal data class LoreRules(
     val triggers: List<String> = emptyList(),
     val outlet: String = "",
     val ignoreBudget: Boolean = false,
+    val characterFilter: LoreCharacterFilter = LoreCharacterFilter(),
 ) {
     val groupNames get() = groups.split(',').map(String::trim).filter(String::isNotBlank).distinct()
 
@@ -45,6 +46,7 @@ internal data class LoreRules(
         json.put("triggers", JSONArray(triggers))
         json.put("outletName", outlet)
         json.put("ignoreBudget", ignoreBudget)
+        if (characterFilter.isEmpty) json.remove("characterFilter") else json.put("characterFilter", characterFilter.json())
         LoreSource.entries.forEach { json.put(it.field, it in sources) }
     }
 
@@ -68,9 +70,14 @@ internal data class LoreRules(
                 triggers = json.optJSONArray("triggers").strings(),
                 outlet = json.string(field("outletName", "outlet_name")),
                 ignoreBudget = json.optBoolean(field("ignoreBudget", "ignore_budget")),
+                characterFilter = LoreCharacterFilter.from(json.optJSONObject("characterFilter") ?: json.optJSONObject("character_filter")),
             )
         }
     }
+}
+
+internal enum class LoreInsertionStrategy(val label: String) {
+    EVENLY("按条目优先级混排"), CHARACTER_FIRST("角色世界书优先"), GLOBAL_FIRST("全局世界书优先"),
 }
 
 internal data class LoreSettings(
@@ -84,6 +91,9 @@ internal data class LoreSettings(
     val budgetPercent: Int = 25,
     val budgetCap: Int = 0,
     val overflowAlert: Boolean = false,
+    val scanDepth: Int = 4,
+    val includeNames: Boolean = false,
+    val insertionStrategy: LoreInsertionStrategy = LoreInsertionStrategy.EVENLY,
 ) {
     fun json() = jsonOf(
         "world_info_recursive" to recursive, "world_info_max_recursion_steps" to maxPasses,
@@ -92,6 +102,8 @@ internal data class LoreSettings(
         "world_info_use_group_scoring" to groupScoring,
         "world_info_budget" to budgetPercent, "world_info_budget_cap" to budgetCap,
         "world_info_overflow_alert" to overflowAlert,
+        "world_info_depth" to scanDepth, "world_info_include_names" to includeNames,
+        "world_info_character_strategy" to insertionStrategy.ordinal,
     )
 
     companion object {
@@ -106,6 +118,9 @@ internal data class LoreSettings(
             budgetPercent = json.optInt("world_info_budget", 25).takeIf { it in 0..100 } ?: 25,
             budgetCap = json.optInt("world_info_budget_cap").coerceIn(0, MAX_CONTEXT_TOKENS),
             overflowAlert = json.optBoolean("world_info_overflow_alert"),
+            scanDepth = json.optInt("world_info_depth", 4).coerceIn(0, 80),
+            includeNames = json.optBoolean("world_info_include_names"),
+            insertionStrategy = LoreInsertionStrategy.entries.getOrElse(json.optInt("world_info_character_strategy")) { LoreInsertionStrategy.EVENLY },
         )
     }
 }
@@ -119,7 +134,8 @@ internal data class LoreEffect(val signature: Int, val start: Int, val stickyEnd
     }
 }
 
-internal data class LoreEvaluation(val entries: List<LoreEntry>, val effects: Map<String, LoreEffect>, val budget: LoreBudgetUsage)
+internal data class LoreEvaluation(val entries: List<LoreEntry>, val effects: Map<String, LoreEffect>, val budget: LoreBudgetUsage,
+                                   val automationIds: Set<String>)
 
 internal data class LoreCandidate(val key: String, val entry: LoreEntry, val bookDepth: Int) {
     val rules get() = entry.rules
@@ -129,22 +145,41 @@ internal data class LoreCandidate(val key: String, val entry: LoreEntry, val boo
 
 private enum class LorePass { INITIAL, RECURSION, EXPANSION }
 
-internal fun loreCandidates(card: Card, books: List<WorldBook>, persona: PersonaProfile, options: ConversationOptions): List<LoreCandidate> {
-    val embedded = card.book?.let { value ->
-        val depth = value.optInt("scan_depth", 4).coerceIn(0, 80)
+internal fun loreCandidates(
+    card: Card, books: List<WorldBook>, persona: PersonaProfile, options: ConversationOptions,
+    settings: LoreSettings = LoreSettings(), tagIds: Set<String> = LibraryPreferences().loreTags(card),
+): List<LoreCandidate> {
+    val primary = books.firstOrNull { it.name == card.worldName }
+    val embedded = card.book?.takeIf { primary == null }?.let { value ->
+        val depth = value.optInt("scan_depth", settings.scanDepth).coerceIn(0, 80)
         value.optJSONArray("entries")?.objects().orEmpty().mapIndexed { index, item ->
             val entry = LoreEntry.from(item.optInt("id", index), item, embedded = true)
             LoreCandidate("card:${card.id}:${entry.id}", entry, depth)
         }
     }.orEmpty()
-    val chatBook = options.worldBook(books)
-    val global = books.filter { it.enabled || it == chatBook || it.name == card.worldName || it.id == persona.worldId }.flatMap { book ->
-        val depth = book.scanDepth
+    val chatBook = options.worldBook(books)?.takeUnless(WorldBook::enabled)
+    val personaBook = books.firstOrNull { it.id == persona.worldId && !it.enabled && it != chatBook }
+    val otherBooks = books.filter { it != chatBook && it != personaBook }
+    val extraIds = card.additionalWorldBookIds.toHashSet()
+    fun entries(source: List<WorldBook>) = source.flatMap { book ->
+        val depth = book.scanDepthOverride ?: settings.scanDepth
         book.entries.map { LoreCandidate("book:${book.id}:${it.id}", it, depth) }
     }
-    return (embedded + global).distinctBy(LoreCandidate::key)
-        .filter { !it.entry.disabled && it.entry.content.isNotBlank() }
-        .sortedByDescending { it.entry.priority }
+    fun List<LoreCandidate>.byPriority() = sortedByDescending { it.entry.priority }
+    val global = entries(otherBooks.filter(WorldBook::enabled))
+    val character = embedded + entries(otherBooks.filter { !it.enabled && (it == primary || it.id in extraIds) })
+    val shared = when (settings.insertionStrategy) {
+        LoreInsertionStrategy.EVENLY -> (global + character).byPriority()
+        LoreInsertionStrategy.CHARACTER_FIRST -> character.byPriority() + global.byPriority()
+        LoreInsertionStrategy.GLOBAL_FIRST -> global.byPriority() + character.byPriority()
+    }
+    val filename by lazy(LazyThreadSafetyMode.NONE) { card.scriptAvatarKey.loreFilenameStem() }
+    return (entries(listOfNotNull(chatBook)).byPriority() + entries(listOfNotNull(personaBook)).byPriority() + shared)
+        .distinctBy(LoreCandidate::key)
+        .filter { item ->
+            val filter = item.rules.characterFilter
+            !item.entry.disabled && item.entry.content.isNotBlank() && (filter.isEmpty || filter.applies(card.id, filename, tagIds))
+        }
 }
 
 internal fun evaluateLore(
@@ -152,24 +187,27 @@ internal fun evaluateLore(
     persona: PersonaProfile, options: ConversationOptions, extraScan: String,
     trigger: String = "normal", random: Random = Random.Default, semanticMatches: Set<String> = emptySet(),
     budget: LoreBudget = LoreBudget(3_000, estimatedTokens),
+    tagIds: Set<String> = LibraryPreferences().loreTags(card),
     render: (String) -> String = { expand(it, card, persona.name) },
     renderEntry: (LoreEntry, String) -> LoreExpansion = { _, text -> LoreExpansion(render(text)) },
 ): LoreEvaluation {
-    val candidates = loreCandidates(card, books, persona, options)
+    val candidates = loreCandidates(card, books, persona, options, settings, tagIds)
     val count = history.size
     val effects = history.asReversed().firstNotNullOfOrNull(Message::loreEffects).orEmpty()
         .filterValues { count > it.start && count < it.cooldownEnd }.toMutableMap()
     fun effect(item: LoreCandidate) = effects[item.key]?.takeIf { it.signature == item.signature }
     fun sticky(item: LoreCandidate) = effect(item)?.let { count < it.stickyEnd } == true
-    val recursionEnabled = settings.recursive || card.book?.let { value ->
-        value.optBoolean("recursive_scanning") && !value.optJSONArray("entries")?.objects().isNullOrEmpty()
-    } == true
+    val recursionEnabled = settings.recursive ||
+        (candidates.any { it.key.startsWith("card:") } && card.book?.optBoolean("recursive_scanning") == true)
     val recursionLevels = ArrayDeque(candidates.map { it.rules.recursionLevel }.filter { it > 0 }.distinct().sorted())
     var recursionLevel = recursionLevels.removeFirstOrNull() ?: 0
     val activated = linkedMapOf<LoreCandidate, LoreEntry>()
     val lostProbability = mutableSetOf<LoreCandidate>()
-    val scanMessages = mutableMapOf<Int, String>()
-    val recentMessages by lazy { history.takeLast(80).map { render(it.text) } }
+    val scanMessages = mutableMapOf<Pair<Int, Boolean>, String>()
+    val recentMessages by lazy { history.takeLast(80).map { message ->
+        val text = render(message.text)
+        if (settings.includeNames && message.name.isNotBlank()) "${message.name}: $text" else text
+    } }
     var cachedCharacters = 0
     val sourceText = mapOf(
         LoreSource.PERSONA to persona.description, LoreSource.CHARACTER to card.description,
@@ -177,25 +215,33 @@ internal fun evaluateLore(
         LoreSource.SCENARIO to options.scenario.ifBlank { card.scenario }, LoreSource.CREATOR to card.creatorNotes,
     )
     var expandedDepth = 0
-    var recurseText = ""
+    val recursionText = mutableListOf<String>()
     var spent = 0
     var budgetExhausted = false
     var pass = LorePass.INITIAL
     var passes = 0
     val expandLimit = minOf(history.size, settings.minimumDepthMax.takeIf { it > 0 } ?: 80)
     val shallowest = candidates.filter { it.entry.scanDepth == null }.minOfOrNull(LoreCandidate::bookDepth) ?: expandLimit
-    fun scan(item: LoreCandidate): String {
+    fun scan(item: LoreCandidate, boundaries: Boolean): String {
         val depth = item.entry.scanDepth ?: (item.bookDepth + expandedDepth).coerceAtMost(80)
         if (depth <= 0) return ""
-        val messages = scanMessages[depth] ?: recentMessages.takeLast(depth).joinToString("\n").also {
+        val separator = if (boundaries) "\n\u0001" else "\n"
+        val key = depth to boundaries
+        val messages = scanMessages[key] ?: recentMessages.takeLast(depth).let { recent ->
+            (if (boundaries) recent.asReversed() else recent).joinToString(separator)
+        }.also {
             if (it.length <= 256_000 - cachedCharacters) {
-                scanMessages[depth] = it
+                scanMessages[key] = it
                 cachedCharacters += it.length
             }
         }
         val sources = item.rules.sources.mapNotNull(sourceText::get).map(render)
-        return (listOf(messages, extraScan) + sources +
-            recurseText.takeIf { pass != LorePass.EXPANSION }.orEmpty()).filter(String::isNotBlank).joinToString("\n")
+        val recursed = recursionText.takeUnless { pass == LorePass.EXPANSION }.orEmpty()
+        val fragments = if (boundaries) listOf(messages) + sources + extraScan + recursed
+            else listOf(messages, extraScan) + sources + recursed
+        val nonempty = fragments.filter(String::isNotBlank)
+        if (nonempty.isEmpty()) return ""
+        return nonempty.joinToString(separator, prefix = if (boundaries) "\u0001" else "")
     }
 
     while (settings.maxPasses == 0 || passes < settings.maxPasses) {
@@ -214,7 +260,11 @@ internal fun evaluateLore(
             val forced = pinned || entry.constant || directive == "@@activate"
             val semantic = item.key in semanticMatches
             val scored = rules.groupScoring ?: settings.groupScoring
-            val keywords = if ((forced || semantic) && !scored) null else matchingKeys(entry, settings, scan(item), render)
+            val keywords = if ((forced || semantic) && !scored) null else {
+                val plain by lazy(LazyThreadSafetyMode.NONE) { scan(item, false) }
+                val bounded by lazy(LazyThreadSafetyMode.NONE) { scan(item, true) }
+                matchingKeys(entry, settings, { if (it) bounded else plain }, render)
+            }
             if (!forced && !semantic && keywords?.first != true) return@mapNotNull null
             LoreMatch(item, pinned, scored, keywords?.second ?: 0, content)
         }.sortedWith(compareByDescending(LoreMatch::sticky).thenByDescending { it.candidate.entry.constant })
@@ -225,7 +275,7 @@ internal fun evaluateLore(
             val entry = item.entry
             val rules = item.rules
             if (!rules.ignoreBudget && budgetExhausted) continue
-            if (!match.sticky && entry.probability < 100 && random.nextInt(100) >= entry.probability) {
+            if (!match.sticky && entry.useProbability && entry.probability < 100 && random.nextInt(100) >= entry.probability) {
                 lostProbability += item
                 continue
             }
@@ -246,10 +296,10 @@ internal fun evaluateLore(
                 effects[item.key] = LoreEffect(item.signature, count, stickyEnd, stickyEnd + rules.cooldown)
             }
         }
-        if (newText.isNotEmpty()) recurseText = (listOf(recurseText) + newText).filter(String::isNotBlank).joinToString("\n")
+        recursionText += newText.filter(String::isNotBlank)
         pass = when {
             budgetExhausted -> break
-            recursionEnabled && (newText.isNotEmpty() || (pass == LorePass.EXPANSION && recurseText.isNotEmpty())) ->
+            recursionEnabled && (newText.isNotEmpty() || (pass == LorePass.EXPANSION && recursionText.isNotEmpty())) ->
                 LorePass.RECURSION
             settings.maxPasses == 0 && activated.size < settings.minimum && shallowest + expandedDepth < expandLimit -> {
                 expandedDepth++
@@ -263,7 +313,8 @@ internal fun evaluateLore(
         }
     }
     return LoreEvaluation(activated.values.sortedByDescending(LoreEntry::priority), effects.toMap(),
-        LoreBudgetUsage(budget.limit, spent, budgetExhausted, budget.counter.label))
+        LoreBudgetUsage(budget.limit, spent, budgetExhausted, budget.counter.label),
+        activated.values.map(LoreEntry::automationId).filter(String::isNotBlank).toSet())
 }
 
 private data class LoreMatch(
@@ -300,10 +351,11 @@ internal fun loreContent(content: String): Pair<String, String?> {
     else content to null
 }
 
-private fun matchingKeys(entry: LoreEntry, settings: LoreSettings, text: String, render: (String) -> String): Pair<Boolean, Int> {
+private fun matchingKeys(entry: LoreEntry, settings: LoreSettings, scan: (Boolean) -> String, render: (String) -> String): Pair<Boolean, Int> {
     fun matches(raw: String): Boolean {
         val key = render(raw).trim()
         if (key.isBlank()) return false
+        val text = scan(key.startsWith('/') && ("\\x01" in key || "\\u0001" in key || '\u0001' in key))
         regexKeywordMatches(key, text)?.let { return it }
         val insensitive = !(entry.caseSensitive ?: settings.caseSensitive)
         if (!(entry.wholeWords ?: settings.wholeWords)) return text.contains(key, insensitive)
@@ -311,8 +363,8 @@ private fun matchingKeys(entry: LoreEntry, settings: LoreSettings, text: String,
         return Regex(edges, if (insensitive) setOf(RegexOption.IGNORE_CASE) else emptySet()).containsMatchIn(text)
     }
     val primary = entry.keywords.count(::matches)
-    val secondary = entry.secondary.count(::matches)
-    val valid = entry.secondary.isEmpty() || when (entry.logic) {
+    val secondary = if (entry.selective) entry.secondary.count(::matches) else 0
+    val valid = !entry.selective || entry.secondary.isEmpty() || when (entry.logic) {
         LoreLogic.AND_ANY -> secondary > 0
         LoreLogic.NOT_ALL -> secondary < entry.secondary.size
         LoreLogic.NOT_ANY -> secondary == 0

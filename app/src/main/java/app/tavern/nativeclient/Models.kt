@@ -69,13 +69,15 @@ internal data class Card(val id: String, val original: String, val hasAvatar: Bo
     val greetings get() = (listOf(greeting) + alternateGreetings).filter(String::isNotBlank)
     val book get() = data.optJSONObject("character_book")
     val worldName get() = data.optJSONObject("extensions")?.string("world").orEmpty()
+    val additionalWorldBookIds get() = data.optJSONObject("extensions")?.optJSONArray("tavern_native_extra_books").strings()
     val regexRules by lazy { RegexRule.fromArray(data.optJSONObject("extensions")?.optJSONArray("regex_scripts")) }
     val expressionSprites by lazy {
         data.optJSONObject("extensions")?.optJSONArray(EXPRESSION_EXTENSION)?.objects()?.mapNotNull(ExpressionSprite::from)
     }
     val authorNote get() = CharacterNote.fromJson(data.optJSONObject("extensions")?.optJSONObject("tavern_native_author_note"))
     val talkativeness get() = data.optJSONObject("extensions")?.optDouble("talkativeness",
-        data.optDouble("talkativeness", .5)) ?: data.optDouble("talkativeness", .5)
+        data.optDouble("talkativeness", .5))?.takeIf(Double::isFinite)
+        ?: data.optDouble("talkativeness", .5).takeIf(Double::isFinite) ?: .5
 
     fun edited(fields: Map<String, String>, alternates: List<String>): Card {
         val root = JSONObject(original)
@@ -94,6 +96,21 @@ internal data class Card(val id: String, val original: String, val hasAvatar: Bo
         val target = root.optJSONObject("data") ?: root
         val extensions = target.optJSONObject("extensions") ?: JSONObject().also { target.put("extensions", it) }
         extensions.put("world", name)
+        return copy(original = root.toString())
+    }
+
+    fun withAdditionalWorldBooks(ids: List<String>): Card {
+        val root = JSONObject(original)
+        val target = root.optJSONObject("data") ?: root
+        val extensions = target.optJSONObject("extensions") ?: JSONObject().also { target.put("extensions", it) }
+        if (ids.isEmpty()) extensions.remove("tavern_native_extra_books")
+        else extensions.put("tavern_native_extra_books", JSONArray(ids.distinct()))
+        return copy(original = root.toString())
+    }
+
+    fun withCharacterBook(book: JSONObject): Card {
+        val root = JSONObject(original)
+        (root.optJSONObject("data") ?: root).put("character_book", book)
         return copy(original = root.toString())
     }
 
@@ -119,6 +136,17 @@ internal data class Card(val id: String, val original: String, val hasAvatar: Bo
         val target = root.optJSONObject("data") ?: root
         val extensions = target.optJSONObject("extensions") ?: JSONObject().also { target.put("extensions", it) }
         extensions.put("fav", favorite)
+        return copy(original = root.toString())
+    }
+
+    fun withTalkativeness(value: Double): Card {
+        require(value in 0.0..1.0)
+        val root = JSONObject(original)
+        val target = root.optJSONObject("data") ?: root
+        val extensions = target.optJSONObject("extensions") ?: JSONObject().also { target.put("extensions", it) }
+        extensions.put("talkativeness", value)
+        if (root.has("talkativeness")) root.put("talkativeness", value)
+        if (target.has("talkativeness")) target.put("talkativeness", value)
         return copy(original = root.toString())
     }
 
@@ -181,23 +209,22 @@ internal object CardFile {
             val json = JSONObject(bytes.toString(Charsets.UTF_8).trimStart('\uFEFF'))
             return CardImport(Card.from(json, id))
         }
-        var v2: String? = null
-        var v3: String? = null
-        scanPng(bytes) { type, _, offset, size ->
-            if (type == "tEXt") {
-                val limit = minOf(offset + size, offset + 80)
-                val separator = (offset until limit).firstOrNull { bytes[it] == 0.toByte() }
-                if (separator != null) {
-                    val label = String(bytes, offset, separator - offset, Charsets.US_ASCII)
-                    val value = { String(bytes, separator + 1, offset + size - separator - 1, Charsets.US_ASCII) }
-                    if (label.equals("ccv3", true) && v3 == null) v3 = value()
-                    if (label.equals("chara", true) && v2 == null) v2 = value()
-                }
-            }
-        }
-        val encoded = requireNotNull(v3 ?: v2) { "PNG 中没有 SillyTavern 角色卡数据" }
+        val metadata = pngTextFields(bytes, setOf("ccv3", "chara"))
+        val encoded = requireNotNull(metadata["ccv3"] ?: metadata["chara"]) { "PNG 中没有 SillyTavern 角色卡数据" }
         val json = boundedJsonObject(Base64.getMimeDecoder().decode(encoded).decodeToString(), "PNG 角色数据无法读取")
         return CardImport(Card.from(json, id, true), bytes)
+    }
+
+    fun pngTextFields(bytes: ByteArray, labels: Set<String>): Map<String, String> = buildMap {
+        scanPng(bytes) { type, _, offset, size ->
+            if (type != "tEXt") return@scanPng
+            val limit = minOf(offset + size, offset + 80)
+            val separator = (offset until limit).firstOrNull { bytes[it] == 0.toByte() } ?: return@scanPng
+            val label = String(bytes, offset, separator - offset, Charsets.US_ASCII).lowercase()
+            if (label in labels && label !in this) {
+                put(label, String(bytes, separator + 1, offset + size - separator - 1, Charsets.US_ASCII))
+            }
+        }
     }
 
     fun png(card: Card, portrait: ByteArray): ByteArray {
@@ -243,6 +270,14 @@ internal object CardFile {
     }
 }
 
+internal enum class MessageMediaDisplay(val wire: String, val label: String) {
+    LIST("list", "列表"), GALLERY("gallery", "轮播");
+
+    companion object {
+        fun from(value: String?) = entries.firstOrNull { it.wire == value }
+    }
+}
+
 internal data class Message(
     val role: String,
     val name: String,
@@ -268,12 +303,35 @@ internal data class Message(
     val toolTurn: ToolTurn? = null,
     val hidden: Boolean = false,
     val imageCaptions: Map<String, String> = emptyMap(),
+    val replyMetrics: ReplyMetrics? = null,
+    val variantMetrics: List<ReplyMetrics?> = emptyList(),
+    val hiddenReplyPrefix: String? = null,
+    val variantHiddenPrefixes: List<String?> = emptyList(),
+    val replyMedia: StoredReplyMedia? = null,
+    val variantReplyMedia: List<StoredReplyMedia?> = emptyList(),
+    val webReply: StoredWebReply? = null,
+    val variantWebReplies: List<StoredWebReply?> = emptyList(),
+    val replyTokens: ReplyTokenTrace? = null,
+    val variantReplyTokens: List<ReplyTokenTrace?> = emptyList(),
+    val videos: List<ChatVideo> = emptyList(),
+    val openingGreeting: Boolean = false,
+    val mediaDisplay: MessageMediaDisplay? = null,
+    val mediaIndex: Int = 0,
 ) {
     val excludedFromContext get() = hidden || role == "system"
     val requestText get() = wireText ?: text
-    val displayText get() = translation ?: text
-    val displayImages get() = (images + listOfNotNull(drawing?.current)).distinctBy(ChatImage::filename)
-    fun imageAssets() = images + drawing?.images.orEmpty() + drawing?.recipe?.references.orEmpty()
+    val displayText get() = translation ?: text.removePrefix(hiddenReplyPrefix.orEmpty())
+    val compactNarrator by lazy {
+        raw?.let { JSONObject(it).optJSONObject("extra") }?.let {
+            it.string("type") == "narrator" && it.optBoolean("isSmallSys")
+        } == true
+    }
+    val displayImages get() = (images + replyMedia?.images.orEmpty() + listOfNotNull(drawing?.current)).distinctBy(ChatImage::filename)
+    val mediaCount get() = displayImages.size + videos.size
+    fun acceptsEditing(value: String) = value.isNotBlank() || mediaCount > 0 || documents.isNotEmpty()
+    val selectedMediaIndex get() = mediaIndex.coerceIn(0, (mediaCount - 1).coerceAtLeast(0))
+    fun imageAssets() = images + replyMedia?.images.orEmpty() + variantReplyMedia.flatMap { it?.images.orEmpty() } +
+        drawing?.images.orEmpty() + drawing?.recipe?.references.orEmpty()
     fun isBy(card: Card) = characterId?.let { it == card.id } ?: (name == card.name)
     val regexSite by lazy {
         when {
@@ -285,9 +343,23 @@ internal data class Message(
     }
 
     private fun reasoningAt(at: Int): String? = if (at == index) reasoning else variantReasoning.getOrNull(at)
+    fun metricsAt(at: Int): ReplyMetrics? = if (at == index) replyMetrics else variantMetrics.getOrNull(at)
+    fun hiddenPrefixAt(at: Int): String? = if (at == index) hiddenReplyPrefix else variantHiddenPrefixes.getOrNull(at)
+    fun replyMediaAt(at: Int): StoredReplyMedia? = if (at == index) replyMedia else variantReplyMedia.getOrNull(at)
+    fun webReplyAt(at: Int): StoredWebReply? = if (at == index) webReply else variantWebReplies.getOrNull(at)
+    fun replyTokensAt(at: Int): ReplyTokenTrace? = if (at == index) replyTokens else variantReplyTokens.getOrNull(at)
+
+    fun withAvailableReplyImages(contains: (ChatImage) -> Boolean) = copy(
+        replyMedia = replyMedia?.available(contains), variantReplyMedia = variantReplyMedia.map { it?.available(contains) },
+    )
 
     fun select(choice: Int) = copy(text = variants[choice], index = choice, reasoning = reasoningAt(choice),
-        variantReasoning = List(variants.size, ::reasoningAt), translation = null, wireText = null)
+        variantReasoning = List(variants.size, ::reasoningAt), replyMetrics = metricsAt(choice),
+        variantMetrics = List(variants.size, ::metricsAt), translation = null, wireText = null,
+        hiddenReplyPrefix = hiddenPrefixAt(choice), variantHiddenPrefixes = List(variants.size, ::hiddenPrefixAt),
+        replyMedia = replyMediaAt(choice), variantReplyMedia = List(variants.size, ::replyMediaAt),
+        webReply = webReplyAt(choice), variantWebReplies = List(variants.size, ::webReplyAt),
+        replyTokens = replyTokensAt(choice), variantReplyTokens = List(variants.size, ::replyTokensAt), mediaIndex = 0)
 
     fun withReasoning(value: String?) = copy(reasoning = value, variantReasoning = if (variants.isEmpty()) emptyList()
         else List(variants.size) { if (it == index) value else reasoningAt(it) })
@@ -296,14 +368,28 @@ internal data class Message(
         val alternatives = variants.toMutableList()
         if (index in alternatives.indices) alternatives[index] = value
         return if (value == text) copy(variants = alternatives)
-        else copy(text = value, variants = alternatives, translation = null, wireText = null, summary = null)
+        else copy(text = value, variants = alternatives, translation = null, wireText = null, summary = null, openingGreeting = false,
+            replyMetrics = replyMetrics?.copy(bodyTokens = null, counter = ""),
+            replyMedia = replyMedia?.takeIf { it.images.isNotEmpty() }?.copy(gemini = null), webReply = null, replyTokens = null)
     }
 
-    fun withAlternative(value: String, details: String? = null): Message {
+    fun withAlternative(value: String, details: String? = null, metrics: ReplyMetrics? = null,
+                        hiddenPrefix: String? = null, media: StoredReplyMedia? = null,
+                        web: StoredWebReply? = null, tokens: ReplyTokenTrace? = null): Message {
         val alternatives = variants.ifEmpty { listOf(text) } + value
         val prior = if (variants.isEmpty()) listOf(reasoning) else List(variants.size, ::reasoningAt)
+        val previousMetrics = if (variants.isEmpty()) listOf(replyMetrics) else List(variants.size, ::metricsAt)
+        val previousPrefixes = if (variants.isEmpty()) listOf(hiddenReplyPrefix) else List(variants.size, ::hiddenPrefixAt)
+        val previousMedia = if (variants.isEmpty()) listOf(replyMedia) else List(variants.size, ::replyMediaAt)
+        val previousWeb = if (variants.isEmpty()) listOf(webReply) else List(variants.size, ::webReplyAt)
+        val previousTokens = if (variants.isEmpty()) listOf(replyTokens) else List(variants.size, ::replyTokensAt)
         return copy(text = value, variants = alternatives, index = alternatives.lastIndex, reasoning = details,
-            variantReasoning = prior + details, translation = null, wireText = null, summary = null)
+            variantReasoning = prior + details, replyMetrics = metrics, variantMetrics = previousMetrics + metrics,
+            translation = null, wireText = null, summary = null, openingGreeting = false,
+            hiddenReplyPrefix = hiddenPrefix, variantHiddenPrefixes = previousPrefixes + hiddenPrefix,
+            replyMedia = media, variantReplyMedia = previousMedia + media,
+            webReply = web, variantWebReplies = previousWeb + web,
+            replyTokens = tokens, variantReplyTokens = previousTokens + tokens)
     }
 
     fun portable(chats: List<ChatSummary>) = copy(
@@ -317,6 +403,13 @@ internal data class Message(
         put("send_date", date)
         put("mes", requestText)
         val extra = optJSONObject("extra") ?: JSONObject().also { put("extra", it) }
+        if (replyMedia == null) extra.remove("tavern_native_reply_media")
+        else extra.put("tavern_native_reply_media", replyMedia.json())
+        if (webReply == null) extra.remove("tavern_native_web_reply")
+        else extra.put("tavern_native_web_reply", webReply.json())
+        if (replyTokens == null) extra.remove(TOKEN_PROBABILITY_EXTRA)
+        else extra.put(TOKEN_PROBABILITY_EXTRA, replyTokens.json())
+        replyMetrics?.write(this) ?: ReplyMetrics.clear(this)
         if (imageCaptions.isEmpty()) extra.remove("tavern_native_image_captions")
         else extra.put("tavern_native_image_captions", JSONObject(imageCaptions))
         if (hidden) extra.put("tavern_native_hidden_role", role) else extra.remove("tavern_native_hidden_role")
@@ -332,11 +425,18 @@ internal data class Message(
         }
         if (images.isEmpty()) extra.remove("tavern_native_images")
         else extra.put("tavern_native_images", JSONArray(images.map(ChatImage::json)))
+        if (videos.isEmpty()) extra.remove("tavern_native_videos")
+        else extra.put("tavern_native_videos", JSONArray(videos.map(ChatVideo::json)))
+        if (mediaDisplay == null) extra.remove("media_display") else extra.put("media_display", mediaDisplay.wire)
+        if (mediaIndex != 0 || extra.has("media_index")) extra.put("media_index", selectedMediaIndex)
+        if (openingGreeting) extra.put("tavern_native_opening_greeting", true) else extra.remove("tavern_native_opening_greeting")
         if (documents.isEmpty()) extra.remove("tavern_native_documents")
         else extra.put("tavern_native_documents", JSONArray(documents.map(ChatDocument::json)))
         if (drawing == null) extra.remove("tavern_native_drawing") else extra.put("tavern_native_drawing", drawing.json())
         toolTurn?.store(extra)
         if (reasoning == null) extra.remove("reasoning") else extra.put("reasoning", reasoning)
+        if (hiddenReplyPrefix == null) extra.remove("tavern_native_reply_prefix")
+        else extra.put("tavern_native_reply_prefix", hiddenReplyPrefix)
         if (characterId == null) extra.remove("tavern_native_character") else extra.put("tavern_native_character", characterId)
         if (personaId == null) extra.remove("tavern_native_persona") else extra.put("tavern_native_persona", personaId)
         if (groupTurnId == null) extra.remove("gen_id")
@@ -362,13 +462,31 @@ internal data class Message(
             put("swipes", JSONArray(variants))
             put("swipe_id", index)
             val saved = optJSONArray("swipe_info")
-            if (saved != null || reasoning != null || variantReasoning.any { it != null }) {
+            if (saved != null || reasoning != null || variantReasoning.any { it != null } ||
+                replyMetrics != null || variantMetrics.any { it != null } ||
+                hiddenReplyPrefix != null || variantHiddenPrefixes.any { it != null } ||
+                replyMedia != null || variantReplyMedia.any { it != null } ||
+                webReply != null || variantWebReplies.any { it != null } ||
+                replyTokens != null || variantReplyTokens.any { it != null }) {
                 val info = JSONArray()
                 variants.indices.forEach { at ->
                     val row = saved?.optJSONObject(at) ?: JSONObject().put("send_date", date)
                     val detail = row.optJSONObject("extra") ?: JSONObject().also { row.put("extra", it) }
                     val value = reasoningAt(at)
                     if (value == null) detail.remove("reasoning") else detail.put("reasoning", value)
+                    val prefix = hiddenPrefixAt(at)
+                    if (prefix == null) detail.remove("tavern_native_reply_prefix")
+                    else detail.put("tavern_native_reply_prefix", prefix)
+                    val media = replyMediaAt(at)
+                    if (media == null) detail.remove("tavern_native_reply_media")
+                    else detail.put("tavern_native_reply_media", media.json())
+                    val web = webReplyAt(at)
+                    if (web == null) detail.remove("tavern_native_web_reply")
+                    else detail.put("tavern_native_web_reply", web.json())
+                    val tokens = replyTokensAt(at)
+                    if (tokens == null) detail.remove(TOKEN_PROBABILITY_EXTRA)
+                    else detail.put(TOKEN_PROBABILITY_EXTRA, tokens.json())
+                    metricsAt(at)?.write(row) ?: ReplyMetrics.clear(row)
                     info.put(row)
                 }
                 put("swipe_info", info)
@@ -398,6 +516,11 @@ internal data class Message(
             val nativeOriginal = extra?.opt("tavern_native_original_input") as? String
             val modelText = row.string("mes")
             val original = nativeOriginal ?: modelText
+            fun readHiddenPrefix(data: JSONObject?): String? = data?.string("tavern_native_reply_prefix")
+                ?.takeIf { it.isNotEmpty() && it.length <= REPLY_PREFIX_LIMIT }
+            fun readMedia(data: JSONObject?) = StoredReplyMedia.read(data?.optJSONObject("tavern_native_reply_media"))
+            fun readWeb(data: JSONObject?) = StoredWebReply.read(data?.optJSONObject("tavern_native_web_reply"))
+            fun readTokens(data: JSONObject?) = ReplyTokenTrace.from(data?.optJSONObject(TOKEN_PROBABILITY_EXTRA))
             return Message(role, row.string("name"), original,
                 row.string("send_date").ifBlank { Instant.now().toString() }, variants, index, row.toString(),
                 extra?.string("tavern_native_character")?.takeIf(String::isNotBlank),
@@ -416,7 +539,21 @@ internal data class Message(
                 DrawnImageSeries.from(extra?.optJSONObject("tavern_native_drawing")),
                 ToolTurn.from(extra).takeIf { role == "system" },
                 row.optBoolean("is_system") && (role != "system" || hiddenRole != null),
-                readImageCaptions(extra?.optJSONObject("tavern_native_image_captions")))
+                readImageCaptions(extra?.optJSONObject("tavern_native_image_captions")),
+                ReplyMetrics.from(row) ?: ReplyMetrics.from(swipeInfo?.optJSONObject(index)),
+                variants.indices.map { ReplyMetrics.from(swipeInfo?.optJSONObject(it)) },
+                readHiddenPrefix(extra) ?: readHiddenPrefix(swipeInfo?.optJSONObject(index)?.optJSONObject("extra")),
+                variants.indices.map { readHiddenPrefix(swipeInfo?.optJSONObject(it)?.optJSONObject("extra")) },
+                readMedia(extra) ?: readMedia(swipeInfo?.optJSONObject(index)?.optJSONObject("extra")),
+                variants.indices.map { readMedia(swipeInfo?.optJSONObject(it)?.optJSONObject("extra")) },
+                readWeb(extra) ?: readWeb(swipeInfo?.optJSONObject(index)?.optJSONObject("extra")),
+                variants.indices.map { readWeb(swipeInfo?.optJSONObject(it)?.optJSONObject("extra")) },
+                readTokens(extra) ?: readTokens(swipeInfo?.optJSONObject(index)?.optJSONObject("extra")),
+                variants.indices.map { readTokens(swipeInfo?.optJSONObject(it)?.optJSONObject("extra")) },
+                extra?.optJSONArray("tavern_native_videos")?.objects().orEmpty().take(MAX_VIDEOS_PER_MESSAGE).mapNotNull(ChatVideo::from),
+                role == "assistant" && extra?.optBoolean("tavern_native_opening_greeting") == true,
+                MessageMediaDisplay.from(extra?.string("media_display")),
+                extra?.optInt("media_index")?.coerceAtLeast(0) ?: 0)
         }
     }
 }
@@ -492,17 +629,29 @@ internal data class Preferences(
     val vectors: VectorPreferences = VectorPreferences(),
     val drawing: DrawingSettings = DrawingSettings(),
     val toolCalling: Boolean = false,
+    val requestTokenProbabilities: Boolean = false,
     val visualNovel: Boolean = false,
     val welcome: WelcomePreferences = WelcomePreferences(),
     val captions: CaptionSettings = CaptionSettings(),
     val translationServices: TranslationServices = TranslationServices(),
+    val summaryExtras: SummaryExtrasSettings = SummaryExtrasSettings(),
     val library: LibraryPreferences = LibraryPreferences(),
+    val characterLibrary: CharacterLibraryOptions = CharacterLibraryOptions(),
     val replyAutomation: ReplyAutomation = ReplyAutomation(),
+    val backgrounds: BackgroundLibrary = BackgroundLibrary(),
     val chatAppearance: ChatAppearance = ChatAppearance(),
+    val chatThemes: ChatThemes = ChatThemes(),
+    val swipeGestures: Boolean = false,
+    val showGroupQueue: Boolean = false,
+    val chatHandling: ChatHandling = ChatHandling(),
     val connectionProfiles: List<ConnectionProfile> = emptyList(),
     val activeProfileId: String? = null,
     val sync: app.tavern.nativeclient.backup.SyncSettings = app.tavern.nativeclient.backup.SyncSettings(),
     val cardScriptsEnabled: Boolean = false,
+    val textSystem: TextSystemSettings = TextSystemSettings(),
+    val customStops: CustomStoppingStrings = CustomStoppingStrings(),
+    val replyFormatting: ReplyFormatting = ReplyFormatting(),
+    val exampleBudget: ExampleBudget = ExampleBudget.AVAILABLE_SPACE,
 ) {
     fun personaFor(chat: Chat? = null, subjectId: String? = chat?.cardId ?: chat?.groupId,
                    temporaryId: String? = null): PersonaProfile =

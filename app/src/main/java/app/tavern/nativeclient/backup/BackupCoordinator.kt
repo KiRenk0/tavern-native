@@ -13,6 +13,68 @@ import java.io.File
 
 internal class BackupCoordinator(private val host: CoordinatorHost) {
     private var server: TavernServer? = null
+    private val snapshots = SettingsSnapshotStore(File(host.app.noBackupFilesDir, "settings-snapshots"))
+
+    suspend fun settingsSnapshots() = withContext(Dispatchers.IO) { snapshots.list() }
+
+    fun createSettingsSnapshot(name: String) = host.work {
+        val prefs = host.current.prefs
+        withContext(Dispatchers.IO) { snapshots.insert(host.store.captureSettingsSnapshot(name, prefs)) }
+        host.notice("已保存设置快照")
+    }
+
+    fun renameSettingsSnapshot(id: String, name: String) = host.work {
+        withContext(Dispatchers.IO) { snapshots.rename(id, name) }
+        host.notice("已重命名设置快照")
+    }
+
+    fun deleteSettingsSnapshot(id: String) = host.work {
+        withContext(Dispatchers.IO) { snapshots.delete(id) }
+        host.notice("已删除设置快照")
+    }
+
+    fun importSettingsSnapshot(uri: Uri) = host.work {
+        val prefs = host.current.prefs
+        withContext(Dispatchers.IO) {
+            val bytes = requireNotNull(host.resolver.openInputStream(uri)) { "无法打开设置快照" }
+                .use { it.readLimited(SETTINGS_SNAPSHOT_LIMIT) }
+            snapshots.insert(SettingsSnapshot.import(bytes, host.app.documentName(uri), prefs))
+        }
+        host.notice("已导入到快照列表，可以选择恢复")
+    }
+
+    fun exportSettingsSnapshot(id: String, uri: Uri) = host.work {
+        withContext(Dispatchers.IO) { host.writeUri(uri, snapshots.read(id).portableBytes()) }
+        host.notice("已导出设置快照")
+    }
+
+    fun restoreSettingsSnapshot(id: String) = host.work {
+        host.generation.stopAuto()
+        val current = host.current.prefs
+        val next = withContext(Dispatchers.IO) {
+            val snapshot = snapshots.read(id)
+            val restored = ModelService.validated(host.store.preferencesFromSnapshot(snapshot, current))
+            val entries = restored.backgrounds.items.filter { host.savedImages.file(it.image).isFile }
+            val selected = restored.backgrounds.selectedId?.takeIf { id -> entries.any { it.image.id == id } }
+            val avatars = restored.personas.map { profile ->
+                profile.copy(avatar = profile.avatar?.takeIf { host.store.personaAvatar(it).isFile })
+            }
+            val ready = restored.copy(personas = avatars, backgrounds = restored.backgrounds.copy(items = entries, selectedId = selected))
+            if (ready != current) {
+                snapshots.insert(host.store.captureSettingsSnapshot("还原前 · ${snapshot.name}", current))
+            }
+            ready
+        }
+        if (next != current) {
+            host.persistPreferences(next)
+            clearRemote()
+            host.mutable.update { it.copy(catalog = null) }
+            host.refreshRecentChats()
+            host.notice("已恢复设置。还原前的配置已保存为快照。")
+        } else {
+            host.notice("当前设置已与此快照一致")
+        }
+    }
 
     fun importEmbedded() = host.work {
         val message = withContext(Dispatchers.IO) {
@@ -31,7 +93,8 @@ internal class BackupCoordinator(private val host: CoordinatorHost) {
                 requireNotNull(host.resolver.openInputStream(uri)) { "无法打开备份 ZIP" }.use { input ->
                     readOriginalBackup(input, host.app.cacheDir, filename, { context.ensureActive() }) { account, source ->
                         host.mutable.update { it.copy(utility = "正在导入账户 $account…") }
-                        EmbeddedLibrary(source, host.savedDocuments, host.savedImages, account).import(host.store) { context.ensureActive() }
+                        EmbeddedLibrary(source, host.savedDocuments, host.savedImages, account, host.savedVideos)
+                            .import(host.store) { context.ensureActive() }
                     }
                 }
             }
@@ -47,7 +110,7 @@ internal class BackupCoordinator(private val host: CoordinatorHost) {
             val archive = File.createTempFile("tavern-backup-", ".zip", host.app.cacheDir)
             try {
                 val exported = archive.outputStream().buffered().use { output ->
-                    writeOriginalBackup(output, host.store, host.savedDocuments, host.savedImages) { context.ensureActive() }
+                    writeOriginalBackup(output, host.store, host.savedDocuments, host.savedImages, host.savedVideos) { context.ensureActive() }
                 }
                 context.ensureActive()
                 withContext(NonCancellable) {

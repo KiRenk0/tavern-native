@@ -111,7 +111,8 @@ internal data class QuickReplies(
 }
 
 internal data class ScriptDialog(val id: String = newId(), val kind: String, val title: String,
-                                 val text: String, val buttons: List<String> = emptyList(), val initial: String = "")
+                                 val text: String, val buttons: List<String> = emptyList(), val initial: String = "",
+                                 val card: Card? = null, val avatarBytes: ByteArray? = null)
 
 internal fun JSONObject?.variableStrings(): Map<String, String> = this?.let { value ->
     value.keys().asSequence().filterNot(value::isNull).associateWith(value::string)

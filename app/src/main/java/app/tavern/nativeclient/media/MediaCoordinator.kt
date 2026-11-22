@@ -1,5 +1,7 @@
 package app.tavern.nativeclient.media
 
+import android.media.AudioAttributes
+import android.media.MediaPlayer
 import android.net.Uri
 import app.tavern.nativeclient.*
 import kotlinx.coroutines.CancellationException
@@ -26,6 +28,7 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
     private var narrationJob: Job? = null
     private var narrationOwner: QueuedNarration? = null
     private var voiceForeground = true
+    private var replySoundPlayer: MediaPlayer? = null
     private var imageJob: Job? = null
     private val expressionCache = linkedMapOf<ExpressionInference, String>()
 
@@ -37,6 +40,7 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
 
     fun close() {
         stopNarration()
+        closeReplySound()
         if (speechPlayer.isInitialized()) speechPlayer.value.close()
     }
 
@@ -45,12 +49,41 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
         if (!visible) stopNarration()
     }
 
+    fun playReplySound(preview: Boolean = false) {
+        val settings = host.current.prefs.chatHandling
+        if (!preview && (!settings.replySound || settings.replySoundInBackgroundOnly && voiceForeground)) return
+        closeReplySound()
+        try {
+            val attributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            val player = checkNotNull(MediaPlayer.create(host.app, R.raw.message_sound, attributes, 0))
+            replySoundPlayer = player
+            player.setVolume(0.8f, 0.8f)
+            player.setOnCompletionListener { if (replySoundPlayer === it) closeReplySound() }
+            player.setOnErrorListener { failed, _, _ ->
+                if (replySoundPlayer === failed) closeReplySound()
+                if (preview) host.notice("无法播放提示音")
+                true
+            }
+            player.start()
+        } catch (_: Exception) {
+            closeReplySound()
+            if (preview) host.notice("无法播放提示音")
+        }
+    }
+
+    private fun closeReplySound() {
+        replySoundPlayer?.release()
+        replySoundPlayer = null
+    }
+
     fun saveVoice(options: VoicePreferences, done: () -> Unit) = host.work {
         when (options.activeBackend) {
             TtsBackend.SYSTEM -> Unit
             TtsBackend.OPENAI_COMPAT -> {
-                require(options.backendId.isNotBlank() &&
-                    host.current.prefs.providers.any { it.id == options.backendId && it.template == null }) {
+                require(options.speechProvider(host.current.prefs.providers) != null) {
                     "请选择已保存的自定义语音服务"
                 }
                 require(options.backendModel.isNotBlank() && options.backendVoice.isNotBlank()) {
@@ -72,6 +105,18 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
                 require(options.ttsEndpoint.isNotBlank()) { "请填写 GPT-SoVITS 服务地址" }
                 checkedAddress(options.ttsEndpoint)
                 require(options.gptSovitsRefAudio.isNotBlank()) { "请填写 GPT-SoVITS 参考音频路径" }
+            }
+            TtsBackend.GEMINI_NATIVE, TtsBackend.NOVELAI -> {
+                require(options.speechProvider(host.current.prefs.providers) != null) {
+                    "请选择已配置 Key 的 ${options.activeBackend.label} 连接"
+                }
+                require(options.defaultVoice.isNotBlank()) { "请选择默认音色" }
+                if (options.activeBackend == TtsBackend.GEMINI_NATIVE) checkedGeminiTtsModel(options.geminiTtsModel)
+            }
+            TtsBackend.VITS, TtsBackend.STYLE_BERT_VITS2, TtsBackend.XTTS, TtsBackend.SILERO, TtsBackend.COSYVOICE -> {
+                options.selfHostedSpeechRoot()
+                options.checkSelfHostedVoice()
+                options.readSpeechParameters()
             }
         }
         if (options.sttBackend == SttBackend.WHISPER_API) {
@@ -108,8 +153,8 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
     private fun enqueueSpeech(text: String, chatId: String?, options: VoicePreferences, voice: String, replace: Boolean) {
         if (!voiceForeground || text.isBlank()) return
         if (chatId != null && chatId != host.current.chat?.id) return
-        val backend = if (options.activeBackend != TtsBackend.OPENAI_COMPAT) null else {
-            host.current.prefs.providers.firstOrNull { it.id == options.backendId && it.template == null }
+        val backend = if (!options.activeBackend.usesProvider) null else {
+            options.speechProvider(host.current.prefs.providers)
                 ?: return host.notice("请重新选择朗读使用的语音服务")
         }
         if (replace) stopNarration()
@@ -174,13 +219,17 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
         enqueueSpeech(text, chat.id, options, options.actorVoice(key), replace = false)
     }
 
-    fun attachImages(chatId: String, documents: List<Uri>, ready: ((ChatImage) -> Unit)? = null) {
+    fun attachImages(chatId: String, documents: List<Uri>, ready: ((ChatImage) -> Unit)? = null, messageIndex: Int? = null) {
         if (host.current.chat?.id != chatId || documents.isEmpty()) return
-        val existing = host.current.draftImages[chatId].orEmpty()
         host.work {
+            val chat = host.current.chat?.takeIf { it.id == chatId } ?: return@work
+            val message = messageIndex?.let { chat.messages.getOrNull(it) ?: return@work }
+            if (message != null) host.generation.stopAuto()
+            val existing = message?.images ?: host.current.draftImages[chatId].orEmpty()
+            val slots = (MAX_CHAT_IMAGES - existing.size).coerceAtLeast(0)
             var lastFailure: String? = null
             val imported = withContext(Dispatchers.IO) {
-                documents.take((MAX_CHAT_IMAGES - existing.size).coerceAtLeast(0)).mapNotNull { uri ->
+                documents.take(slots).mapNotNull { uri ->
                     val name = host.app.documentName(uri).takeUnless { it == "导入的聊天" } ?: "图片"
                     try {
                         importCaptionableImage(uri, name)
@@ -192,10 +241,15 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
                     }
                 }
             }
-            host.mutable.update { it.copy(draftImages = it.draftImages + (chatId to (existing + imported).distinctBy(ChatImage::id))) }
+            val attachments = (existing + imported).distinctBy(ChatImage::id)
+            if (message != null) {
+                if (attachments != existing) host.chats.updateMessage(chat, messageIndex, message.copy(images = attachments, mediaIndex = 0))
+            } else {
+                host.mutable.update { it.copy(draftImages = it.draftImages + (chatId to attachments)) }
+            }
             imported.singleOrNull()?.let { ready?.invoke(it) }
             lastFailure?.let(host::notice)
-            if (lastFailure == null && documents.size > MAX_CHAT_IMAGES - existing.size) host.notice("每条消息最多附带 $MAX_CHAT_IMAGES 张图片")
+            if (lastFailure == null && documents.size > slots) host.notice("每条消息最多附带 $MAX_CHAT_IMAGES 张图片")
         }
     }
 
@@ -251,6 +305,10 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
         val bytes = withContext(Dispatchers.IO) { checkNotNull(host.imageStore.bytes(image)) { "找不到图片文件" } }
         return when (settings.source) {
             CaptionSource.LOCAL -> withContext(Dispatchers.Default) { host.localCaptioner.caption(bytes) }
+            CaptionSource.HORDE -> {
+                val provider = checkNotNull(settings.hordeProvider(host.current.prefs)) { "请先配置 AI Horde 提供商" }
+                Horde(provider).caption(image.dataUrl(bytes))
+            }
             CaptionSource.MULTIMODAL -> {
                 val connection = checkNotNull(settings.connection(host.current.prefs, host.current.chat)) { "请先配置图片描述模型" }
                 try {
@@ -352,6 +410,70 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
         host.notice("图片已保存")
     }
 
+    fun exportVideo(uri: Uri, video: ChatVideo) = host.work {
+        withContext(Dispatchers.IO) {
+            requireNotNull(host.videoStore.input(video)) { "视频文件不可用" }.use { input ->
+                requireNotNull(host.resolver.openOutputStream(uri, "wt")) { "无法写入所选文件" }.use { out ->
+                    check(copyVideo(input, out, video.byteCount) == video.byteCount) { "视频文件大小已变化" }
+                }
+            }
+        }
+        host.notice("视频已保存")
+    }
+
+    fun importVideo(chatId: String, uri: Uri, messageIndex: Int? = null) = host.utilityWork("正在导入视频…") {
+        val chat = host.current.chat?.takeIf { it.id == chatId } ?: return@utilityWork
+        val message = messageIndex?.let { chat.messages.getOrNull(it) ?: return@utilityWork }
+        require(message == null || message.videos.size < MAX_VIDEOS_PER_MESSAGE) { "每条消息最多附带 $MAX_VIDEOS_PER_MESSAGE 段视频" }
+        val store = host.videoStore
+        val video = withContext(Dispatchers.IO) {
+            val name = host.app.documentName(uri)
+            val context = currentCoroutineContext()
+            requireNotNull(host.resolver.openInputStream(uri)) { "无法打开视频文件" }.use { store.import(it, name) { context.ensureActive() } }
+        }
+        if (message != null) {
+            if (message.videos.none { it.id == video.id }) {
+                host.chats.updateMessage(chat, messageIndex, message.copy(videos = message.videos + video))
+            }
+        } else appendVideo(chat, video, "附件视频")
+    }
+
+    fun removeMessageMedia(chatId: String, index: Int, filename: String? = null) = host.work {
+        val chat = host.current.chat?.takeIf { it.id == chatId } ?: return@work
+        val message = chat.messages.getOrNull(index) ?: return@work
+        host.generation.stopAuto()
+        host.chats.updateMessage(chat, index, message.withoutDisplayedMedia(filename))
+    }
+
+    fun setMessageMedia(chatId: String, index: Int, display: MessageMediaDisplay? = null, selected: Int? = null) = host.work {
+        val chat = host.current.chat?.takeIf { it.id == chatId } ?: return@work
+        val message = chat.messages.getOrNull(index) ?: return@work
+        if (message.mediaCount < 2) return@work
+        val target = (selected ?: message.selectedMediaIndex).coerceIn(0, message.mediaCount - 1)
+        host.chats.updateMessage(chat, index, message.copy(mediaDisplay = display ?: message.mediaDisplay, mediaIndex = target))
+    }
+
+    fun generateVideo(chatId: String, request: VideoRequest): Boolean = launchDrawing(chatId, video = true) { chat ->
+        val profile = request.profile.copy(providerId = request.provider.id)
+        val store = host.videoStore
+        val referenceStore = host.imageStore
+        val video = withContext(Dispatchers.IO) {
+            val context = currentCoroutineContext()
+            GeminiVideoService().generate(request, referenceStore::bytes, progress = { label ->
+                host.mutable.update { it.copy(utility = label) }
+            }) { input -> store.import(input, "Gemini 视频 ${profile.seconds} 秒.mp4") { context.ensureActive() } }
+        }
+        val prefs = host.current.prefs
+        host.persistPreferences(prefs.copy(drawing = prefs.drawing.copy(video = profile)))
+        appendVideo(chat, video, "视频生成")
+    }
+
+    private suspend fun appendVideo(chat: Chat, video: ChatVideo, name: String) {
+        val current = host.current.chat?.takeIf { it.id == chat.id } ?: return
+        val message = Message("system", name, "", videos = listOf(video))
+        host.persist(current.copy(messages = current.messages + message, updated = System.currentTimeMillis()))
+    }
+
     fun generateImage(chatId: String, request: ImageRequest, mode: DrawingMode, target: Int?, remember: Boolean): Boolean =
         launchDrawing(chatId) { chat ->
             val settings = host.current.prefs.drawing
@@ -434,6 +556,12 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
 
     fun loadComfyOptions(provider: Provider, done: (ComfyCatalog) -> Unit) = host.utilityWork("正在读取 ComfyUI 参数…") {
         done(ComfyService().catalog(provider))
+    }
+
+    fun loadHordeImageModels(provider: Provider, done: (List<String>) -> Unit) = host.utilityWork("正在读取 AI Horde 图像模型…") {
+        val models = Horde(provider).imageModels()
+        if (models.isEmpty()) host.notice("AI Horde 当前没有在线绘图模型")
+        done(models)
     }
 
     fun showImageGallery() = host.work { loadImageGallery() }
@@ -647,7 +775,7 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
 
     fun setDrawingBackground(chatId: String, image: ChatImage) = host.work {
         val chat = host.current.chat?.takeIf { it.id == chatId } ?: return@work
-        require(host.imageStore.file(image).isFile) { "找不到图库中的图片" }
+        require(backgroundFile(image).isFile) { "找不到背景图片" }
         host.persist(chat.copy(options = chat.options.copy(background = image)))
         closeImageGallery()
         host.notice("已应用对话背景")
@@ -664,6 +792,67 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
         }
         host.persist(chat.copy(options = chat.options.copy(background = image)))
         host.notice("已应用对话背景")
+    }
+
+    fun backgroundFile(image: ChatImage) = host.imageStore.file(image).takeIf { it.isFile } ?: host.savedImages.file(image)
+
+    fun importBackgrounds(uris: List<Uri>) = host.utilityWork("正在导入背景图片…") {
+        val (added, failures) = withContext(Dispatchers.IO) {
+            val context = currentCoroutineContext()
+            var failures = 0
+            val entries = uris.distinct().mapNotNull { uri ->
+                context.ensureActive()
+                try {
+                    val name = host.app.documentName(uri).takeUnless { it == "导入的聊天" } ?: "背景图片"
+                    val image = requireNotNull(host.resolver.openInputStream(uri)) { "无法打开背景图片" }.use {
+                        host.savedImages.import(it.readLimited(MAX_IMAGE_SOURCE), name)
+                    }
+                    BackgroundEntry(image)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    failures++
+                    null
+                }
+            }
+            entries to failures
+        }
+        val prefs = host.current.prefs
+        val library = prefs.backgrounds.add(added)
+        if (library != prefs.backgrounds) host.persistPreferences(prefs.copy(backgrounds = library))
+        val failed = if (failures == 0) "" else "，$failures 张无法读取"
+        host.notice("已加入 ${library.items.size - prefs.backgrounds.items.size} 张背景$failed")
+    }
+
+    fun addLibraryBackground(image: ChatImage) = host.work {
+        val prefs = host.current.prefs
+        val existing = prefs.backgrounds.items.any { it.image.id == image.id }
+        if (existing) return@work
+        withContext(Dispatchers.IO) {
+            if (!host.savedImages.file(image).isFile) {
+                val bytes = requireNotNull(host.imageStore.bytes(image)) { "找不到背景图片" }
+                host.savedImages.restore(image, bytes)
+            }
+        }
+        host.persistPreferences(prefs.copy(backgrounds = prefs.backgrounds.add(listOf(BackgroundEntry(image)))))
+        host.notice("已加入背景库")
+    }
+
+    fun selectLibraryBackground(id: String?) = changeBackgroundLibrary {
+        require(id == null || items.any { it.image.id == id }) { "找不到这张背景" }
+        copy(selectedId = id)
+    }
+
+    fun renameLibraryBackground(id: String, name: String) = changeBackgroundLibrary { renamed(id, name) }
+
+    fun removeLibraryBackground(id: String) = changeBackgroundLibrary { remove(id) }
+
+    fun setBackgroundFit(fit: BackgroundFit) = changeBackgroundLibrary { copy(fit = fit) }
+
+    private fun changeBackgroundLibrary(update: BackgroundLibrary.() -> BackgroundLibrary) = host.work {
+        val prefs = host.current.prefs
+        val library = prefs.backgrounds.update()
+        if (library != prefs.backgrounds) host.persistPreferences(prefs.copy(backgrounds = library))
     }
 
     fun previousDrawing(chatId: String, index: Int) = host.work {
@@ -688,21 +877,21 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
         }
     }
 
-    internal fun launchDrawing(chatId: String, action: suspend (Chat) -> Unit): Boolean {
+    internal fun launchDrawing(chatId: String, video: Boolean = false, action: suspend (Chat) -> Unit): Boolean {
         val chat = host.current.chat?.takeIf { it.id == chatId } ?: return false
         if (host.current.busy || host.current.generation != null || host.current.scriptRunning) return false
         host.generation.stopAuto()
-        host.mutable.update { it.copy(busy = true, generatingImage = true) }
+        host.mutable.update { it.copy(busy = true, generatingImage = true, utility = if (video) "正在准备视频请求…" else it.utility) }
         val job = host.scope.launch(start = CoroutineStart.LAZY) {
             try {
                 action(chat)
             } catch (e: CancellationException) {
-                host.notice("已停止图像生成")
+                host.notice(if (video) "已停止等待视频" else "已停止图像生成")
                 throw e
             } catch (e: Exception) {
-                host.notice(e.localizedMessage ?: "图像生成失败，请重试")
+                host.notice(e.localizedMessage ?: if (video) "视频生成失败，请重试" else "图像生成失败，请重试")
             } finally {
-                host.mutable.update { it.copy(busy = false, generatingImage = false) }
+                host.mutable.update { it.copy(busy = false, generatingImage = false, utility = it.utility.takeUnless { video }) }
                 imageJob = null
             }
         }

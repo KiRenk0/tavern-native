@@ -8,8 +8,9 @@ import app.tavern.nativeclient.LorePosition
 import app.tavern.nativeclient.Preferences
 import app.tavern.nativeclient.TavernState
 import app.tavern.nativeclient.WorldBook
-import app.tavern.nativeclient.estimatedTokens
 import app.tavern.nativeclient.jsonOf
+import app.tavern.nativeclient.nextEntryId
+import app.tavern.nativeclient.saveEditedEntry
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -26,7 +27,15 @@ internal object ScriptExtensions {
         saveBook: suspend (WorldBook) -> Unit = { error("当前脚本环境不支持修改世界书") },
         clearVariables: suspend (Boolean) -> Unit = {},
         galleryImages: suspend (Chat) -> List<GalleryImage> = { state.imageGallery?.items.orEmpty() },
+        updateWorldActivation: suspend (List<WorldBook>) -> Unit = { error("当前脚本环境不支持切换全局世界书") },
+        createBoundBook: suspend (WorldBook, ScriptWorldBinding) -> Unit = { _, _ -> error("当前脚本环境不支持创建关联世界书") },
+        notice: (String) -> Unit = {},
     ): String? = when (name) {
+        "world", "getchatbook", "getchatlore", "getchatwi", "getglobalbooks", "getgloballore", "getglobalwi",
+        "getpersonabook", "getpersonalore", "getpersonawi", "getcharbook", "getcharlore", "getcharwi" ->
+            worldBookCommand(name, named, text, state, updateWorldActivation, createBoundBook, notice)
+        "findentry", "findlore", "findwi", "getentryfield", "getlorefield", "getwifield", "setentryfield", "setlorefield", "setwifield",
+        "createentry", "createlore", "createwi" -> worldEntryCommand(name, named, text, state, resolveBook(state, named["file"]), saveBook)
         "wi-get-book", "world-get" -> getBook(state, named, text, includeEntries = true)
         "wi-list-entries" -> listEntries(state, named, text)
         "wi-get-entry" -> getEntry(state, named, text)
@@ -34,17 +43,18 @@ internal object ScriptExtensions {
         "wi-create-entry" -> createEntry(state, named, text, saveBook)
         "wi-delete-entry" -> deleteEntry(state, named, text, saveBook)
         "preset" -> switchPreset(state, text, saveChat)
-        "bg" -> switchBackground(state, named, text, saveChat, galleryImages)
-        "char-get" -> readCharacterField(state, named, text)
+        "bg" -> switchBackground(state, named, text, saveChat, savePrefs, galleryImages)
+        "lockbg", "unlockbg" -> {
+            val chat = requireNotNull(state.chat) { "请先打开对话" }
+            val image = if (name == "lockbg") state.prefs.backgrounds.effective(chat) else null
+            if (chat.options.background != image) saveChat(chat.copy(options = chat.options.copy(background = image)))
+            image?.filename.orEmpty()
+        }
         "listvar" -> listVariables(state, named, text)
         "flushvar" -> "".also { clearVariables(false) }
         "flushglobalvar" -> "".also { clearVariables(true) }
         "re-replace" -> regexReplace(named, text)
-        "trimtokens" -> trimTokens(named, text)
-        else -> {
-            // Avoid unused parameter warning while keeping extension signature uniform
-            savePrefs.let { null }
-        }
+        else -> null
     }
 
     private fun resolveBook(state: TavernState, query: String?): WorldBook {
@@ -69,7 +79,7 @@ internal object ScriptExtensions {
             "id" to book.id,
             "name" to book.name,
             "enabled" to book.enabled,
-            "scanDepth" to book.scanDepth,
+            "scanDepth" to (book.scanDepthOverride ?: state.prefs.loreSettings.scanDepth),
             "entryCount" to book.entries.size,
             "entries" to if (includeEntries) JSONArray(book.entries.map(LoreEntry::json)) else JSONArray(),
         ).toString()
@@ -128,7 +138,7 @@ internal object ScriptExtensions {
             "content" -> existing.copy(content = value)
             "comment", "title" -> existing.copy(title = value)
             "key", "keys" -> existing.copy(keywords = splitKeys(value))
-            "secondary", "keysecondary" -> existing.copy(secondary = splitKeys(value))
+            "secondary", "keysecondary" -> splitKeys(value).let { existing.copy(secondary = it, selective = it.isNotEmpty()) }
             "disable", "disabled" -> existing.copy(disabled = parseBool(value))
             "constant" -> existing.copy(constant = parseBool(value))
             "order", "priority" -> existing.copy(priority = value.trim().toIntOrNull() ?: error("无效 order 数值 $value"))
@@ -158,7 +168,7 @@ internal object ScriptExtensions {
         saveBook: suspend (WorldBook) -> Unit,
     ): String {
         val book = resolveBook(state, named["book"])
-        val newUid = (book.entries.maxOfOrNull(LoreEntry::id) ?: -1) + 1
+        val newUid = book.nextEntryId()
         val created = LoreEntry(
             id = newUid,
             title = named["comment"] ?: named["title"].orEmpty(),
@@ -170,7 +180,7 @@ internal object ScriptExtensions {
             priority = named["order"]?.trim()?.toIntOrNull() ?: 100,
             depth = named["depth"]?.trim()?.toIntOrNull()?.coerceIn(0, 80) ?: 4,
         )
-        saveBook(book.withEntries(book.entries + created))
+        saveBook(book.saveEditedEntry(created))
         return newUid.toString()
     }
 
@@ -207,49 +217,30 @@ internal object ScriptExtensions {
         named: Map<String, String>,
         text: String,
         saveChat: suspend (Chat) -> Unit,
+        savePrefs: suspend (Preferences) -> Unit,
         galleryImages: suspend (Chat) -> List<GalleryImage>,
     ): String {
         val chat = requireNotNull(state.chat) { "请先打开对话" }
         val query = (named["file"] ?: text).trim()
-        if (query.isEmpty()) return chat.options.background?.filename.orEmpty()
+        val library = state.prefs.backgrounds
+        if (query.isEmpty()) return library.effective(chat)?.filename.orEmpty()
         if (query.equals("clear", true) || query.equals("none", true) || query == "无") {
             saveChat(chat.copy(options = chat.options.copy(background = null)))
             return ""
+        }
+        library.find(query)?.image?.let { selected ->
+            if (chat.options.background != null) saveChat(chat.copy(options = chat.options.copy(background = selected)))
+            else savePrefs(state.prefs.copy(backgrounds = library.copy(selectedId = selected.id)))
+            return selected.filename
         }
         val gallery = galleryImages(chat)
         val matched = gallery.firstOrNull {
             it.image.filename.equals(query, true) || it.image.id == query || it.prompt.contains(query, true)
         }?.image ?: chat.messages.flatMap { it.displayImages }.firstOrNull {
             it.filename.equals(query, true) || it.id == query
-        } ?: error("在当前图库与消息图片中找不到背景 $query")
+        } ?: error("在背景库、图库与消息图片中找不到背景 $query")
         saveChat(chat.copy(options = chat.options.copy(background = matched)))
         return matched.filename
-    }
-
-    private fun readCharacterField(state: TavernState, named: Map<String, String>, text: String): String {
-        val explicitCard = named["name"]?.trim()?.takeIf(String::isNotEmpty)?.let { name ->
-            state.cards.firstOrNull { it.name.equals(name, ignoreCase = true) }
-                ?: error("找不到角色 $name")
-        }
-        val card: Card = explicitCard ?: state.regexCard() ?: error("当前没有打开角色卡")
-        val field = (named["field"] ?: text.trim().ifBlank { "name" }).lowercase()
-        return when (field) {
-            "name" -> card.name
-            "description", "desc" -> card.description
-            "personality" -> card.personality
-            "scenario" -> card.scenario
-            "first_mes", "greeting" -> card.greeting
-            "mes_example", "examples" -> card.examples
-            "creator_notes", "notes" -> card.creatorNotes
-            "system_prompt", "instructions" -> card.instructions
-            "post_history_instructions", "posthistory" -> card.postHistory
-            "tags" -> card.tags.joinToString(", ")
-            "world" -> card.worldName
-            "version" -> card.version
-            "creator" -> card.creator
-            "json" -> card.original
-            else -> error("不支持读取的角色卡字段 $field")
-        }
     }
 
     private fun listVariables(state: TavernState, named: Map<String, String>, text: String): String {
@@ -281,42 +272,6 @@ internal object ScriptExtensions {
         }
         val global = flags.isEmpty() || 'g' in flags
         return if (global) regex.replace(text, replacement) else regex.replaceFirst(text, replacement)
-    }
-
-    private fun trimTokens(named: Map<String, String>, text: String): String {
-        val limit = (named["limit"] ?: named["tokens"])?.trim()?.toIntOrNull()?.takeIf { it > 0 }
-            ?: error("请用 limit= 指定大于 0 的 Token 上限")
-        if (text.isEmpty() || estimatedTokens.count(text) <= limit) return text
-        val fromStart = named["direction"]?.trim()?.lowercase() == "start"
-        if (fromStart) {
-            var low = 0
-            var high = text.length
-            while (low < high) {
-                var mid = (low + high) ushr 1
-                if (mid in 1 until text.length && Character.isLowSurrogate(text[mid])) mid--
-                if (estimatedTokens.count(text.substring(mid)) <= limit) {
-                    high = mid
-                } else {
-                    low = mid + 1
-                }
-            }
-            val start = if (high in 1 until text.length && Character.isLowSurrogate(text[high])) high + 1 else high
-            return text.substring(start.coerceIn(0, text.length))
-        } else {
-            var low = 0
-            var high = text.length
-            while (low < high) {
-                var mid = (low + high + 1) ushr 1
-                if (mid in 1 until text.length && Character.isLowSurrogate(text[mid])) mid--
-                if (estimatedTokens.count(text.substring(0, mid)) <= limit) {
-                    low = mid
-                } else {
-                    high = mid - 1
-                }
-            }
-            val end = if (low in 1 until text.length && Character.isLowSurrogate(text[low])) low - 1 else low
-            return text.substring(0, end.coerceIn(0, text.length))
-        }
     }
 
     private fun splitKeys(raw: String?): List<String> =

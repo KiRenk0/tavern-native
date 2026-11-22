@@ -7,6 +7,7 @@ import androidx.activity.result.contract.ActivityResultContracts.OpenDocument
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.MenuBook
 import androidx.compose.material.icons.outlined.*
@@ -61,6 +62,12 @@ internal fun WorldBookLibrary(state: TavernState, model: TavernViewModel) {
     var editingEntry by rememberSaveable { mutableStateOf<Int?>(null) }
     var deletingBook by remember { mutableStateOf(false) }
     var deletingEntry by remember { mutableStateOf<LoreEntry?>(null) }
+    var bookMenu by remember { mutableStateOf(false) }
+    var entryMenu by remember { mutableStateOf<Int?>(null) }
+    var copyBookName by rememberSaveable { mutableStateOf<String?>(null) }
+    var transferEntryId by rememberSaveable { mutableStateOf<Int?>(null) }
+    var sort by rememberSaveable { mutableStateOf(LoreEntrySort.PRIORITY) }
+    var descending by rememberSaveable { mutableStateOf(true) }
     var managingMemory by remember { mutableStateOf(false) }
     var memoryCardId by rememberSaveable { mutableStateOf<String?>(null) }
     var query by rememberSaveable { mutableStateOf("") }
@@ -98,15 +105,19 @@ internal fun WorldBookLibrary(state: TavernState, model: TavernViewModel) {
         itemId != null && open != null -> {
             val entry = entries.firstOrNull { it.id == itemId } ?: LoreEntry(itemId)
             key(open.id, itemId) {
-                EntryEditor(entry, state.busy, ::back) { value ->
-                    val updated = entries.toMutableList()
-                    val index = updated.indexOfFirst { it.id == value.id }
-                    if (index < 0) updated += value else updated[index] = value
-                    model.saveBook(open.withEntries(updated)) { editingEntry = null }
+                val tags = remember(state.prefs.library, state.cards) { state.prefs.library.materialized(state.cards).tags }
+                EntryEditor(entry, state.cards, tags, state.busy, ::back) { value ->
+                    model.saveBook(open.saveEditedEntry(value)) { editingEntry = null }
                 }
             }
         }
         open != null -> {
+            val matches = remember(entries, query, sort, descending) {
+                sort.sorted(entries.filter { entry ->
+                    (listOf(entry.title, entry.content) + entry.keywords + entry.secondary).any { it.contains(query.trim(), true) }
+                }, descending)
+            }
+            val visibleIds = remember(matches) { matches.mapTo(hashSetOf(), LoreEntry::id) }
             WorldsList {
                 item {
                     TextButton(::back, enabled = !state.busy) { Text("返回世界书") }
@@ -144,19 +155,48 @@ internal fun WorldBookLibrary(state: TavernState, model: TavernViewModel) {
                         ActionIcon(Icons.Outlined.FileUpload, "导出世界书", !state.busy) {
                             launchExport.launch("${safeFilename(open.name)}.json")
                         }
-                        ActionIcon(Icons.Outlined.DeleteOutline, "删除世界书", !state.busy) { deletingBook = true }
+                        Box {
+                            ActionIcon(Icons.Outlined.MoreVert, "更多世界书操作", !state.busy) { bookMenu = true }
+                            DropdownMenu(bookMenu, { bookMenu = false }) {
+                                MenuItem("复制世界书", Icons.Outlined.ContentCopy) {
+                                    bookMenu = false
+                                    copyBookName = generateSequence(2) { it + 1 }.map { "${open.name} ($it)" }
+                                        .first { name -> state.books.none { it.name.equals(name, true) } }
+                                }
+                                if (entries.any { it.title.isBlank() && it.keywords.any(String::isNotBlank) }) {
+                                    MenuItem("用首个关键词补齐空白标题", Icons.Outlined.Edit) {
+                                        bookMenu = false
+                                        model.saveBook(open.fillBlankEntryTitles()) {}
+                                    }
+                                }
+                                MenuItem("删除世界书", Icons.Outlined.DeleteOutline) {
+                                    bookMenu = false
+                                    deletingBook = true
+                                }
+                            }
+                        }
                         Spacer(Modifier.weight(1f))
-                        FilledTonalButton(onClick = {
-                            val used = entries.map(LoreEntry::id).toSet()
-                            editingEntry = generateSequence(0) { it + 1 }.first { it !in used }
-                        }, enabled = !state.busy) { Text("新建条目") }
+                        FilledTonalButton(onClick = { editingEntry = open.nextEntryId() }, enabled = !state.busy) { Text("新建条目") }
                     }
-                    if (entries.isNotEmpty()) Field("搜索条目", query, { query = it })
+                    if (entries.isNotEmpty()) {
+                        Field("搜索条目", query, { query = it })
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.weight(1f)) {
+                                SelectField("条目显示排序", sort, LoreEntrySort.entries, LoreEntrySort::label, !state.busy) {
+                                    sort = it
+                                    descending = it == LoreEntrySort.PRIORITY || it == LoreEntrySort.CONTENT_LENGTH
+                                }
+                            }
+                            if (sort != LoreEntrySort.CUSTOM) {
+                                ActionIcon(if (descending) Icons.Outlined.ArrowDownward else Icons.Outlined.ArrowUpward,
+                                    if (descending) "当前降序，切换为升序" else "当前升序，切换为降序", !state.busy) {
+                                    descending = !descending
+                                }
+                            }
+                        }
+                    }
                 }
-                val matches = entries.sortedByDescending(LoreEntry::priority).filter {
-                    (listOf(it.title, it.content) + it.keywords).any { part -> part.contains(query.trim(), true) }
-                }
-                items(matches, key = LoreEntry::id) { entry ->
+                itemsIndexed(matches, key = { _, entry -> entry.id }) { position, entry ->
                     Card(onClick = { editingEntry = entry.id }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
                         Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
                             verticalAlignment = Alignment.CenterVertically) {
@@ -172,7 +212,32 @@ internal fun WorldBookLibrary(state: TavernState, model: TavernViewModel) {
                                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 2, overflow = TextOverflow.Ellipsis)
                             }
-                            ActionIcon(Icons.Outlined.DeleteOutline, "删除条目", !state.busy) { deletingEntry = entry }
+                            Box {
+                                ActionIcon(Icons.Outlined.MoreVert, "条目操作", !state.busy) { entryMenu = entry.id }
+                                DropdownMenu(entryMenu == entry.id, { entryMenu = null }) {
+                                    MenuItem("在本书复制条目", Icons.Outlined.ContentCopy) {
+                                        entryMenu = null
+                                        val (updated, newId) = open.duplicateEntry(entry.id)
+                                        model.saveBook(updated) { editingEntry = newId }
+                                    }
+                                    if (state.books.size > 1) MenuItem("复制或移动到其他世界书", Icons.Outlined.FileUpload) {
+                                        entryMenu = null
+                                        transferEntryId = entry.id
+                                    }
+                                    if (sort == LoreEntrySort.CUSTOM && position > 0) MenuItem("上移条目", Icons.Outlined.ArrowUpward) {
+                                        entryMenu = null
+                                        model.saveBook(open.moveEntryInDisplayOrder(entry.id, -1, visibleIds)) {}
+                                    }
+                                    if (sort == LoreEntrySort.CUSTOM && position < matches.lastIndex) MenuItem("下移条目", Icons.Outlined.ArrowDownward) {
+                                        entryMenu = null
+                                        model.saveBook(open.moveEntryInDisplayOrder(entry.id, 1, visibleIds)) {}
+                                    }
+                                    MenuItem("删除条目", Icons.Outlined.DeleteOutline) {
+                                        entryMenu = null
+                                        deletingEntry = entry
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -184,7 +249,7 @@ internal fun WorldBookLibrary(state: TavernState, model: TavernViewModel) {
                     FormHeading("世界书", "设定可全局启用，也可在角色编辑页绑定。")
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button({ editingBook = true }, enabled = !state.busy) { Text("新建世界书") }
-                        OutlinedButton({ launchImport.launch(arrayOf("*/*")) }, enabled = !state.busy) { Text("导入 JSON") }
+                        OutlinedButton({ launchImport.launch(arrayOf("*/*")) }, enabled = !state.busy) { Text("导入世界书") }
                         ActionIcon(Icons.Outlined.Settings, "全局扫描设置", !state.busy) { editingScan = true }
                     }
                     if (state.books.isNotEmpty()) Field("搜索世界书", query, { query = it })
@@ -200,6 +265,30 @@ internal fun WorldBookLibrary(state: TavernState, model: TavernViewModel) {
                             trailingContent = { Icon(Icons.Outlined.ChevronRight, null) })
                     }
                 }
+            }
+        }
+    }
+    val duplicateName = copyBookName
+    if (duplicateName != null && open != null) {
+        val valid = duplicateName.isNotBlank() && state.books.none { it.name.equals(duplicateName.trim(), true) }
+        AlertDialog(onDismissRequest = { if (!state.busy) copyBookName = null }, title = { Text("复制世界书") }, text = {
+            Field("新世界书名称", duplicateName, { copyBookName = it }, enabled = !state.busy)
+        }, confirmButton = {
+            TextButton(enabled = valid && !state.busy, onClick = {
+                val duplicate = open.copyForEditing(duplicateName.trim())
+                model.saveBook(duplicate) { copyBookName = null; openId = duplicate.id; query = "" }
+            }) { Text("复制") }
+        }, dismissButton = { TextButton({ copyBookName = null }, enabled = !state.busy) { Text("取消") } })
+    }
+    val transferId = transferEntryId
+    if (transferId != null && open != null) {
+        val targets = state.books.filter { it.id != open.id }
+        if (targets.isNotEmpty()) LoreEntryTransferDialog(targets, state.busy, { transferEntryId = null }) { target, move ->
+            model.transferLoreEntry(open.id, target.id, transferId, move) { newId ->
+                transferEntryId = null
+                openId = target.id
+                query = ""
+                editingEntry = newId
             }
         }
     }
@@ -235,6 +324,22 @@ internal fun WorldBookLibrary(state: TavernState, model: TavernViewModel) {
 }
 
 @Composable
+private fun LoreEntryTransferDialog(books: List<WorldBook>, busy: Boolean, dismiss: () -> Unit,
+                                    accept: (WorldBook, Boolean) -> Unit) {
+    var targetId by rememberSaveable { mutableStateOf(books.first().id) }
+    var move by rememberSaveable { mutableStateOf(false) }
+    val target = books.firstOrNull { it.id == targetId } ?: books.first()
+    AlertDialog(onDismissRequest = { if (!busy) dismiss() }, title = { Text("转移世界书条目") }, text = {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            SelectField("目标世界书", target, books, WorldBook::name, !busy) { targetId = it.id }
+            GroupToggle("移动并从原世界书移除", move, !busy) { move = it }
+        }
+    }, confirmButton = {
+        TextButton({ accept(target, move) }, enabled = !busy) { Text(if (move) "移动" else "复制") }
+    }, dismissButton = { TextButton(dismiss, enabled = !busy) { Text("取消") } })
+}
+
+@Composable
 private fun LoreScanSettings(settings: LoreSettings, busy: Boolean, back: () -> Unit, save: (LoreSettings) -> Unit) {
     var recursive by rememberSaveable { mutableStateOf(settings.recursive) }
     var maxPasses by rememberSaveable { mutableStateOf(settings.maxPasses.toString()) }
@@ -246,14 +351,21 @@ private fun LoreScanSettings(settings: LoreSettings, busy: Boolean, back: () -> 
     var budgetPercent by rememberSaveable { mutableStateOf(settings.budgetPercent.toString()) }
     var budgetCap by rememberSaveable { mutableStateOf(settings.budgetCap.toString()) }
     var overflowAlert by rememberSaveable { mutableStateOf(settings.overflowAlert) }
+    var scanDepth by rememberSaveable { mutableStateOf(settings.scanDepth.toString()) }
+    var includeNames by rememberSaveable { mutableStateOf(settings.includeNames) }
+    var strategy by rememberSaveable { mutableStateOf(settings.insertionStrategy) }
     val passes = maxPasses.toIntOrNull()?.takeIf { it >= 0 }
     val minimumCount = minimum.toIntOrNull()?.takeIf { it >= 0 }
     val depth = maxDepth.toIntOrNull()?.takeIf { it in 0..80 }
     val percent = budgetPercent.toIntOrNull()?.takeIf { it in 0..100 }
     val cap = budgetCap.toIntOrNull()?.takeIf { it in 0..MAX_CONTEXT_TOKENS }
+    val defaultDepth = scanDepth.toIntOrNull()?.takeIf { it in 0..80 }
     Form {
         TextButton(back, enabled = !busy) { Text("返回") }
         FormHeading("世界书扫描设置")
+        Field("默认扫描深度（消息条数）", scanDepth, { scanDepth = it }, enabled = !busy, type = KeyboardType.Number)
+        GroupToggle("匹配消息时包含发言者名称", includeNames, !busy) { includeNames = it }
+        SelectField("条目激活顺序", strategy, LoreInsertionStrategy.entries, LoreInsertionStrategy::label, !busy) { strategy = it }
         Field("占模型上下文的百分比（0–100）", budgetPercent, { budgetPercent = it },
             enabled = !busy, type = KeyboardType.Number)
         Field("世界书 Token 上限（0 为不限）", budgetCap, { budgetCap = it }, enabled = !busy, type = KeyboardType.Number)
@@ -270,8 +382,9 @@ private fun LoreScanSettings(settings: LoreSettings, busy: Boolean, back: () -> 
         GroupToggle("默认匹配整个词", wholeWords, !busy) { wholeWords = it }
         GroupToggle("按匹配关键词数量参与分组竞争", groupScoring, !busy) { groupScoring = it }
         Button(onClick = { save(LoreSettings(recursive, requireNotNull(passes), requireNotNull(minimumCount),
-            requireNotNull(depth), caseSensitive, wholeWords, groupScoring, requireNotNull(percent), requireNotNull(cap), overflowAlert)) },
-            enabled = !busy && passes != null && minimumCount != null && depth != null && percent != null && cap != null,
+            requireNotNull(depth), caseSensitive, wholeWords, groupScoring, requireNotNull(percent), requireNotNull(cap), overflowAlert,
+            requireNotNull(defaultDepth), includeNames, strategy)) },
+            enabled = !busy && passes != null && minimumCount != null && depth != null && percent != null && cap != null && defaultDepth != null,
             modifier = Modifier.fillMaxWidth()) { Text("保存扫描设置") }
     }
 }
@@ -279,7 +392,7 @@ private fun LoreScanSettings(settings: LoreSettings, busy: Boolean, back: () -> 
 @Composable
 private fun BookSettings(book: WorldBook, busy: Boolean, back: () -> Unit, save: (WorldBook) -> Unit) {
     var name by rememberSaveable { mutableStateOf(book.name) }
-    var depth by rememberSaveable { mutableStateOf(book.scanDepth.toString()) }
+    var depth by rememberSaveable { mutableStateOf(book.scanDepthOverride?.toString().orEmpty()) }
     var enabled by rememberSaveable { mutableStateOf(book.enabled) }
     var sharedMemory by rememberSaveable { mutableStateOf(book.sharedMemory) }
     val scanDepth = depth.toIntOrNull()?.takeIf { it in 0..80 }
@@ -287,11 +400,11 @@ private fun BookSettings(book: WorldBook, busy: Boolean, back: () -> Unit, save:
         TextButton(back, enabled = !busy) { Text("返回") }
         FormHeading(if (book.name.isBlank()) "新建世界书" else "世界书设置")
         Field("名称", name, { name = it }, enabled = !busy)
-        Field("扫描最近多少条消息", depth, { depth = it }, enabled = !busy, type = KeyboardType.Number)
+        Field("扫描深度（留空沿用全局默认值）", depth, { depth = it }, enabled = !busy, type = KeyboardType.Number)
         GroupToggle("用于所有对话", enabled, !busy) { enabled = it }
         GroupToggle("联通角色记忆", sharedMemory, !busy) { sharedMemory = it }
-        Button({ save(book.copy(name = name, enabled = enabled).withScanDepth(requireNotNull(scanDepth)).withSharedMemory(sharedMemory)) },
-            enabled = !busy && name.isNotBlank() && scanDepth != null, modifier = Modifier.fillMaxWidth()) {
+        Button({ save(book.copy(name = name, enabled = enabled).withScanDepth(scanDepth).withSharedMemory(sharedMemory)) },
+            enabled = !busy && name.isNotBlank() && (depth.isBlank() || scanDepth != null), modifier = Modifier.fillMaxWidth()) {
             Text("保存世界书")
         }
     }
@@ -302,11 +415,13 @@ private enum class EntryActivation(val label: String) {
 }
 
 @Composable
-private fun EntryEditor(entry: LoreEntry, busy: Boolean, back: () -> Unit, save: (LoreEntry) -> Unit) {
+private fun EntryEditor(entry: LoreEntry, cards: List<Card>, tags: List<LibraryTag>, busy: Boolean,
+                        back: () -> Unit, save: (LoreEntry) -> Unit) {
     var title by rememberSaveable { mutableStateOf(entry.title) }
     var content by rememberSaveable { mutableStateOf(entry.content) }
     var keywords by rememberSaveable { mutableStateOf(entry.keywords.joinToString("\n")) }
     var secondary by rememberSaveable { mutableStateOf(entry.secondary.joinToString("\n")) }
+    var selective by rememberSaveable { mutableStateOf(entry.selective) }
     var activation by rememberSaveable {
         mutableStateOf(when {
             entry.constant -> EntryActivation.CONSTANT
@@ -320,6 +435,7 @@ private fun EntryEditor(entry: LoreEntry, busy: Boolean, back: () -> Unit, save:
     var logic by rememberSaveable { mutableStateOf(entry.logic) }
     var priority by rememberSaveable { mutableStateOf(entry.priority.toString()) }
     var probability by rememberSaveable { mutableStateOf(entry.probability.toString()) }
+    var useProbability by rememberSaveable { mutableStateOf(entry.useProbability) }
     var scanDepth by rememberSaveable { mutableStateOf(entry.scanDepth?.toString().orEmpty()) }
     var depth by rememberSaveable { mutableStateOf(entry.depth.toString()) }
     var position by rememberSaveable { mutableStateOf(entry.position) }
@@ -339,6 +455,12 @@ private fun EntryEditor(entry: LoreEntry, busy: Boolean, back: () -> Unit, save:
     var ignoreBudget by rememberSaveable { mutableStateOf(entry.rules.ignoreBudget) }
     var automationId by rememberSaveable { mutableStateOf(entry.automationId) }
     var sources by rememberSaveable { mutableStateOf<List<String>>(entry.rules.sources.map(LoreSource::name)) }
+    val avatarIds = remember(cards) { cards.uniqueLoreFilenames() }
+    var filterNames by rememberSaveable { mutableStateOf(entry.rules.characterFilter.names.map { avatarIds[it.loreFilenameStem()] ?: it }.distinct()) }
+    var filterTags by rememberSaveable { mutableStateOf(entry.rules.characterFilter.tags) }
+    var filterExclude by rememberSaveable { mutableStateOf(entry.rules.characterFilter.exclude) }
+    var triggers by rememberSaveable { mutableStateOf(entry.rules.triggers) }
+    var chooseFilter by rememberSaveable { mutableStateOf<String?>(null) }
     val numericPriority = priority.toIntOrNull()
     val numericProbability = probability.toIntOrNull()?.takeIf { it in 0..100 }
     val numericScanDepth = scanDepth.toIntOrNull()?.takeIf { it in 0..80 }
@@ -360,14 +482,19 @@ private fun EntryEditor(entry: LoreEntry, busy: Boolean, back: () -> Unit, save:
         SelectField("触发方式", activation, EntryActivation.entries, EntryActivation::label, !busy) { activation = it }
         if (activation != EntryActivation.CONSTANT) {
             Field("主关键词（每行一个）", keywords, { keywords = it }, lines = 2, enabled = !busy)
-            Field("次关键词（每行一个）", secondary, { secondary = it }, lines = 2, enabled = !busy)
-            if (secondary.isNotBlank()) SelectField("次关键词逻辑", logic, LoreLogic.entries, LoreLogic::label, !busy) { logic = it }
+            Field("次关键词（每行一个）", secondary, {
+                if (secondary.isBlank() && it.isNotBlank()) selective = true
+                secondary = it
+            }, lines = 2, enabled = !busy)
+            if (secondary.isNotBlank()) GroupToggle("启用次关键词过滤", selective, !busy) { selective = it }
+            if (secondary.isNotBlank() && selective) SelectField("次关键词逻辑", logic, LoreLogic.entries, LoreLogic::label, !busy) { logic = it }
             LoreOverride("区分大小写", caseSensitive, !busy) { caseSensitive = it }
             LoreOverride("匹配整个词", wholeWords, !busy) { wholeWords = it }
             Field("条目扫描深度（可选）", scanDepth, { scanDepth = it }, enabled = !busy, type = KeyboardType.Number)
         }
         Field("排序优先级", priority, { priority = it }, enabled = !busy, type = KeyboardType.Number)
-        Field("触发概率（0–100）", probability, { probability = it }, enabled = !busy, type = KeyboardType.Number)
+        GroupToggle("按概率触发", useProbability, !busy) { useProbability = it }
+        if (useProbability) Field("触发概率（0–100）", probability, { probability = it }, enabled = !busy, type = KeyboardType.Number)
         SelectField("注入位置", position, LorePosition.entries, LorePosition::label, !busy) { position = it }
         if (position == LorePosition.DEPTH) {
             Field("注入深度", depth, { depth = it }, enabled = !busy, type = KeyboardType.Number)
@@ -400,27 +527,59 @@ private fun EntryEditor(entry: LoreEntry, busy: Boolean, back: () -> Unit, save:
                     sources = if (enabled) sources + source.name else sources - source.name
                 }
             }
+            FormHeading("激活范围")
+            OutlinedButton({ chooseFilter = "characters" }, enabled = !busy) { Text("选择角色 · ${filterNames.size}") }
+            OutlinedButton({ chooseFilter = "tags" }, enabled = !busy) { Text("选择标签 · ${filterTags.size}") }
+            if (filterNames.isNotEmpty() || filterTags.isNotEmpty()) {
+                GroupToggle("排除所选角色及带有所选标签的角色", filterExclude, !busy) { filterExclude = it }
+                if (!filterExclude && filterNames.isNotEmpty() && filterTags.isNotEmpty()) {
+                    Text("发言角色须在所选角色中，并至少带有一个所选标签。")
+                }
+            }
+            OutlinedButton({ chooseFilter = "triggers" }, enabled = !busy) {
+                Text(if (triggers.isEmpty()) "生成类型 · 全部" else "生成类型 · ${triggers.size} 项")
+            }
             GroupToggle("忽略世界书注入额度", ignoreBudget, !busy) { ignoreBudget = it }
             Field("快捷回复自动化 ID（可选）", automationId, { automationId = it }, enabled = !busy)
         }
         Button(onClick = {
             save(entry.copy(title = title.trim(), content = content, keywords = keys(keywords), secondary = keys(secondary),
-                logic = logic, constant = activation == EntryActivation.CONSTANT, vectorized = activation == EntryActivation.VECTOR,
+                selective = selective, useProbability = useProbability, logic = logic,
+                constant = activation == EntryActivation.CONSTANT, vectorized = activation == EntryActivation.VECTOR,
                 disabled = disabled, caseSensitive = caseSensitive, wholeWords = wholeWords,
                 priority = requireNotNull(numericPriority), scanDepth = numericScanDepth,
-                probability = requireNotNull(numericProbability), position = position, depth = numericDepth ?: entry.depth, role = role,
+                probability = numericProbability ?: entry.probability, position = position, depth = numericDepth ?: entry.depth, role = role,
                 automationId = automationId.trim(),
                 rules = entry.rules.copy(outlet = outlet.trim(), groups = groups.trim(), groupOverride = groupOverride,
                     groupWeight = requireNotNull(weight), groupScoring = groupScoring, excludeRecursion = excludeRecursion,
                     preventRecursion = preventRecursion, recursionLevel = requireNotNull(level), sticky = requireNotNull(stickyCount),
                     cooldown = requireNotNull(cooldownCount), delay = requireNotNull(delayCount), ignoreBudget = ignoreBudget,
-                    sources = LoreSource.entries.filter { it.name in sources }.toSet())))
-        }, enabled = !busy && content.isNotBlank() && numericPriority != null && numericProbability != null &&
+                    sources = LoreSource.entries.filter { it.name in sources }.toSet(), triggers = triggers,
+                    characterFilter = LoreCharacterFilter(filterNames, filterTags, filterExclude))))
+        }, enabled = !busy && content.isNotBlank() && numericPriority != null && (!useProbability || numericProbability != null) &&
             (scanDepth.isBlank() || numericScanDepth != null) && (position != LorePosition.DEPTH || numericDepth != null) &&
             (position != LorePosition.OUTLET || outlet.isNotBlank()) && validAdvanced,
             modifier = Modifier.fillMaxWidth()) { Text("保存条目") }
     }
+    when (chooseFilter) {
+        "characters" -> {
+            val counts = cards.groupingBy(Card::name).eachCount()
+            val choices = cards.sortedBy(Card::name).map { card ->
+                card.id to if (counts[card.name] == 1) card.name else "${card.name} · ${card.scriptAvatarKey} · ${card.id.take(8)}"
+            }
+            LoreSelectionDialog("选择角色", choices, filterNames, { chooseFilter = null }) { filterNames = it; chooseFilter = null }
+        }
+        "tags" -> LoreSelectionDialog("选择标签", tags.sortedBy(LibraryTag::name).map { it.id to it.name }, filterTags,
+            { chooseFilter = null }) { filterTags = it; chooseFilter = null }
+        "triggers" -> LoreSelectionDialog("生成类型", loreTriggerChoices, triggers, { chooseFilter = null }) {
+            triggers = it
+            chooseFilter = null
+        }
+    }
 }
+
+private val loreTriggerChoices = listOf("normal" to "普通回复", "continue" to "续写", "impersonate" to "代写",
+    "swipe" to "生成备选回复", "regenerate" to "重新生成", "quiet" to "后台生成")
 
 @Composable
 private fun LoreOverride(label: String, value: Boolean?, enabled: Boolean, change: (Boolean?) -> Unit) {

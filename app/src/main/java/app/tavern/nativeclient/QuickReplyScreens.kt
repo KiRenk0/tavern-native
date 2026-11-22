@@ -7,6 +7,9 @@ import androidx.activity.result.contract.ActivityResultContracts.OpenDocument
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -164,8 +167,12 @@ internal fun ChatQuickReplySets(state: TavernState, model: TavernViewModel, dism
 internal fun ScriptQuestion(dialog: ScriptDialog, resolve: (String?) -> Unit) {
     var input by rememberSaveable(dialog.id) { mutableStateOf(dialog.initial) }
     AlertDialog(onDismissRequest = { resolve(null) }, title = { Text(dialog.title) }, text = {
-        Column(Modifier.heightIn(max = 480.dp)) {
-            if (dialog.text.isNotBlank()) Text(dialog.text)
+        val body = Modifier.heightIn(max = 480.dp)
+        val popup = dialog.kind == "popup"
+        Column(if (popup) body.verticalScroll(rememberScrollState()) else body) {
+            if (dialog.text.isNotBlank()) {
+                if (popup) SelectionContainer { Text(dialog.text) } else Text(dialog.text)
+            }
             if (dialog.kind == "input") Field("输入", input, { input = it })
             if (dialog.kind == "buttons") LazyColumn(Modifier.heightIn(max = 320.dp)) {
                 items(dialog.buttons) { button -> TextButton({ resolve(button) }) { Text(button) } }
@@ -173,6 +180,8 @@ internal fun ScriptQuestion(dialog: ScriptDialog, resolve: (String?) -> Unit) {
         }
     }, dismissButton = { if (dialog.kind != "popup") TextButton({ resolve(null) }) { Text("取消") } },
         confirmButton = {
-            if (dialog.kind != "buttons") TextButton({ resolve(if (dialog.kind == "input") input else dialog.text) }) { Text("确定") }
+            if (dialog.kind != "buttons") TextButton({ resolve(if (dialog.kind == "input") input else dialog.text) }) {
+                Text(if (dialog.kind == "confirm-delete") "删除" else "确定")
+            }
         })
 }

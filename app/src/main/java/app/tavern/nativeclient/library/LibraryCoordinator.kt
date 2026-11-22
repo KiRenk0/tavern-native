@@ -10,11 +10,15 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 
 internal class LibraryCoordinator(private val host: CoordinatorHost) {
+    private val groupWrites = Mutex()
+    private val cardWrites = Mutex()
     fun savePersona(profile: PersonaProfile, photo: Uri?, done: () -> Unit) = host.work {
         val prefs = host.current.prefs
         val previous = prefs.personas.firstOrNull { it.id == profile.id }
@@ -119,18 +123,24 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
     private fun decodeAvatar(uri: Uri) =
         resizeAvatar(requireNotNull(host.resolver.openInputStream(uri)) { "无法读取头像文件" }.use { it.readLimited() })
 
-    private fun resizeAvatar(image: ByteArray): ByteArray {
+    internal fun resizeAvatar(image: ByteArray): ByteArray = normalizeAvatar(image, keepSize = false)
+
+    private fun importCharacterPortrait(image: ByteArray): ByteArray =
+        normalizeAvatar(image, keepSize = host.current.prefs.characterLibrary.keepAvatarSize)
+
+    private fun normalizeAvatar(image: ByteArray, keepSize: Boolean): ByteArray {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(image, 0, image.size, bounds)
         require(bounds.outWidth > 0 && bounds.outHeight > 0) { "所选文件不是可用的图片" }
-        var sample = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 640) sample *= 2
+        if (keepSize && CardFile.isPng(image)) return image
+        val sample = avatarDecodeSample(bounds.outWidth, bounds.outHeight, keepSize)
         val bitmap = requireNotNull(
             BitmapFactory.decodeByteArray(image, 0, image.size, BitmapFactory.Options().apply { inSampleSize = sample }),
         ) { "无法解码头像" }
         return try {
             val out = ByteArrayOutputStream()
             check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) { "无法保存头像" }
+            require(out.size() <= MAX_IMAGE_SOURCE) { "转换后的头像文件过大" }
             out.toByteArray()
         } finally {
             bitmap.recycle()
@@ -139,9 +149,32 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
 
     fun saveCard(card: Card, done: () -> Unit) = host.work {
         require(card.name.isNotBlank()) { "请输入角色名称" }
-        val cards = withContext(Dispatchers.IO) { host.store.save(card); host.store.cards() }
-        host.mutable.update { it.copy(cards = cards) }
+        cardWrites.withLock { withContext(NonCancellable) {
+            val cards = withContext(Dispatchers.IO) { host.store.save(card); host.store.cards() }
+            host.mutable.update { it.copy(cards = cards) }
+        } }
         done()
+    }
+
+    internal suspend fun saveScriptCard(id: String?, changes: ScriptCardChanges, portrait: ByteArray?): Card = cardWrites.withLock {
+        val original = id?.let { key -> checkNotNull(host.current.cards.firstOrNull { it.id == key }) { "找不到要更新的角色" } }
+        val edited = original?.let(changes::apply) ?: changes.create()
+        val saved = edited.copy(hasAvatar = edited.hasAvatar || portrait != null)
+        require(saved.name.isNotBlank()) { "请输入角色名称" }
+        val library = host.current.prefs.library.materialized(host.current.cards)
+        val key = libraryCardId(saved.id)
+        withContext(NonCancellable) {
+            val cards = withContext(Dispatchers.IO) {
+                if (original == null) host.store.import(CardImport(saved, portrait), emptyList())
+                else host.store.replaceCard(saved, portrait)
+                host.store.cards()
+            }
+            val assignments = if (original == null) library.assignments + (key to emptySet<String>()) else library.assignments
+            val favorites = changes.favorite?.let { library.favorites + (key to it) } ?: library.favorites
+            persistLibrary(library.copy(assignments = assignments, favorites = favorites))
+            host.mutable.update { it.copy(cards = cards) }
+        }
+        saved
     }
 
     private suspend fun persistLibrary(library: LibraryPreferences) {
@@ -149,6 +182,10 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
     }
 
     fun sortLibrary(sort: LibrarySort) = host.work { persistLibrary(host.current.prefs.library.copy(sort = sort)) }
+
+    fun setCharacterLibrary(options: CharacterLibraryOptions) = host.work {
+        host.persistPreferences(host.current.prefs.copy(characterLibrary = options))
+    }
 
     fun showLibraryFolders(show: Boolean) = host.work { persistLibrary(host.current.prefs.library.copy(folders = show)) }
 
@@ -258,16 +295,17 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
         userName: String,
         includeExtras: Boolean = true,
     ): List<ImportedCharacterArchive> =
-        readCharacterFiles(input, name, host.app.cacheDir, userName, ::resizeAvatar, host.imageStore::import, includeExtras)
+        readCharacterFiles(input, name, host.app.cacheDir, userName, ::importCharacterPortrait, host.imageStore::import, includeExtras)
 
     private fun externalImporter(userName: String, includeExtras: Boolean = true) = ExternalContentImporter(
         { input, name -> characterFiles(input, name, userName, includeExtras) },
-        ::resizeAvatar,
+        ::importCharacterPortrait,
     )
 
-    fun importCards(uris: List<Uri>) = host.work {
+    fun importCards(uris: List<Uri>, mode: CardTagImport = CardTagImport.ALL) = host.work {
         if (uris.isEmpty()) return@work
-        val userName = host.current.prefs.personaFor().name
+        val before = host.current
+        val userName = before.prefs.personaFor().name
         var failures = 0
         var chats = 0
         var skippedPictures = 0
@@ -278,9 +316,16 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
                 currentCoroutineContext().ensureActive()
                 val name = host.app.documentName(uri).takeUnless { it == "导入的聊天" } ?: "角色卡文件"
                 try {
-                    val imported = requireNotNull(host.resolver.openInputStream(uri)) { "无法打开角色卡" }.use { input ->
+                    val entries = requireNotNull(host.resolver.openInputStream(uri)) { "无法打开角色卡" }.use { input ->
                         characterFiles(input, name, userName)
                     }
+                    val imported = if (entries.size == 1 && name.substringAfterLast('.').lowercase() in setOf("png", "json")) entries.map { entry ->
+                        val card = entry.card.card
+                        val identified = if (card.scriptAvatarKey == "${card.id}.png") {
+                            card.withScriptAvatarKey(name.substringBeforeLast('.') + ".png")
+                        } else card
+                        entry.copy(card = entry.card.copy(card = identified))
+                    } else entries
                     if (imported.all { it.card.portrait == null && it.chats.isEmpty() && it.pictures.isEmpty() }) {
                         added += host.store.importCharacters(imported.map { it.card.card })
                         skippedPictures += imported.sumOf(ImportedCharacterArchive::skippedImages)
@@ -302,7 +347,7 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
             }
             host.store.cards() to added
         }
-        host.mutable.update { it.copy(cards = cards) }
+        updateImportedCards(before.cards, cards, mode)
         val summary = buildString {
             append("已导入 $count 张角色卡")
             if (chats > 0) append("、$chats 个聊天")
@@ -311,10 +356,11 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
         host.notice(if (failures == 0) summary else "$summary，$failures 个文件失败。$firstFailure")
     }
 
-    fun importExternalContent(addresses: String): Boolean = host.utilityWork("正在导入分享链接…") {
+    fun importExternalContent(addresses: String, mode: CardTagImport): Boolean = host.utilityWork("正在导入分享链接…") {
         val rows = addresses.lineSequence().map(String::trim).filter(String::isNotBlank).toList()
         require(rows.isNotEmpty()) { "请输入角色或世界书的分享链接" }
-        val importer = externalImporter(host.current.prefs.personaFor().name)
+        val before = host.current
+        val importer = externalImporter(before.prefs.personaFor().name)
         val visited = hashSetOf<Pair<ExternalContentSite, String>>()
         var importedCards = 0
         var importedBooks = 0
@@ -356,7 +402,8 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
         } finally {
             if (importedCards + importedBooks > 0) withContext(NonCancellable) {
                 val (cards, books) = withContext(Dispatchers.IO) { host.store.cards() to host.store.books() }
-                host.mutable.update { it.copy(cards = cards, books = books) }
+                updateImportedCards(before.cards, cards, mode)
+                host.mutable.update { it.copy(books = books) }
             }
         }
         val summary = buildString {
@@ -366,6 +413,23 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
             if (failures > 0) append("，$failures 个链接失败。$firstFailure")
         }
         host.notice(summary)
+    }
+
+    private suspend fun updateImportedCards(before: List<Card>, cards: List<Card>, mode: CardTagImport) {
+        val originalIds = before.mapTo(hashSetOf(), Card::id)
+        val state = host.current
+        val imported = cards.filterNot { it.id in originalIds }
+        val updated = state.prefs.library.applyCardTagImport(before, imported, mode)
+        val offered = if (!state.prefs.characterLibrary.askToImportLore) emptyList() else withContext(Dispatchers.Default) {
+            imported.filter { runCatching { it.embeddedWorldBook() != null }.getOrDefault(false) }.map(Card::id)
+        }
+        if (updated != state.prefs.library) {
+            val prefs = state.prefs.copy(library = updated)
+            withContext(Dispatchers.IO) { host.store.save(prefs) }
+            host.mutable.update { it.copy(cards = cards, prefs = prefs, offeredCardLore = offered) }
+        } else {
+            host.mutable.update { it.copy(cards = cards, offeredCardLore = offered) }
+        }
     }
 
     fun updateCardFromLink(card: Card, address: String): Boolean = host.utilityWork("正在更新角色卡…") {
@@ -390,7 +454,9 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
         val value = downloaded.card
         var updated = value.card.copy(id = card.id, hasAvatar = value.portrait != null || card.hasAvatar)
             .edited(mapOf("name" to card.name), value.card.alternateGreetings)
-            .withWorld(card.worldName).withAuthorNote(card.authorNote).withLibraryFavorite(card.libraryFavorite)
+            .withWorld(card.worldName).withAdditionalWorldBooks(card.additionalWorldBookIds)
+            .withAuthorNote(card.authorNote).withLibraryFavorite(card.libraryFavorite)
+            .withScriptAvatarKey(card.scriptAvatarKey)
         card.expressionSprites?.let { updated = updated.withExpressionSprites(it) }
         if (updated.sourceLink == null) card.sourceLink?.let { updated = updated.withSourceLink(it) }
         withContext(NonCancellable) {
@@ -401,34 +467,69 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
     }
 
     fun duplicateCard(card: Card) = host.work {
-        val names = host.current.cards.mapTo(hashSetOf()) { it.name.lowercase() }
-        val base = "${card.name} · 副本"
-        val name = generateSequence(1) { it + 1 }.map { if (it == 1) base else "$base $it" }
-            .first { it.lowercase() !in names }
-        val id = newId()
-        val cards = withContext(Dispatchers.IO) {
-            val portrait = if (card.hasAvatar) host.store.portraitFile(card.id).inputStream().use { it.readLimited() } else null
-            val copy = card.copy(id = id).edited(mapOf("name" to name), card.alternateGreetings)
-            host.store.import(CardImport(copy, portrait), emptyList())
-            host.store.cards()
-        }
-        val library = host.current.prefs.library.materialized(host.current.cards)
-        val tags = library.assignments[libraryCardId(card.id)].orEmpty()
-        host.mutable.update { it.copy(cards = cards, cardId = id, groupId = null, chat = null, history = emptyList()) }
-        if (tags.isNotEmpty()) persistLibrary(library.copy(assignments = library.assignments + (libraryCardId(id) to tags)))
+        val copy = copyCard(card, keepName = false)
+        host.mutable.update { it.copy(cardId = copy.id, groupId = null, chat = null, history = emptyList()) }
         host.notice("已创建角色副本")
     }
 
-    fun deleteCard(card: Card) = host.work {
-        val (cards, groups) = withContext(Dispatchers.IO) { host.store.deleteCard(card.id); host.store.cards() to host.store.groups() }
-        host.mutable.update { it.copy(cards = cards, groups = groups, chat = null, cardId = null, history = emptyList()) }
-        persistLibrary(host.current.prefs.library.removeOwner(libraryCardId(card.id)))
+    internal suspend fun copyCard(card: Card, keepName: Boolean): Card = cardWrites.withLock {
+        val source = checkNotNull(host.current.cards.firstOrNull { it.id == card.id }) { "角色已不存在" }
+        val names = host.current.cards.mapTo(hashSetOf()) { it.name.lowercase() }
+        val base = "${source.name} · 副本"
+        val name = if (keepName) source.name else generateSequence(1) { it + 1 }
+            .map { if (it == 1) base else "$base $it" }.first { it.lowercase() !in names }
+        val id = newId()
+        val copy = source.copy(id = id).edited(mapOf("name" to name), source.alternateGreetings).withScriptAvatarKey("$id.png")
+        val library = host.current.prefs.library.materialized(host.current.cards)
+        val tags = library.assignments[libraryCardId(source.id)].orEmpty()
+        withContext(NonCancellable) {
+            val cards = withContext(Dispatchers.IO) {
+                val portrait = if (source.hasAvatar) host.store.portraitFile(source.id).inputStream().use { it.readLimited() } else null
+                host.store.import(CardImport(copy, portrait), emptyList())
+                host.store.cards()
+            }
+            persistLibrary(library.copy(assignments = library.assignments + (libraryCardId(id) to tags)))
+            host.mutable.update { it.copy(cards = cards) }
+        }
+        copy
+    }
+
+    fun deleteCard(card: Card) = host.work { removeCard(card, deleteChats = true) }
+
+    internal suspend fun removeCard(card: Card, deleteChats: Boolean) = cardWrites.withLock {
+        groupWrites.withLock {
+            withContext(NonCancellable) {
+                val active = host.current.chat?.takeIf { it.cardId == card.id }
+                val archive = TavernGroup(name = "${card.name} · 已归档", order = ReplyOrder.MANUAL).takeUnless { deleteChats }
+                val (retained, cards, groups) = withContext(Dispatchers.IO) {
+                    val result = host.store.deleteCard(card.id, archive, card.worldName)
+                    Triple(result, host.store.cards(), host.store.groups())
+                }
+                host.mutable.update { current ->
+                    val library = current.copy(cards = cards, groups = groups)
+                    if (current.cardId == card.id) library.copy(chat = null, cardId = null, history = emptyList()) else library
+                }
+                if (retained != null && active != null) {
+                    val (opened, history) = withContext(Dispatchers.IO) {
+                        host.store.chat(active.id) to host.store.chats(groupId = retained.id)
+                    }
+                    host.showChat(opened, history)
+                }
+                persistLibrary(host.current.prefs.library.removeOwner(libraryCardId(card.id)))
+                host.refreshRecentChats()
+                host.refreshLibraryUsage()
+                if (retained != null) host.notice("聊天已保存在群组「${retained.name}」")
+            }
+        }
     }
 
     fun exportCard(uri: Uri, card: Card) = host.work {
+        val primary = host.current.books.firstOrNull { it.name == card.worldName }
+        val names = host.current.cards.associate { it.id to it.scriptAvatarKey.loreFilenameStem() }
         withContext(Dispatchers.IO) {
-            val payload = if (card.hasAvatar) CardFile.png(card, host.store.portraitFile(card.id).readBytes())
-            else card.portableJson().toString(2).toByteArray(Charsets.UTF_8)
+            val portable = primary?.let { card.withCharacterBook(it.remapLoreFilters(names).characterBook()) } ?: card
+            val payload = if (card.hasAvatar) CardFile.png(portable, host.store.portraitFile(card.id).readBytes())
+            else portable.portableJson().toString(2).toByteArray(Charsets.UTF_8)
             host.writeUri(uri, payload)
         }
         host.notice("角色卡已导出")
@@ -450,10 +551,25 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
         val members = group.members(host.current.cards).map(Card::id)
         val name = group.name.trim()
         require(name.isNotBlank() && members.isNotEmpty()) { "请输入群组名称并选择至少一个角色" }
-        val saved = group.copy(name = name, memberIds = members, mutedIds = group.mutedIds.intersect(members.toSet()))
-        val groups = withContext(Dispatchers.IO) { host.store.save(saved); host.store.groups() }
-        host.mutable.update { it.copy(groups = groups) }
+        persistGroup(group.copy(name = name, memberIds = members, mutedIds = group.mutedIds.intersect(members.toSet())))
         done()
+    }
+
+    private suspend fun persistGroup(group: TavernGroup) = groupWrites.withLock {
+        withContext(NonCancellable) {
+            val groups = withContext(Dispatchers.IO) { host.store.save(group); host.store.groups() }
+            host.mutable.update { it.copy(groups = groups) }
+        }
+    }
+
+    internal suspend fun updateGroupRoster(id: String, change: (TavernGroup) -> TavernGroup): Boolean = groupWrites.withLock {
+        withContext(NonCancellable) {
+            val (changed, groups) = withContext(Dispatchers.IO) {
+                host.store.updateGroupRoster(id, change) to host.store.groups()
+            }
+            host.mutable.update { it.copy(groups = groups) }
+            changed
+        }
     }
 
     fun openGroup(group: TavernGroup) = host.work {
@@ -468,12 +584,42 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
         persistLibrary(host.current.prefs.library.removeOwner(libraryGroupId(group.id)))
     }
 
-    fun newGroupChat(group: TavernGroup) = host.work {
-        val title = if (host.current.history.isEmpty()) "新群聊" else "新群聊 · ${host.current.history.size + 1}"
-        host.persist(Chat(
+    fun openFavoriteConversation(item: LibraryItem) = host.work {
+        val state = host.current
+        val card = item.card?.let { favorite -> state.cards.firstOrNull { it.id == favorite.id } }
+        val group = item.group?.let { favorite -> state.groups.firstOrNull { it.id == favorite.id } }
+        if (card == null && group == null) return@work
+        val active = state.chat
+        if (active != null && !active.isTemporary &&
+            (card != null && card.id == active.cardId || group != null && group.id == active.groupId)) return@work
+        host.generation.stopAuto()
+        val newest = withContext(Dispatchers.IO) { host.store.chats(card?.id, group?.id, limit = 1).firstOrNull() }
+        when {
+            newest != null -> host.chats.openStoredChat(newest.id)
+            card != null -> host.chats.startChat(card, card.greeting)
+            group != null -> startGroupChat(group)
+            else -> Unit
+        }
+    }
+
+    fun newGroupChat(group: TavernGroup) = host.work { startGroupChat(group) }
+
+    private suspend fun startGroupChat(group: TavernGroup) {
+        val state = host.current
+        val prefs = state.prefs
+        val history = if (state.groupId == group.id) state.history else withContext(Dispatchers.IO) { host.store.chats(groupId = group.id) }
+        val title = if (history.isEmpty()) "新群聊" else "新群聊 · ${history.size + 1}"
+        val chat = Chat(
             newId(), null, title, groupId = group.id,
-            options = ConversationOptions(authorNote = host.current.prefs.defaultAuthorNote),
-        ))
+            options = ConversationOptions(authorNote = prefs.defaultAuthorNote),
+        )
+        val preset = state.copy(cardId = null, groupId = group.id).presetFor(chat)
+        val (messages, changes) = withContext(Dispatchers.Default) { group.openingMessages(chat, state.cards, prefs, preset) }
+        val options = chat.options.copy(variables = chat.options.variables.withVariableChanges(changes.local))
+        val globals = changes.global.takeIf { it.isNotEmpty() }?.let { host.current.prefs.scriptVariables.withVariableChanges(it) }
+        withContext(NonCancellable) {
+            host.persist(chat.copy(title = chat.availableTitle(history), messages = messages, options = options), scriptGlobals = globals)
+        }
         host.script.quickEvent(QuickEvent.NEW)
         host.script.quickEvent(QuickEvent.CHAT)
     }

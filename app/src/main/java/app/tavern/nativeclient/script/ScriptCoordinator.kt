@@ -5,18 +5,22 @@ import android.util.Log
 import app.tavern.nativeclient.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import org.json.JSONArray
 import org.json.JSONObject
 
 internal class ScriptCoordinator(private val host: CoordinatorHost) {
     private var scriptJob: Job? = null
     private var scriptAnswer: CompletableDeferred<String?>? = null
+    private val pendingTriggers = mutableSetOf<Job>()
     private val customTools = linkedMapOf<String, ModelTool>()
     internal var nativeDrawingToolRemoved = false
         private set
@@ -25,6 +29,8 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
 
     fun cancelScript() {
         scriptJob?.cancel()
+        pendingTriggers.toList().forEach { it.cancel() }
+        pendingTriggers.clear()
     }
 
     internal fun resetNativeDrawingTool() {
@@ -100,8 +106,8 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
             { host.persist(it) },
             host::persistPreferences,
             ::requestScriptInput,
-            ::scriptTrigger,
-            ::scriptGenerate,
+            ::requestTrigger,
+            { text, named -> scriptGenerate(text, named) },
             ::scriptDraft,
             host.media::scriptNarrate,
             { host.media.narrate(it, automatic = true) },
@@ -131,7 +137,42 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
                 if (!changes.isEmpty) host.persistMacroVariables(state.chat?.id, changes)
             },
             { chat -> withContext(Dispatchers.IO) { host.store.gallery(chat.cardId, chat.groupId) } },
+            host.chatTokenizers,
+            { text, named -> scriptGenerate(text, named, raw = true) },
+            ::scriptAsk,
+            host.library::updateGroupRoster,
+            ::scriptEditCharacter,
+            checkpointCommand = ::scriptCheckpoint,
+            updateWorldActivation = ::updateWorldActivation,
+            createBoundBook = ::createBoundBook,
+            chatAction = host.chats::scriptChatAction,
         ) { host.notice(it) }
+
+    private suspend fun updateWorldActivation(changes: List<WorldBook>) = withContext(NonCancellable) {
+        val books = withContext(Dispatchers.IO) { host.store.updateWorldActivation(changes); host.store.books() }
+        host.mutable.update { it.copy(books = books) }
+    }
+
+    private suspend fun createBoundBook(book: WorldBook, binding: ScriptWorldBinding) = withContext(NonCancellable) {
+        val (books, cards) = withContext(Dispatchers.IO) {
+            host.store.createBoundWorldBook(book, binding)
+            host.store.books() to if (binding is ScriptWorldBinding.Character) host.store.cards() else null
+        }
+        host.mutable.update { current ->
+            val linked = (binding as? ScriptWorldBinding.Conversation)?.chat?.takeIf { it.id == current.chat?.id }
+            val prefs = (binding as? ScriptWorldBinding.Persona)?.prefs ?: current.prefs
+            current.copy(books = books, cards = cards ?: current.cards, chat = linked ?: current.chat, prefs = prefs)
+        }
+    }
+
+    private suspend fun scriptCheckpoint(command: String, named: Map<String, String>, text: String): String {
+        val snapshot = host.current
+        val chat = requireNotNull(snapshot.chat) { "请先打开对话" }
+        return executeCheckpointCommand(command, named, text, chat, snapshot.history, host.chats::createChatFork) { target ->
+            require(host.current.generation == null) { "请等待当前回复结束再切换聊天" }
+            host.chats.openStoredChat(target.id).title
+        }
+    }
 
     private suspend fun scriptCaption(named: Map<String, String>, prompt: String): String {
         val chat = checkNotNull(host.current.chat) { "请先打开对话" }
@@ -425,19 +466,21 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
 
     internal suspend fun quickEvent(event: QuickEvent) = runAutomatic { event in it.events }
 
-    internal suspend fun quickWorldEvent(ids: Set<String>) = runAutomatic { it.automationId in ids }
+    internal suspend fun quickWorldEvent(ids: Set<String>) =
+        runAutomatic(ids.withIndex().associate { (index, id) -> id to index }) { it.automationId in ids }
 
-    private suspend fun runAutomatic(matches: (QuickReply) -> Boolean) {
+    private suspend fun runAutomatic(order: Map<String, Int> = emptyMap(), matches: (QuickReply) -> Boolean) {
         val config = host.current.prefs.quickReplies
         if (!config.enabled || preventNestedQuickReplies || quickReplyDepth >= 8) return
         val items = config.selected(host.current.chat).flatMap { set ->
             set.items.filter { matches(it) && it.message.isNotBlank() }.map { set to it }
         }
         if (items.isEmpty()) return
+        val ordered = if (order.isEmpty()) items else items.sortedBy { (_, item) -> order.getValue(item.automationId) }
         suspend fun play() {
             quickReplyDepth++
             try {
-                for ((set, item) in items) {
+                for ((set, item) in ordered) {
                     try {
                         playQuickReply(set, item, "", automatic = true)
                     } catch (e: CancellationException) {
@@ -496,64 +539,249 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
         }
     }
 
+    private suspend fun scriptEditCharacter(command: ScriptCharacterCommand, named: Map<String, String>): String {
+        val creating = command == ScriptCharacterCommand.CREATE
+        val source = if (creating) null else host.current.scriptCardTarget(named)
+            ?: return (if (command == ScriptCharacterCommand.DELETE) "false" else "").also { host.notice("找不到指定角色") }
+        if (command == ScriptCharacterCommand.DELETE) {
+            val card = requireNotNull(source)
+            val deleteChats = named["deleteChats"].orEmpty().scriptBoolean()
+            if (!named["silent"].orEmpty().scriptBoolean()) {
+                val details = if (deleteChats) "角色与关联的聊天和备份将被删除。"
+                    else "角色将被删除，关联聊天将保存在归档群组中。"
+                if (requestScriptInput(ScriptDialog(kind = "confirm-delete", title = "删除「${card.name}」？", text = details)) == null) {
+                    return "false"
+                }
+            }
+            if (host.current.generation != null &&
+                (host.current.cardId == card.id || host.current.generation?.characterId == card.id)) {
+                return "false".also { host.notice("该角色正在生成回复") }
+            }
+            return try {
+                host.library.removeCard(card, deleteChats)
+                "true"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                host.notice(e.localizedMessage ?: "无法删除角色")
+                "false"
+            }
+        }
+        val select = (creating || command == ScriptCharacterCommand.DUPLICATE) &&
+            named["select"].orEmpty().scriptBoolean(default = creating)
+        check(!select || host.current.generation == null) { "生成期间无法切换角色" }
+        val saved = if (command == ScriptCharacterCommand.DUPLICATE) host.library.copyCard(requireNotNull(source), keepName = true)
+        else {
+            val changes = ScriptCardChanges.from(named)
+            require(!creating || changes.fields.containsKey("name")) { "请输入角色名称" }
+            val portrait = named["avatar"]?.takeIf(String::isNotBlank)?.let {
+                scriptAvatar(it, named["avatarPromptResize"].orEmpty().scriptBoolean(default = true))
+            }
+            check(!select || host.current.generation == null) { "生成期间无法切换角色" }
+            host.library.saveScriptCard(source?.id, changes, portrait)
+        }
+        if (select) {
+            if (host.current.generation == null) host.chats.startChat(saved, saved.greeting)
+            else host.notice("角色已保存，当前回复结束后可打开角色")
+        }
+        return saved.scriptAvatarKey
+    }
+
+    private suspend fun scriptAvatar(input: String, crop: Boolean): ByteArray? {
+        val name = input.trim()
+        return try {
+            val source = if (name.equals("prompt", true)) {
+                val picked = requestScriptInput(ScriptDialog(kind = "image-file", title = "选择角色头像", text = "")) ?: return null
+                withContext(Dispatchers.IO) {
+                    checkNotNull(host.resolver.openInputStream(Uri.parse(picked))) { "无法读取头像" }.use { it.readLimited(MAX_IMAGE_SOURCE) }
+                }
+            } else withContext(Dispatchers.IO) {
+                originalGroupAvatarData(name) ?: localScriptAvatar(name)
+            }
+            val selected = if (crop) {
+                val data = requestScriptInput(ScriptDialog(kind = "avatar-crop", title = "裁剪角色头像", text = "", avatarBytes = source))
+                    ?: return null
+                requireNotNull(originalGroupAvatarData(data)) { "无法读取裁剪结果" }
+            } else source
+            withContext(Dispatchers.Default) { host.library.resizeAvatar(selected) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            host.notice(e.localizedMessage ?: "无法读取头像")
+            null
+        }
+    }
+
+    private fun localScriptAvatar(address: String): ByteArray {
+        val state = host.current
+        val path = address.removePrefix("./").removePrefix("/")
+        val filename = path.substringAfterLast('/')
+        val background = state.prefs.backgrounds.find(filename)?.image
+        val bytes = when {
+            address.startsWith("tavern://image/") -> {
+                val images = parseDrawingMarkup(address) { image ->
+                    host.imageStore.file(image).isFile || host.savedImages.file(image).isFile
+                }.images
+                images.singleOrNull()?.let { host.imageStore.bytes(it) ?: host.savedImages.bytes(it) }
+            }
+            path.startsWith("characters/", true) || '/' !in path -> scriptActor(state.cards, filename)?.takeIf(Card::hasAvatar)
+                ?.let { host.store.portraitFile(it.id).inputStream().use { file -> file.readLimited(MAX_IMAGE_SOURCE) } }
+            path.startsWith("User Avatars/", true) -> state.prefs.personas.firstOrNull { persona ->
+                "${persona.avatar}.png".equals(filename, true) || persona.name.equals(filename.substringBeforeLast('.'), true)
+            }?.avatar?.let { host.store.personaAvatar(it).inputStream().use { file -> file.readLimited(MAX_IMAGE_SOURCE) } }
+            path.startsWith("backgrounds/", true) -> background?.let { host.savedImages.bytes(it) ?: host.imageStore.bytes(it) }
+            path.startsWith("assets/", true) || path.startsWith("user/images/", true) -> {
+                val chat = state.chat
+                val images = chat?.messages.orEmpty().flatMap(Message::imageAssets) +
+                    (chat?.let { host.store.gallery(it.cardId, it.groupId).map(GalleryImage::image) }.orEmpty())
+                val image = images.firstOrNull { it.filename.equals(filename, true) || it.name.equals(filename, true) } ?: background
+                image?.let { host.imageStore.bytes(it) ?: host.savedImages.bytes(it) }
+            }
+            else -> null
+        }
+        return requireNotNull(bytes) { "未找到头像素材，可用 avatar=prompt 选择本机图片" }
+    }
+
     fun completeScriptDialog(id: String, response: String?) {
         if (host.current.scriptDialog?.id == id) scriptAnswer?.complete(response)
     }
 
-    private suspend fun scriptTrigger(name: String?): String {
+    private suspend fun requestTrigger(name: String?, awaitReply: Boolean) {
+        val chatId = requireNotNull(host.current.chat) { "请先打开对话" }.id
+        if (awaitReply) {
+            check(!host.generation.owns(currentCoroutineContext()[Job])) { "当前生成事件无法等待另一条回复" }
+            triggerWhenReady(chatId, name)
+            return
+        }
+        val queued = host.scope.launch(start = CoroutineStart.LAZY) {
+            val job = requireNotNull(currentCoroutineContext()[Job])
+            try {
+                yield()
+                triggerWhenReady(chatId, name)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (host.current.chat?.id == chatId) host.notice(e.localizedMessage ?: "无法触发回复")
+            } finally {
+                pendingTriggers.remove(job)
+            }
+        }
+        pendingTriggers += queued
+        queued.start()
+    }
+
+    private suspend fun triggerWhenReady(chatId: String, name: String?) {
+        val ready = awaitScriptTriggerSlot(host.mutable, chatId)
+        if (ready == true && host.current.chat?.id == chatId) scriptTrigger(name)
+        else if (ready == null && host.current.chat?.id == chatId) host.notice("仍有模型请求在进行，暂时无法触发新回复")
+    }
+
+    private suspend fun scriptTrigger(name: String?) {
         val chat = requireNotNull(host.current.chat) { "请先打开对话" }
         check(host.current.generation == null) { "已有模型请求在进行" }
         check(host.current.prefs.connectionFor(chat) != null) { "请先配置模型提供商" }
         val group = host.current.group
-        val speakers = if (group != null && name != null) {
-            listOfNotNull(group.members(host.current.cards).firstOrNull { it.name.equals(name, true) })
-        } else group?.nextTurn(host.current.cards, chat.messages) ?: listOfNotNull(host.current.card)
+        val specified = if (group != null && name != null) group.scriptMember(host.current.cards, name) else null
+        if (specified == null && group != null && name != null) host.notice("找不到群成员 $name，将按群聊设置选择发言者")
+        val speakers = specified?.let(::listOf) ?: group?.nextTurn(host.current.cards, chat.messages) ?: listOfNotNull(host.current.card)
         require(speakers.isNotEmpty()) { "找不到发言角色" }
         val generator = requireNotNull(host.generation.generate(chat, speakers))
         generator.join()
-        return host.current.chat?.messages?.drop(chat.messages.size)?.lastOrNull { it.role == "assistant" }?.text
-            ?: error(host.current.notice ?: "模型没有返回回复")
     }
 
-    private suspend fun scriptGenerate(text: String, named: Map<String, String>): String {
-        val chat = requireNotNull(host.current.chat) { "请先打开对话" }
+    private suspend fun scriptAsk(name: String, text: String): Message? {
+        val state = host.current
+        val chat = requireNotNull(state.chat) { "请先打开对话" }
+        if (chat.groupId != null) return null.also { host.notice("请在单聊使用 /ask") }
+        check(state.generation == null) { "已有模型请求在进行" }
+        val guest = scriptActor(state.cards, name, state.card) ?: return null.also { host.notice("找不到角色 $name") }
+        check(state.prefs.connectionFor(chat) != null) { "请先配置模型提供商" }
+        val prompt = withContext(Dispatchers.Default) {
+            state.textRules(chat).transform(text.trim(), RegexSite.COMMAND, RegexStage.STORAGE)
+        }
+        val addUser = prompt.isNotBlank()
+        val translation = chat.options.translation
+        val wire = if (addUser && translation.mode.input) {
+            host.chats.automaticTranslation(state.prefs, chat, prompt, translation.requestLanguage)
+        } else null
+        val active = checkNotNull(host.current.chat?.takeIf { it.id == chat.id && host.current.generation == null }) {
+            "对话已切换或正在生成回复"
+        }
+        val withPrompt = if (!addUser) active else active.copy(
+            updated = System.currentTimeMillis(), messages = active.messages + Message(
+                "user", state.persona.name, prompt, personaId = state.persona.id, wireText = wire,
+            ),
+        )
+        var reply: Message? = null
+        val generator = requireNotNull(host.generation.generate(withPrompt, listOf(guest), addUser = addUser,
+            preserveDraftAttachments = true, onSavedReply = { reply = it }))
+        generator.join()
+        return reply
+    }
+
+    private suspend fun scriptGenerate(text: String, named: Map<String, String>, raw: Boolean = false): String {
         val config = host.current
-        val character = requireNotNull(config.regexCard()) { "找不到发言角色" }
-        val connection = requireNotNull(config.prefs.connectionFor(chat)) { "请先配置模型提供商" }
-        val prefs = config.prefs.copy(
-            maxTokens = named["max"]?.toIntOrNull()?.takeIf { it > 0 }?.toString()
-                ?: config.prefs.maxTokens,
-        )
-        val history = chat.messages + listOfNotNull(
-            text.takeIf(String::isNotBlank)?.let { Message("user", config.persona.name, it) },
-        )
-        val group = config.group?.let {
+        val chat = config.chat
+        val prefs = config.prefs
+        val settings = ScriptGenerationOptions.read(named, raw) { key ->
+            chat?.options?.variables?.get(key) ?: prefs.scriptVariables[key] ?: key
+        }
+        val effective = prefs.effectiveConfig(chat)
+        val connection = host.provider.formattedConnection(requireNotNull(effective.connection) { "请先配置模型提供商" })
+        val explicit = settings.name.takeIf { !raw && it.isNotEmpty() }?.let { name ->
+            scriptActor(config.cards, name, config.regexCard())
+        }
+        val character = explicit ?: config.regexCard()
+        val group = config.group?.takeIf { character != null }?.let {
             GroupPrompt(
-                it, it.promptMembers(config.cards, character), it.members(config.cards).map(Card::name),
+                it, it.promptMembers(config.cards, requireNotNull(character)), it.members(config.cards).map(Card::name),
                 it.participants(config.cards).map(Card::name),
             )
         }
-        val output = StringBuilder()
-        val vectors = host.world.promptVectors(config.prefs, chat, character, config.persona, config.books, history)
-        val sharedMemory = host.world.promptSharedWorldMemory(chat, character, history, config.books, config.groups, config.cards)
-        val loreCounter = withContext(Dispatchers.Default) { host.loreTokenizers.counterFor(connection) }
+        val preset = config.presetFor(chat)
         var loreBudget: LoreBudgetUsage? = null
+        var contextBudget: PromptBudgetUsage? = null
+        fun capture(messages: JSONArray) {
+            if (chat == null) return
+            host.mutable.update { current -> current.copy(lastPrompt = PromptCapture(chat.id, connection.model, messages,
+                loreBudget, contextBudget, connection.provider.id)) }
+        }
+        if (raw) {
+            val macros = ConversationMacros(character, config.persona, chat?.messages.orEmpty(), group,
+                chat?.options ?: ConversationOptions(), prefs.scriptVariables, connection.model, chat?.id.orEmpty(), "quiet")
+            val turn = InstructTurn(config.persona.name, character?.name ?: "Assistant", trigger = "quiet",
+                group = group != null, quiet = !settings.asCharacter, expand = { macros.expand(it) })
+            val compiled = connection.provider.compiledRequestOptions(
+                PromptPostProcessingNames(turn.user, turn.character, group?.roster.orEmpty()),
+            ) { macros.expand(it) }
+            return ModelService.scriptRaw(connection, text, settings, preset, effective.sampling, turn,
+                prefs.customStops, prefs.replyFormatting, compiled, ::capture, host::notice,
+                tokenCounter = withContext(Dispatchers.Default) { host.chatTokenizers.counterFor(connection) })
+        }
+        requireNotNull(chat) { "请先打开对话" }
+        requireNotNull(character) { "找不到发言角色" }
+        val history = chat.messages
+        val quiet = ScriptQuietPrompt(text, explicit?.name ?: settings.name.ifBlank { "System" }, settings.asCharacter, settings.stops)
+        val recallHistory = if (text.isBlank()) history else history + Message("user", config.persona.name, text)
+        val output = StringBuilder()
+        val vectors = host.world.promptVectors(prefs, chat, character, config.persona, config.books, recallHistory)
+        val sharedMemory = host.world.promptSharedWorldMemory(chat, character, recallHistory, config.books, config.groups, config.cards)
+        val loreCounter = withContext(Dispatchers.Default) { host.chatTokenizers.counterFor(connection) }
         val result = ModelService.reply(
             prefs, connection, character, history, config.books, group, config.persona, chat.options,
-            "quiet", config.presetFor(chat),
-            onPrompt = { messages ->
-                host.mutable.update { it.copy(lastPrompt = PromptCapture(chat.id, connection.model, messages, loreBudget)) }
-            },
+            "quiet", preset, onPrompt = ::capture,
             readImage = host.imageStore::bytes, readDocument = host.documentStore::text, vectors = vectors,
             onRetry = { output.clear() }, sharedMemory = sharedMemory, loreCounter = loreCounter,
+            onContextBudget = { contextBudget = it.copy(firstHistoryIndex = null, firstHistoryDate = null) },
             onLoreBudget = {
                 loreBudget = it
                 if (it.blocked && prefs.loreSettings.overflowAlert) host.notice("世界书额度已达 ${it.limit} Token，部分条目未注入")
             },
             chatId = chat.id, onVariables = { host.persistMacroVariables(chat.id, it) },
-            effectiveSampling = prefs.effectiveConfig(chat).sampling,
+            effectiveSampling = effective.sampling.copy(maxTokens = settings.length?.toString() ?: effective.sampling.maxTokens),
+            quietPrompt = quiet,
         ) { output.append(it) }
         result.incomplete?.let(host::notice)
-        return output.toString().trim()
+        return output.toString().trim().let { if (settings.trim) trimToCompleteSentence(it) else it }
     }
 }

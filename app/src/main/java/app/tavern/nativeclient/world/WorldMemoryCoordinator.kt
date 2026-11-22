@@ -2,6 +2,7 @@ package app.tavern.nativeclient.world
 
 import android.net.Uri
 import app.tavern.nativeclient.*
+import app.tavern.nativeclient.script.ScriptWorldBinding
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -43,11 +44,21 @@ internal class WorldMemoryCoordinator(private val host: CoordinatorHost) {
         host.mutable.update { it.copy(books = books, cards = cards) }
     }
 
+    fun transferEntry(sourceId: String, targetId: String, entryId: Int, move: Boolean, done: (Int) -> Unit) = host.work {
+        val (newEntryId, books) = withContext(Dispatchers.IO) {
+            val id = host.store.transferWorldEntry(sourceId, targetId, entryId, move)
+            id to host.store.books()
+        }
+        host.mutable.update { it.copy(books = books) }
+        host.notice(if (move) "已移动世界书条目" else "已复制世界书条目")
+        done(newEntryId)
+    }
+
     fun importBook(uri: Uri, displayName: String) = host.work {
         val books = withContext(Dispatchers.IO) {
             val source = requireNotNull(host.resolver.openInputStream(uri)) { "无法打开世界书文件" }
-                .use { it.readLimited().toString(Charsets.UTF_8) }.trimStart('\uFEFF')
-            val parsed = WorldBook.import(JSONObject(source), displayName.removeSuffix(".json"))
+                .use { it.readLimited() }
+            val parsed = readWorldBook(source, displayName.substringBeforeLast('.'))
             saveImportedBook(parsed, host.store.books().map(WorldBook::name))
             host.store.books()
         }
@@ -55,15 +66,51 @@ internal class WorldMemoryCoordinator(private val host: CoordinatorHost) {
         host.notice("世界书已导入")
     }
 
+    fun importCardLore(ids: List<String>, done: () -> Unit) = host.work(completed = done) {
+        val requested = ids.toHashSet()
+        val state = host.current
+        var added = 0
+        try {
+            withContext(Dispatchers.IO) {
+                val books = host.store.books().toMutableList()
+                val names = books.mapTo(hashSetOf()) { it.name.lowercase(Locale.ROOT) }
+                val cards = host.store.cards()
+                val aliases = cards.uniqueLoreFilenames()
+                for (card in cards.filter { it.id in requested }) {
+                    currentCoroutineContext().ensureActive()
+                    val book = card.embeddedWorldBook() ?: continue
+                    if (books.any { it.id == book.id }) continue
+                    val title = generateSequence(1) { it + 1 }
+                        .map { if (it == 1) book.name else "${book.name} ($it)" }
+                        .first { names.add(it.lowercase(Locale.ROOT)) }
+                    val created = book.remapLoreFilters(aliases).copy(name = title)
+                    val bound = if (books.any { it.name == card.worldName }) {
+                        card.withAdditionalWorldBooks((card.additionalWorldBookIds + created.id).distinct())
+                    } else card.withWorld(title)
+                    host.store.createBoundWorldBook(created, ScriptWorldBinding.Character(bound))
+                    books += created
+                    added++
+                }
+            }
+        } finally {
+            if (added > 0) withContext(NonCancellable) {
+                val (books, cards) = withContext(Dispatchers.IO) { host.store.books() to host.store.cards() }
+                host.mutable.update { it.copy(books = books, cards = cards) }
+            }
+        }
+        host.notice(if (added == 0) "所选角色卡没有新的内嵌世界书" else "已提取并关联 $added 本世界书")
+    }
+
     internal fun saveImportedBook(book: WorldBook, names: List<String>) {
         val expected = names.mapTo(hashSetOf()) { it.lowercase() }
         val name = generateSequence(1) { it + 1 }.map { if (it == 1) book.name else "${book.name} ($it)" }
             .first { it.lowercase() !in expected }
-        host.store.save(book.copy(name = name))
+        host.store.save(book.remapLoreFilters(host.store.cards().uniqueLoreFilenames()).copy(name = name))
     }
 
     fun exportBook(uri: Uri, book: WorldBook) = host.work {
-        withContext(Dispatchers.IO) { host.writeUri(uri, book.export()) }
+        val names = host.current.cards.associate { it.id to it.scriptAvatarKey.loreFilenameStem() }
+        withContext(Dispatchers.IO) { host.writeUri(uri, book.remapLoreFilters(names).export()) }
         host.notice("世界书已导出")
     }
 
@@ -191,14 +238,32 @@ internal class WorldMemoryCoordinator(private val host: CoordinatorHost) {
         host.notice(if (failures.isEmpty()) "已导入 $imported 份资料" else "已导入 $imported 份资料 · ${failures.first()}")
     }
 
-    fun importDataUrl(owner: DataOwner, url: String) = host.utilityWork("正在提取网页文本…") {
+    fun importDataUrls(owner: DataOwner, urls: List<String>) = host.utilityWork("正在提取网页文本…") {
+        require(urls.size in 1..MAX_WEB_DOCUMENTS) { "每批最多导入 $MAX_WEB_DOCUMENTS 个网页" }
         checkDataOwner(owner)
-        val document = importWebDocument(url)
-        withContext(Dispatchers.IO) {
-            host.store.saveDocument(DataDocument(title = document.title, owner = owner, source = url.trim().take(2000)), document.text)
+        var imported = 0
+        val failures = mutableListOf<String>()
+        try {
+            for ((index, url) in urls.withIndex()) {
+                currentCoroutineContext().ensureActive()
+                try {
+                    val document = importWebDocument(url)
+                    checkDataOwner(owner)
+                    withContext(Dispatchers.IO) {
+                        host.store.saveDocument(DataDocument(title = document.title, owner = owner, source = url.trim().take(2000)), document.text)
+                    }
+                    imported++
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    failures += "第 ${index + 1} 个地址 · ${e.localizedMessage.orEmpty().take(180)}"
+                }
+            }
+        } finally {
+            withContext(NonCancellable) { host.refreshDataBank() }
         }
-        host.refreshDataBank()
-        host.notice("已导入网页资料")
+        val report = "已导入 $imported 份网页资料"
+        host.notice(if (failures.isEmpty()) report else "$report · ${failures.size} 项失败 · ${failures.first()}")
     }
 
     fun exportDataDocument(document: DataDocument, uri: Uri) = host.work {
@@ -437,7 +502,8 @@ internal class WorldMemoryCoordinator(private val host: CoordinatorHost) {
         return try {
             withTimeoutOrNull(18_000) {
                 val candidates = if (config.worldEnabled) withContext(Dispatchers.Default) {
-                    loreCandidates(card, books, persona, chat.options)
+                    val prefs = host.current.prefs
+                    loreCandidates(card, books, persona, chat.options, prefs.loreSettings, prefs.library.loreTags(card))
                 } else emptyList()
                 val documents = if (config.files.enabled) withContext(Dispatchers.IO) {
                     host.store.availableDocuments(card.id, chat.id)
@@ -460,7 +526,10 @@ internal class WorldMemoryCoordinator(private val host: CoordinatorHost) {
             if (config.chatEnabled) add(chatCorpus(chat.id, chat.messages, config, query = false))
             if (config.worldEnabled) {
                 val cards = snapshot.group?.members(snapshot.cards) ?: listOfNotNull(snapshot.card)
-                val lore = cards.flatMap { loreCandidates(it, snapshot.books, snapshot.persona, chat.options) }
+                val lore = cards.flatMap { card ->
+                    loreCandidates(card, snapshot.books, snapshot.persona, chat.options,
+                        snapshot.prefs.loreSettings, snapshot.prefs.library.loreTags(card))
+                }
                     .distinctBy(LoreCandidate::key)
                 add(worldCorpus(lore, config))
             }

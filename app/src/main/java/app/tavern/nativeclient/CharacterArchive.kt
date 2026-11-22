@@ -13,6 +13,15 @@ internal data class ImportedCharacterArchive(
     val card: CardImport, val chats: List<Chat>, val pictures: List<GalleryImage>, val skippedImages: Int,
 )
 
+internal fun avatarDecodeSample(width: Int, height: Int, keepSize: Boolean): Int {
+    if (keepSize) {
+        require(width.toLong() * height <= 16_000_000L) { "头像尺寸过大，无法原尺寸转换" }
+        return 1
+    }
+    var sample = 1
+    while (maxOf(width, height) / sample > 640) sample *= 2
+    return sample
+}
 internal fun readCharacterFiles(
     source: InputStream, filename: String, cache: File, userName: String,
     normalizePortrait: (ByteArray) -> ByteArray, saveImage: (ByteArray, String) -> ChatImage,
@@ -29,7 +38,10 @@ internal fun readCharacterFiles(
     input.reset()
     fun entry(card: CardImport) = ImportedCharacterArchive(card, emptyList(), emptyList(), 0)
     return when {
-        CardFile.isPng(header) -> listOf(entry(CardFile.read(input.readLimited())))
+        CardFile.isPng(header) -> {
+            val card = CardFile.read(input.readLimited())
+            listOf(entry(card.copy(portrait = card.portrait?.let(normalizePortrait))))
+        }
         CharacterArchive.matches(header, filename) ->
             listOf(CharacterArchive.read(input, header, cache, userName, normalizePortrait, saveImage, includeExtras))
         else -> readCharacterJson(input.readLimited()).map { entry(CardImport(it)) }

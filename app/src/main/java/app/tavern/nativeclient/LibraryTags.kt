@@ -121,10 +121,11 @@ private fun readAssignments(value: JSONObject?) = value?.let {
 private fun assignmentJson(assignments: Map<String, Set<String>>) =
     JSONObject(assignments.mapValues { (_, tags) -> JSONArray(tags.toList()) })
 
-internal data class LibraryTagImport(val preferences: LibraryPreferences, val added: Int, val unmatched: Int)
+internal data class LibraryTagImport(val preferences: LibraryPreferences, val added: Int, val unmatched: Int, val idMap: Map<String, String>)
 
 internal fun LibraryPreferences.mergeTags(
     backup: JSONObject, ownerFor: (String) -> String?, preserveAssignments: Boolean = false,
+    preserveEmptyAssignments: Boolean = false,
 ): LibraryTagImport {
     val rawTags = backup.optJSONArray("tags")?.objects().orEmpty().sortedBy { it.optInt("sort_order", Int.MAX_VALUE) }
     val byName = tags.associateByTo(linkedMapOf()) { it.name.tagKey() }
@@ -148,8 +149,9 @@ internal fun LibraryPreferences.mergeTags(
         if (preserveAssignments && key in assignments) continue
         val imported = selected.mapNotNullTo(linkedSetOf(), mapped::get)
         if (imported.isNotEmpty()) links[key] = links[key].orEmpty() + imported
+        else if (preserveEmptyAssignments && selected.isEmpty() && key !in links) links[key] = emptySet()
     }
-    return LibraryTagImport(copy(tags = byName.values.toList(), assignments = links), byName.size - tags.size, unmatched)
+    return LibraryTagImport(copy(tags = byName.values.toList(), assignments = links), byName.size - tags.size, unmatched, mapped)
 }
 
 internal fun LibraryPreferences.tagBackup(entities: List<LibraryItem>): JSONObject {
@@ -162,6 +164,7 @@ internal fun LibraryPreferences.tagBackup(entities: List<LibraryItem>): JSONObje
 internal fun browseLibrary(
     entries: List<LibraryItem>, catalog: LibraryPreferences, usage: Map<String, LibraryUsage>, query: String,
     included: Set<String>, excluded: Set<String>, folder: String?, onlyFavorites: Boolean,
+    advancedSearch: Boolean = false,
 ): List<LibraryItem> {
     val wanted = included + listOfNotNull(folder)
     val closed = if (catalog.folders && catalog.tags.none { it.id == folder && it.folder == TagFolder.CLOSED })
@@ -178,11 +181,28 @@ internal fun browseLibrary(
         LibrarySort.FAVORITES -> compareByDescending(LibraryItem::favorite).then(byName)
     }
     val term = query.trim()
+    val search = if (advancedSearch && term.isNotEmpty()) CharacterLibrarySearch(term) else null
     return entries.filter { item ->
-        (!onlyFavorites || item.favorite) && item.tags.containsAll(wanted) && item.tags.none { it in excluded || it in closed } &&
-            (term.isEmpty() || item.name.contains(term, true) || item.detail.contains(term, true) ||
-                item.card?.creator?.contains(term, true) == true || item.tags.any { names[it]?.contains(term, true) == true })
+        if (onlyFavorites && !item.favorite || !item.tags.containsAll(wanted) || item.tags.any { it in excluded || it in closed }) {
+            return@filter false
+        }
+        term.isEmpty() || (search?.matches(item, item.tags.mapNotNull(names::get)) ?:
+            (item.name.contains(term, true) || item.detail.contains(term, true) ||
+                item.card?.creator?.contains(term, true) == true || item.tags.any { names[it]?.contains(term, true) == true }))
     }.sortedWith(order)
+}
+
+internal fun LibraryPreferences.applyCardTagImport(
+    existingCards: List<Card>, importedCards: List<Card>, mode: CardTagImport,
+): LibraryPreferences {
+    if (importedCards.isEmpty() || mode == CardTagImport.ALL || mode == CardTagImport.ASK) return this
+    val current = materialized(existingCards)
+    val tagIds = current.tags.associate { it.name.tagKey() to it.id }
+    val assignments = importedCards.associate { card ->
+        val tags = if (mode == CardTagImport.EXISTING) card.tags.mapNotNull { tagIds[it.tagKey()] }.toSet() else emptySet()
+        libraryCardId(card.id) to tags
+    }
+    return current.copy(assignments = current.assignments + assignments)
 }
 
 internal fun libraryTagColor(value: String): Int? {

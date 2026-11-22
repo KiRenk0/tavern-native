@@ -78,6 +78,45 @@ class StScriptTest {
     }
 
     @Test
+    fun textReplacementPreservesOriginalSubstitutionTokensAndFlags() = runBlocking {
+        val script = StScript(FakeHost())
+        assertEquals("Blue [blue]$9", script.run("""/replace pattern="blue" replacer="[${'$'}&]${'$'}9" Blue blue"""))
+        assertEquals("[Blue] blue", script.run("""/re mode=regex pattern="/(blue)/i" replacer="[${'$'}1]" Blue blue"""))
+        assertEquals("@Blue @blue", script.run("""/replace mode=regex pattern="/(?<color>blue)/gi" replacer="@${'$'}<color>" Blue blue"""))
+        assertEquals("a[a<b>c]c", script.run("""/replace pattern=b replacer="[${'$'}`<${'$'}&>${'$'}']" abc"""))
+        assertEquals("$-a2-$9", scriptRegexReplace("/(a)/", "${'$'}${'$'}-${'$'}12-${'$'}9", "a"))
+    }
+
+    @Test
+    fun regexTestsAndMatchesCanBePipedIncludingUnmatchedCaptures() = runBlocking {
+        val script = StScript(FakeHost())
+        assertEquals("true", script.run("""/test pattern="/green/i" GREEN | /pass {{pipe}}"""))
+        assertEquals("false", script.run("""/test pattern="/green/" GREEN"""))
+        assertEquals("true", script.run("/test pattern=\"/^\$/\""))
+        assertEquals("[\"green\",null]", script.run("""/match pattern="green(t)?" green"""))
+        assertEquals("[[\"blue\",\"b\"],[\"Blue\",\"B\"]]", script.run("""/match pattern="/(b)lue/gi" blue Blue"""))
+        assertEquals("[[\"\"],[\"\"]]", script.run("""/match pattern="/(?=.)/g" 灯猫"""))
+        assertEquals("", script.run("/match pattern=red blue"))
+        assertEquals("[]", script.run("/match pattern=/red/g blue"))
+    }
+
+    @Test
+    fun arrayCommandsPreserveTypedJsonAndDoNotCoercePlainText() = runBlocking {
+        val script = StScript(FakeHost())
+        assertEquals("[\"42\"]", script.run("/array-wrap 42"))
+        assertEquals("[42]", script.run("/list-wrap stringify=false 42"))
+        assertEquals("[true]", script.run("/array-wrap stringify=off true"))
+        assertEquals("[null]", script.run("/array-wrap stringify=false null"))
+        assertEquals("[\"01\"]", script.run("/array-wrap stringify=false 01"))
+        assertEquals("[\"{city:1}\"]", script.run("/array-wrap {city:1}"))
+        assertEquals("[1, 2]", script.run("/array-wrap [1, 2]"))
+        assertEquals("{\"city\":\"Harbor\"}", script.run("""/array-wrap {"city":"Harbor"} | /list-unwrap"""))
+        assertEquals("", script.run("/array-unwrap [null,2]"))
+        assertEquals("", script.run("/array-unwrap []"))
+        assertEquals("plain", script.run("/list-unwrap plain"))
+    }
+
+    @Test
     fun pipelinesLetVarsAndLocalGlobalVariables() = runBlocking {
         val host = FakeHost()
         val script = StScript(host)

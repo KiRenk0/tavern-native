@@ -305,6 +305,10 @@ internal suspend fun synthesizeBackendAudio(narration: Narration): ByteArray {
         TtsBackend.ELEVENLABS -> synthesizeElevenLabs(options, voice, narration.text)
         TtsBackend.FISH_AUDIO -> synthesizeFishAudio(options, voice, narration.text)
         TtsBackend.GPT_SOVITS -> synthesizeGptSovits(options, voice, narration.text)
+        TtsBackend.GEMINI_NATIVE -> synthesizeGeminiVoice(requireNotNull(narration.backend), options, voice, narration.text)
+        TtsBackend.NOVELAI -> synthesizeNovelAiVoice(requireNotNull(narration.backend), voice, narration.text)
+        TtsBackend.VITS, TtsBackend.STYLE_BERT_VITS2, TtsBackend.XTTS, TtsBackend.SILERO, TtsBackend.COSYVOICE ->
+            synthesizeSelfHostedVoice(options, voice, narration.text)
     }
 }
 
@@ -313,10 +317,7 @@ internal suspend fun synthesizeElevenLabs(options: VoicePreferences, voiceId: St
     require(key.isNotBlank()) { "请填写 ElevenLabs API Key" }
     val targetVoice = voiceId.trim().ifBlank { options.elevenLabsVoiceId.trim() }
     require(targetVoice.isNotBlank()) { "请填写 ElevenLabs Voice ID" }
-    val base = options.ttsEndpoint.trim().ifBlank { "https://api.elevenlabs.io" }
-        .let { checkedAddress(it).toString().trimEnd('/') }
-        .removeSuffix("/v1/text-to-speech")
-        .removeSuffix("/v1")
+    val base = elevenLabsTtsRoot(options.ttsEndpoint)
     val encodedVoice = URLEncoder.encode(targetVoice, "UTF-8")
     val body = jsonOf(
         "text" to text,
@@ -327,6 +328,7 @@ internal suspend fun synthesizeElevenLabs(options: VoicePreferences, voiceId: St
         "$base/v1/text-to-speech/$encodedVoice",
         body = body,
         headers = mapOf("xi-api-key" to key, "Accept" to "audio/mpeg"),
+        redactError = { it.redactValue(key) },
     ) { input, type ->
         check(!type.startsWith("application/json", true)) { "ElevenLabs 返回了非音频响应" }
         input.readLimited(12 * 1024 * 1024).also { check(it.isNotEmpty()) { "ElevenLabs 未返回音频" } }

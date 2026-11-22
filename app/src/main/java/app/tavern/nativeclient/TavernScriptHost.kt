@@ -10,13 +10,13 @@ internal class TavernScriptHost(
     private val saveChat: suspend (Chat) -> Unit,
     private val savePrefs: suspend (Preferences) -> Unit,
     private val ask: suspend (ScriptDialog) -> String?,
-    private val generate: suspend (String?) -> String,
+    private val trigger: suspend (String?, Boolean) -> Unit,
     private val quiet: suspend (String, Map<String, String>) -> String,
     private val draft: (String) -> Unit,
     private val speak: (String, String?) -> Unit = { _, _ -> },
     private val posted: (Message) -> Unit = {},
     private val translate: suspend (String, String?) -> String = { _, _ -> "" },
-    private val summarize: suspend (String, String?) -> String = { _, _ -> "" },
+    private val summarize: suspend (String, Map<String, String>) -> String = { _, _ -> "" },
     private val dataBank: suspend (String, Map<String, String>, String) -> String = { _, _, _ -> "" },
     private val drawing: suspend (String, Map<String, String>, String) -> String = { _, _, _ -> "" },
     private val drawingMarkup: (String) -> ImageMarkup = { ImageMarkup(it, emptyList()) },
@@ -29,6 +29,20 @@ internal class TavernScriptHost(
     private val saveBook: suspend (WorldBook) -> Unit = { error("当前脚本环境不支持修改世界书") },
     private val clearVariables: suspend (Boolean) -> Unit = {},
     private val galleryImages: suspend (Chat) -> List<GalleryImage> = { emptyList() },
+    private val tokenizers: ChatTokenizers? = null,
+    private val generateRaw: suspend (String, Map<String, String>) -> String = { _, _ -> error("当前脚本环境不支持原始生成") },
+    private val askCharacter: suspend (String, String) -> Message? = { _, _ -> error("当前脚本环境不支持指定角色发言") },
+    private val updateGroup: suspend (String, (TavernGroup) -> TavernGroup) -> Boolean =
+        { _, _ -> error("当前脚本环境不支持修改群成员") },
+    private val editCharacter: suspend (ScriptCharacterCommand, Map<String, String>) -> String =
+        { _, _ -> error("当前脚本环境不支持编辑角色") },
+    private val checkpointCommand: suspend (String, Map<String, String>, String) -> String =
+        { _, _, _ -> error("当前脚本环境不支持聊天分支") },
+    private val updateWorldActivation: suspend (List<WorldBook>) -> Unit = { error("当前脚本环境不支持切换全局世界书") },
+    private val createBoundBook: suspend (WorldBook, app.tavern.nativeclient.script.ScriptWorldBinding) -> Unit =
+        { _, _ -> error("当前脚本环境不支持创建关联世界书") },
+    private val chatAction: suspend (ScriptChatAction, Chat, String) -> Unit =
+        { _, _, _ -> error("当前脚本环境不支持操作聊天档案") },
     private val notice: (String) -> Unit,
 ) : StScriptHost {
     private val state get() = snapshot()
@@ -69,13 +83,65 @@ internal class TavernScriptHost(
     override fun registerTool(tool: ModelTool) = addTool(tool)
 
     override suspend fun command(name: String, named: Map<String, String>, text: String): String? = when (name) {
+        "flat", "default", "bubble", "bubbles", "single", "story" -> {
+            val layout = when (name) {
+                "flat", "default" -> ChatLayoutMode.FLAT
+                "bubble", "bubbles" -> ChatLayoutMode.BUBBLE
+                else -> ChatLayoutMode.DOCUMENT
+            }
+            val prefs = state.prefs
+            if (prefs.chatAppearance.layoutMode != layout) {
+                savePrefs(prefs.copy(chatAppearance = prefs.chatAppearance.copy(layoutMode = layout)))
+            }
+            ""
+        }
+        "count" -> {
+            val chat = chat()
+            val connection = state.prefs.connectionFor(chat)
+            val counted = tokenizers?.countChat(chat, connection, TextTokenizer.MODEL) ?: withContext(Dispatchers.Default) {
+                TokenPreview(estimatedTokens.label, estimatedTokens.count(chatTokenText(chat)))
+            }
+            notice("${counted.count} Token · ${counted.source}")
+            counted.count.toString()
+        }
+        "trimtokens" -> {
+            val limit = (named["limit"] ?: named["tokens"])?.trim()?.toIntOrNull()
+                ?: error("请用 limit= 指定 Token 上限")
+            val connection = state.prefs.connectionFor(state.chat)
+            withContext(Dispatchers.Default) {
+                val counter = tokenizers?.counterFor(connection) ?: estimatedTokens
+                trimTokenText(text, limit, named["direction"].equals("start", true), counter)
+            }
+        }
         "echo", "toast" -> text.also(notice)
-        "send", "sendas", "sys", "comment" -> append(name, named, text)
-        "trigger" -> generate(named["name"] ?: text.takeIf(String::isNotBlank))
+        "send", "sendas", "sys", "comment" -> append(name, named, text).text
+        "trigger" -> "".also {
+            trigger(named["name"] ?: text.takeIf(String::isNotBlank), named["await"].orEmpty().scriptBoolean())
+        }
+        "ask" -> {
+            val returnType = scriptReturnType(named, fallback = "pipe")
+            val actor = named["name"]?.takeIf(String::isNotBlank)
+            if (actor == null) "".also { notice("请用 name= 指定要询问的角色") }
+            else askCharacter(actor, text)?.let { scriptReturn(it, returnType) }.orEmpty()
+        }
         "gen" -> quiet(text, named)
+        "getchatname" -> state.chat?.title.orEmpty()
+        "renamechat" -> runChatAction(ScriptChatAction.RENAME, text.trim())
+        "closechat" -> runChatAction(ScriptChatAction.CLOSE)
+        "chat-reload" -> runChatAction(ScriptChatAction.RELOAD)
+        "chat-jump", "chat-scrollto", "floor-teleport" -> runChatAction(ScriptChatAction.JUMP, text)
+        "genraw" -> if (text.isBlank()) "" else generateRaw(text, named)
+        "sysgen" -> {
+            if (text.isBlank()) "" else {
+                val returnType = scriptReturnType(named, fallback = "none")
+                val generated = quiet(text, named - "name")
+                val message = append("sys", named, generated, narratorPosition = true)
+                scriptReturn(message, returnType)
+            }
+        }
         "speak", "narrate", "tts" -> "".also { speak(text, named["voice"] ?: named["name"]) }
         "translate" -> translate(text, named["target"])
-        "summarize" -> summarize(text, named["prompt"])
+        "summarize" -> summarize(text, named)
         "db", "databank", "data-bank" -> dataBank("db", named, text)
         "sd", "img", "image", "imagine" -> drawing("draw", named, text)
         "sd-source", "img-source", "imagine-source" -> drawing("source", named, text)
@@ -84,6 +150,8 @@ internal class TavernScriptHost(
         "show-gallery" -> drawing("gallery", named, text)
         "expression-set", "expression" -> expression("set", named, text)
         "expression-list" -> expression("list", named, text)
+        "branch-create", "checkpoint-create", "checkpoint-go", "checkpoint-exit", "checkpoint-parent",
+        "checkpoint-get", "checkpoint-list" -> checkpointCommand(name, named, text)
         "caption" -> caption(named, text)
         "tools-list", "tool-list" -> tools("list", named, text)
         "tools-invoke", "tool-invoke" -> tools("invoke", named, text)
@@ -159,7 +227,15 @@ internal class TavernScriptHost(
         "help", "?" -> (if (text.equals("macros", true)) MACRO_HELP else HELP).also(notice)
         else -> {
             val databaseCommand = name.removePrefix("data-bank-").removePrefix("databank-").removePrefix("db-")
-            if (databaseCommand != name && databaseCommand in setOf("list", "get", "add", "update", "delete", "enable", "disable")) {
+            val groupCommand = ScriptGroupCommand.from(name)
+            val characterCommand = ScriptCharacterCommand.from(name)
+            if (characterCommand != null) {
+                scriptCharacter(characterCommand, named, text)
+            } else if (groupCommand != null) {
+                groupCommand.execute(state, named["field"] ?: "name", text, updateGroup, peek = { card ->
+                    ask(ScriptDialog(kind = "member-card", title = card.name, text = "", card = card))
+                }, notice = notice)
+            } else if (databaseCommand != name && databaseCommand in setOf("list", "get", "add", "update", "delete", "enable", "disable")) {
                 dataBank("db-$databaseCommand", named, text)
             } else {
                 app.tavern.nativeclient.script.ScriptExtensions.execute(
@@ -172,12 +248,60 @@ internal class TavernScriptHost(
                     saveBook = saveBook,
                     clearVariables = clearVariables,
                     galleryImages = galleryImages,
+                    updateWorldActivation = updateWorldActivation,
+                    createBoundBook = createBoundBook,
+                    notice = notice,
                 )
             }
         }
     }
 
-    private suspend fun append(command: String, named: Map<String, String>, text: String): String {
+    private suspend fun scriptCharacter(command: ScriptCharacterCommand, named: Map<String, String>, text: String): String {
+        val snapshot = state
+        return when (command) {
+            ScriptCharacterCommand.FIND -> {
+                val (card, ambiguous) = findScriptCharacter(snapshot, text, scriptFindTags(named["tag"].orEmpty()),
+                    named["preferCurrent"].orEmpty().scriptBoolean(default = true))
+                if (ambiguous && !named["quiet"].orEmpty().scriptBoolean()) notice("匹配到多个角色，已采用首个结果")
+                card?.scriptAvatarKey.orEmpty()
+            }
+            ScriptCharacterCommand.GET -> {
+                val card = snapshot.scriptCardTarget(named) ?: return "".also { notice("找不到指定角色") }
+                val field = named["field"] ?: text.takeIf(String::isNotBlank)?.trim()
+                val activeChat = snapshot.chat?.takeIf { it.cardId == card.id }?.title
+                val favorite = snapshot.prefs.library.favorites[libraryCardId(card.id)] ?: card.libraryFavorite
+                val value = card.scriptCardValue(field, favorite, activeChat) ?: return ""
+                val pretty = if (value is org.json.JSONObject) value.toString(2) else value.toString()
+                when (val type = named["return"]?.lowercase() ?: "pipe") {
+                    "pipe" -> pretty
+                    "object" -> JSONArray().put(value).toString().removeSurrounding("[", "]")
+                    "popup-html", "popup-text" -> "".also { ask(ScriptDialog(kind = "popup", title = card.name, text = pretty)) }
+                    "toast-text", "toast-html" -> "".also { notice(pretty) }
+                    "console" -> "".also { android.util.Log.i("TavernScript", pretty) }
+                    "none" -> ""
+                    else -> error("无法识别脚本返回方式 $type")
+                }
+            }
+            else -> editCharacter(command, named)
+        }
+    }
+
+    private fun scriptReturnType(named: Map<String, String>, fallback: String): String =
+        (named["return"]?.lowercase() ?: fallback).also {
+            require(it in setOf("none", "pipe", "object", "toast-text", "toast-html", "console")) { "无法识别脚本返回方式 $it" }
+        }
+
+    private fun scriptReturn(message: Message, type: String): String = when (type) {
+        "pipe" -> message.text
+        "object" -> message.toJson().toString()
+        "toast-text", "toast-html" -> "".also { notice(message.text) }
+        "console" -> "".also { android.util.Log.i("TavernScript", message.toJson().toString()) }
+        else -> ""
+    }
+
+    private suspend fun append(
+        command: String, named: Map<String, String>, text: String, narratorPosition: Boolean = false,
+    ): Message {
         val conversation = chat()
         val persona = state.persona
         val actorName = named["name"] ?: state.regexCard()?.name
@@ -188,25 +312,39 @@ internal class TavernScriptHost(
         val message = (when (command) {
             "send" -> Message("user", named["name"] ?: persona.name, filtered, personaId = persona.id)
             "sendas" -> Message("assistant", requireNotNull(actorName) { "请指定发言者" }, filtered, characterId = actor?.id)
-            "sys" -> Message("assistant", named["name"] ?: "旁白", filtered, raw = """{"extra":{"type":"narrator"}}""")
+            "sys" -> Message("assistant", named["name"] ?: "旁白", filtered,
+                raw = scriptNarratorMetadata(named["compact"].orEmpty().scriptBoolean()))
             else -> Message("system", named["name"] ?: "注释", filtered)
         }).copy(images = markup.images)
         val messages = conversation.messages.toMutableList()
         val offset = named["at"]?.toIntOrNull() ?: messages.size
-        val index = if (offset < 0) messages.size + offset + 1 else offset
+        val index = if (narratorPosition) scriptNarratorIndex(named["at"], messages.size)
+            else if (offset < 0) messages.size + offset + 1 else offset
         require(index in 0..messages.size) { "消息位置超出范围" }
         messages.add(index, message)
         saveChat(conversation.copy(messages = messages, updated = System.currentTimeMillis()))
         posted(message)
-        return filtered
+        return message
+    }
+
+    private suspend fun runChatAction(action: ScriptChatAction, target: String = ""): String {
+        val chat = state.chat
+        if (chat != null) chatAction(action, chat, target)
+        else if (action != ScriptChatAction.CLOSE) notice("请先打开对话")
+        return ""
     }
 
     companion object {
         const val HELP = "/pass · /let · /var · /getvar · /setvar · /addvar · /listvar · /flushvar · /flushglobalvar · /if · /while · /times · /break · /run · " +
-            "/echo · /input · /buttons · /send · /sendas · /sys · /comment · /trigger · /gen · /regex · /re-replace · /trimtokens · /setinput · /speak · /translate · /summarize · /db · /sd · /caption · /show-gallery · /bg · /preset · /char-get · " +
+            "/replace · /test · /match · /array-wrap · /array-unwrap · " +
+            "/getchatname · /renamechat · /closechat · /chat-reload · /chat-jump · " +
+            "/echo · /input · /buttons · /send · /sendas · /sys · /sysgen · /comment · /ask · /trigger · /gen · /genraw · /regex · /re-replace · /count · /trimtokens · /setinput · /speak · /translate · /summarize · /db · /sd · /caption · /show-gallery · /bg · /lockbg · /unlockbg · /preset · /char-get · " +
+            "/world · /getglobalbooks · /getchatbook · /getcharbook · /getpersonabook · /findentry · /getentryfield · /setentryfield · /createentry · " +
             "/wi-get-book · /wi-list-entries · /wi-get-entry · /wi-set-entry · /wi-create-entry · /wi-delete-entry · " +
             "/tools-register · /tools-list · /tools-invoke · /tools-unregister · /messages · /message-role · /message-name · " +
-            "/hide · /unhide · /cut · /del · /delname · /addswipe · /delswipe · /swipe · /model · /profile · /reroll-pick · /? macros"
+            "/hide · /unhide · /cut · /del · /delname · /addswipe · /delswipe · /swipe · " +
+            "/member-get · /member-count · /member-add · /member-remove · /member-enable · /member-disable · /member-up · /member-down · /member-peek · " +
+            "/char-find · /char-create · /char-update · /char-duplicate · /char-delete · /model · /profile · /reroll-pick · /? macros"
         const val MACRO_HELP = "{{char}} · {{user}} · {{persona}} · {{group}} · {{groupNotMuted}} · {{description}} · " +
             "{{scenario}} · {{charFirstMessage::1}} · {{model}} · {{lastUserMessage}} · {{summary}} · {{getvar::name}} · " +
             "{{setvar::name::值}} · {{incvar::计数}} · {{.name ??= 值}} · {{getglobalvar::name}} · " +

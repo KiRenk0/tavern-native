@@ -38,23 +38,56 @@ internal fun Chat.nextForkTitle(history: List<ChatSummary>, checkpoint: Boolean)
     return generateSequence(1) { it + 1 }.map { "$base · $kind $it" }.first { it !in used }
 }
 
-internal fun Chat.fork(position: Int, title: String, checkpoint: Boolean): Pair<Chat, Chat> {
+internal fun Chat.fork(position: Int, title: String, checkpoint: Boolean, swipe: Int? = null,
+                      forkId: String = newId()): Pair<Chat, Chat> {
     require(position in messages.indices) { "找不到所选消息" }
     require(title.isNotBlank()) { "请输入聊天名称" }
-    val id = newId()
     val now = System.currentTimeMillis()
     val header = this.header?.let(::JSONObject) ?: JSONObject()
     header.put("create_date", Instant.ofEpochMilli(now).toString())
     val metadata = header.optJSONObject("chat_metadata") ?: JSONObject().also { header.put("chat_metadata", it) }
     metadata.put("integrity", newId())
-    val child = copy(id = id, title = title, updated = now, messages = messages.take(position + 1),
-        header = header.toString(), options = options.copy(parent = ChatPointer(this.title, this.id)))
-    val pointer = ChatPointer(title, id)
     val original = messages[position]
+    require(swipe == null || swipe in original.variants.indices) { "找不到所选备选回复" }
+    val snapshot = if (swipe == null || swipe == original.index) messages.take(position + 1) else {
+        messages.take(position) + original.select(swipe).copy(summary = null)
+    }
+    val child = copy(id = forkId, title = title, updated = now, messages = snapshot,
+        header = header.toString(), options = options.copy(parent = ChatPointer(this.title, this.id)))
+    val pointer = ChatPointer(title, forkId)
     val messages = messages.toMutableList()
     messages[position] = if (checkpoint) original.copy(checkpoint = pointer)
         else original.copy(branches = original.branches + pointer)
     return copy(messages = messages) to child
+}
+
+internal fun Chat.refreshCheckpoint(position: Int, target: Chat, history: List<ChatSummary>): Pair<Chat, Chat> {
+    val link = messages.getOrNull(position)?.checkpoint?.resolve(history)
+    require(target.id != id && target.id == link?.id && target.cardId == cardId && target.groupId == groupId) {
+        "找不到这条消息的检查点"
+    }
+    require(target.options.parent?.resolve(history)?.id == id) { "找不到检查点和当前聊天的关联" }
+    val (parent, child) = fork(position, target.title, checkpoint = true, forkId = target.id)
+    val messages = child.messages.map { message ->
+        message.copy(checkpoint = message.checkpoint?.takeUnless { it.resolve(history)?.id == target.id },
+            branches = message.branches.filterNot { it.resolve(history)?.id == target.id })
+    }
+    return parent to child.copy(messages = messages)
+}
+
+internal fun Chat.retargetLegacyChatLinks(old: ChatSummary, newTitle: String): Chat {
+    fun update(pointer: ChatPointer): ChatPointer = if (pointer.id == null && pointer.title == old.title) {
+        ChatPointer(newTitle, old.id)
+    } else pointer
+    return copy(options = options.copy(parent = options.parent?.let(::update)), messages = messages.map { message ->
+        message.copy(checkpoint = message.checkpoint?.let(::update), branches = message.branches.map(::update))
+    })
+}
+
+internal enum class ChatExportFormat(val suffix: String, val mime: String, val label: String) {
+    JSONL("jsonl", "application/octet-stream", "导出聊天 JSONL"),
+    TEXT("txt", "text/plain", "导出聊天文本"),
+    ARCHIVE("zip", "application/zip", "导出聊天及附件 ZIP"),
 }
 
 internal const val CHAT_OWNER_KEY = "tavern_native_chat_owner"
@@ -113,16 +146,24 @@ internal fun Chat.withOwner(card: Card?, group: TavernGroup?, members: List<Card
         header = newHeader, options = if (detached) options.copy(parent = null) else options, messages = transferred)
 }
 
-internal fun Chat.availableTitle(history: List<ChatSummary>): String {
-    val titles = history.mapTo(hashSetOf(), ChatSummary::title)
+internal fun Chat.availableTitle(history: List<ChatSummary>): String =
+    availableTitle(history.mapTo(hashSetOf(), ChatSummary::title))
+
+internal fun Chat.availableTitle(titles: Set<String>): String {
     if (title !in titles) return title
     return generateSequence(2) { it + 1 }.map { "$title · $it" }.first { it !in titles }
 }
 
-internal fun joinContinuation(prefix: String, continuation: String, transform: (String) -> String = { it }): String {
+internal fun joinContinuation(prefix: String, continuation: String, spacing: ContinueSpacing? = null,
+                              transform: (String) -> String = { it }): String {
     if (continuation.isEmpty()) return prefix
     val suffix = transform(continuation)
     if (prefix.isEmpty() || suffix.isEmpty()) return prefix + suffix
+    if (spacing != null) {
+        if (suffix.isBlank()) return prefix
+        if (spacing == ContinueSpacing.NONE) return prefix + suffix
+        return prefix.trimEnd() + spacing.separator + suffix.trimStart()
+    }
     val last = prefix.last()
     val first = continuation.first()
     fun wordLike(character: Char) = character.isDigit() ||

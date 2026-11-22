@@ -1,19 +1,44 @@
 package app.tavern.nativeclient
 
 import org.json.JSONObject
+import java.util.Locale
 
 internal enum class DictationMode(val label: String) {
     APPEND("追加到草稿"), REPLACE("替换草稿"), SEND("直接发送");
 }
 
-internal enum class TtsBackend(val label: String, val usesCustomProvider: Boolean = false) {
+internal enum class TtsBackend(val label: String, val usesProvider: Boolean = false, val localPort: Int? = null) {
     SYSTEM("Android 系统朗读"),
-    OPENAI_COMPAT("OpenAI 兼容 TTS", usesCustomProvider = true),
+    OPENAI_COMPAT("OpenAI 兼容 TTS", usesProvider = true),
     EDGE_TTS("Edge 微软神经语音（免费）"),
     ELEVENLABS("ElevenLabs"),
     FISH_AUDIO("Fish Audio"),
     GPT_SOVITS("GPT-SoVITS（本地/自建）"),
+    GEMINI_NATIVE("Google Gemini TTS", usesProvider = true),
+    NOVELAI("NovelAI TTS", usesProvider = true),
+    VITS("VITS", localPort = 23456),
+    STYLE_BERT_VITS2("Style-Bert-VITS2", localPort = 5000),
+    XTTS("XTTSv2", localPort = 8020),
+    SILERO("Silero", localPort = 8001),
+    COSYVOICE("CosyVoice（非官方接口）", localPort = 9880);
+
+    val selfHosted get() = localPort != null
+    val hasOwnCredentials get() = this == ELEVENLABS || this == FISH_AUDIO || this == GPT_SOVITS || selfHosted
+
+    fun accepts(provider: Provider): Boolean = when (this) {
+        OPENAI_COMPAT -> provider.template == null
+        GEMINI_NATIVE -> provider.apiKey.isNotBlank() &&
+            (provider.template == ProviderTemplate.GOOGLE || provider.protocol == ApiProtocol.GEMINI_NATIVE)
+        NOVELAI -> provider.protocol == ApiProtocol.NOVELAI_TEXT && provider.apiKey.isNotBlank()
+        else -> false
+    }
 }
+
+internal const val DEFAULT_GEMINI_TTS_MODEL = "gemini-3.8-flash-tts"
+internal const val DEFAULT_GEMINI_TTS_VOICE = "Kore"
+internal const val DEFAULT_NOVELAI_TTS_VOICE = "Ligeia"
+
+internal data class TtsCredentials(val endpoint: String = "", val key: String = "")
 
 internal enum class SttBackend(val label: String) {
     SYSTEM("Android 系统语音识别"),
@@ -57,9 +82,51 @@ internal data class VoicePreferences(
     val requireOffline: Boolean = false,
     val shortcuts: Map<String, String> = emptyMap(),
     val translatedText: Boolean = false,
+    val inactiveTtsCredentials: Map<TtsBackend, TtsCredentials> = emptyMap(),
+    val geminiTtsProvider: String = "",
+    val geminiTtsModel: String = DEFAULT_GEMINI_TTS_MODEL,
+    val geminiTtsVoice: String = DEFAULT_GEMINI_TTS_VOICE,
+    val geminiTtsStyle: String = "",
+    val novelAiTtsProvider: String = "",
+    val novelAiTtsVoice: String = DEFAULT_NOVELAI_TTS_VOICE,
+    val selfHostedVoices: Map<TtsBackend, SelfHostedVoiceOptions> = emptyMap(),
 ) {
-    val activeBackend: TtsBackend
-        get() = if (ttsBackend == TtsBackend.SYSTEM && backendId.isNotBlank()) TtsBackend.OPENAI_COMPAT else ttsBackend
+    val activeBackend: TtsBackend get() = ttsBackend
+    val selfHostedVoice get() = selfHostedVoices[activeBackend] ?: SelfHostedVoiceOptions()
+
+    fun withSelfHostedVoice(value: SelfHostedVoiceOptions) = copy(
+        selfHostedVoices = if (value == SelfHostedVoiceOptions()) selfHostedVoices - activeBackend
+            else selfHostedVoices + (activeBackend to value),
+    )
+
+    fun speechProvider(providers: List<Provider>): Provider? {
+        val id = when (activeBackend) {
+            TtsBackend.OPENAI_COMPAT -> backendId.takeIf(String::isNotBlank) ?: return null
+            TtsBackend.GEMINI_NATIVE -> geminiTtsProvider
+            TtsBackend.NOVELAI -> novelAiTtsProvider
+            else -> return null
+        }
+        if (id.isBlank() && activeBackend == TtsBackend.GEMINI_NATIVE) {
+            providers.firstOrNull { it.template == ProviderTemplate.GOOGLE && activeBackend.accepts(it) }?.let { return it }
+        }
+        return providers.firstOrNull { (id.isBlank() || it.id == id) && activeBackend.accepts(it) }
+    }
+
+    fun credentialsFor(backend: TtsBackend): TtsCredentials? = when {
+        !backend.hasOwnCredentials -> null
+        backend == activeBackend -> TtsCredentials(ttsEndpoint, ttsApiKey)
+        else -> inactiveTtsCredentials[backend]
+    }
+
+    fun selectTtsBackend(backend: TtsBackend): VoicePreferences {
+        if (backend == activeBackend) return this
+        val selected = credentialsFor(backend) ?: TtsCredentials()
+        val stored = inactiveTtsCredentials.toMutableMap()
+        credentialsFor(activeBackend)?.takeUnless { it == TtsCredentials() }?.let { stored[activeBackend] = it }
+        stored.remove(backend)
+        return copy(ttsBackend = backend, ttsEndpoint = selected.endpoint, ttsApiKey = selected.key,
+            inactiveTtsCredentials = stored)
+    }
 
     val backendScopeKey: String
         get() = when (activeBackend) {
@@ -69,6 +136,10 @@ internal data class VoicePreferences(
             TtsBackend.ELEVENLABS -> "elevenlabs"
             TtsBackend.FISH_AUDIO -> "fish"
             TtsBackend.GPT_SOVITS -> "gptsovits"
+            TtsBackend.GEMINI_NATIVE -> "gemini:$geminiTtsProvider"
+            TtsBackend.NOVELAI -> "novelai:$novelAiTtsProvider"
+            TtsBackend.VITS, TtsBackend.STYLE_BERT_VITS2, TtsBackend.XTTS, TtsBackend.SILERO, TtsBackend.COSYVOICE ->
+                activeBackend.name.lowercase(Locale.ROOT)
         }
 
     val defaultVoice: String
@@ -79,6 +150,9 @@ internal data class VoicePreferences(
             TtsBackend.ELEVENLABS -> elevenLabsVoiceId
             TtsBackend.FISH_AUDIO -> fishReferenceId
             TtsBackend.GPT_SOVITS -> gptSovitsRefAudio
+            TtsBackend.GEMINI_NATIVE -> geminiTtsVoice.ifBlank { DEFAULT_GEMINI_TTS_VOICE }
+            TtsBackend.NOVELAI -> novelAiTtsVoice.ifBlank { DEFAULT_NOVELAI_TTS_VOICE }
+            TtsBackend.VITS, TtsBackend.STYLE_BERT_VITS2, TtsBackend.XTTS, TtsBackend.SILERO, TtsBackend.COSYVOICE -> selfHostedVoice.voice
         }
 
     fun actorVoice(actor: String?): String {
@@ -98,6 +172,22 @@ internal data class VoicePreferences(
         "ttsBackend" to activeBackend.name,
         "ttsEndpoint" to ttsEndpoint,
         "ttsApiKey" to seal(ttsApiKey),
+        "ttsProfiles" to JSONObject().apply {
+            inactiveTtsCredentials.forEach { (backend, credentials) ->
+                if (backend != activeBackend && backend.hasOwnCredentials) {
+                    put(backend.name, jsonOf("endpoint" to credentials.endpoint, "key" to seal(credentials.key)))
+                }
+            }
+        },
+        "geminiTtsProvider" to geminiTtsProvider,
+        "geminiTtsModel" to geminiTtsModel,
+        "geminiTtsVoice" to geminiTtsVoice,
+        "geminiTtsStyle" to geminiTtsStyle,
+        "novelAiTtsProvider" to novelAiTtsProvider,
+        "novelAiTtsVoice" to novelAiTtsVoice,
+        "selfHostedVoices" to JSONObject().apply {
+            selfHostedVoices.forEach { (backend, voice) -> put(backend.name, voice.json()) }
+        },
         "edgeVoice" to edgeVoice,
         "elevenLabsVoiceId" to elevenLabsVoiceId,
         "elevenLabsModelId" to elevenLabsModelId,
@@ -120,10 +210,14 @@ internal data class VoicePreferences(
         fun from(row: JSONObject?, unseal: (String) -> String = { it }): VoicePreferences {
             if (row == null) return VoicePreferences()
             val legacyBackendId = row.string("backendId")
-            val parsedTts = TtsBackend.entries.firstOrNull { it.name == row.string("ttsBackend") }
-                ?: if (legacyBackendId.isNotBlank()) TtsBackend.OPENAI_COMPAT else TtsBackend.SYSTEM
+            val choice = TtsBackend.entries.firstOrNull { it.name == row.string("ttsBackend") }
+            val parsedTts = if (legacyBackendId.isNotBlank() &&
+                (choice == null || choice == TtsBackend.SYSTEM && !row.has("ttsProfiles"))) {
+                TtsBackend.OPENAI_COMPAT
+            } else choice ?: TtsBackend.SYSTEM
             val parsedStt = SttBackend.entries.firstOrNull { it.name == row.string("sttBackend") }
                 ?: SttBackend.SYSTEM
+            val profiles = row.optJSONObject("ttsProfiles")
             return VoicePreferences(
                 enabled = row.optBoolean("enabled", true), automatic = row.optBoolean("automatic"),
                 includeUser = row.optBoolean("includeUser"), quoteOnly = row.optBoolean("quoteOnly"),
@@ -155,6 +249,19 @@ internal data class VoicePreferences(
                 language = row.string("language"), requireOffline = row.optBoolean("requireOffline"),
                 shortcuts = row.optJSONObject("shortcuts").variableStrings(),
                 translatedText = row.optBoolean("translatedText"),
+                inactiveTtsCredentials = TtsBackend.entries.filter { it != parsedTts && it.hasOwnCredentials }
+                    .mapNotNull { backend ->
+                        profiles?.optJSONObject(backend.name)?.let { backend to TtsCredentials(it.string("endpoint"), unseal(it.string("key"))) }
+                    }.toMap(),
+                geminiTtsProvider = row.string("geminiTtsProvider"),
+                geminiTtsModel = row.string("geminiTtsModel").ifBlank { DEFAULT_GEMINI_TTS_MODEL },
+                geminiTtsVoice = row.string("geminiTtsVoice").ifBlank { DEFAULT_GEMINI_TTS_VOICE },
+                geminiTtsStyle = row.string("geminiTtsStyle").take(1000),
+                novelAiTtsProvider = row.string("novelAiTtsProvider"),
+                novelAiTtsVoice = row.string("novelAiTtsVoice").ifBlank { DEFAULT_NOVELAI_TTS_VOICE },
+                selfHostedVoices = TtsBackend.entries.filter(TtsBackend::selfHosted).mapNotNull { backend ->
+                    row.optJSONObject("selfHostedVoices")?.optJSONObject(backend.name)?.let { backend to SelfHostedVoiceOptions.from(it) }
+                }.toMap(),
             )
         }
     }

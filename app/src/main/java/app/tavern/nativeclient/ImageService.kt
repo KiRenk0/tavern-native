@@ -9,25 +9,29 @@ import java.util.zip.ZipInputStream
 
 internal enum class ImageProtocol(val label: String, val source: String) {
     GEMINI("Google Gemini", "google"), COMPATIBLE("OpenAI 兼容", "openai"), DIFFUSION("AUTOMATIC1111 / Forge", "auto"),
-    NOVELAI("NovelAI", "novelai"),
+    NOVELAI("NovelAI", "novelai"), HORDE("AI Horde", "horde"),
     COMFY("ComfyUI", "comfy"), COMFY_RUNPOD("ComfyUI · RunPod", "comfyrunpod");
 
     val usesWorkflow get() = this == COMFY || this == COMFY_RUNPOD
     val supportsReferences get() = this == GEMINI || usesWorkflow
-    val usesSamplerParameters get() = this == DIFFUSION || this == NOVELAI || usesWorkflow
+    val usesSamplerParameters get() = this == DIFFUSION || this == NOVELAI || this == HORDE || usesWorkflow
 
-    fun available(provider: Provider) = when (this) {
-        GEMINI -> provider.template == ProviderTemplate.GOOGLE && provider.apiKey.isNotBlank()
-        COMPATIBLE, DIFFUSION, COMFY -> provider.template == null && provider.endpoint.isNotBlank()
-        NOVELAI -> provider.template == null && provider.apiKey.isNotBlank()
-        COMFY_RUNPOD -> provider.template == null && provider.endpoint.isNotBlank() && provider.apiKey.isNotBlank()
+    fun available(provider: Provider): Boolean {
+        if (provider.protocol == ApiProtocol.HORDE_TEXT) return this == HORDE && provider.endpoint.isNotBlank()
+        return when (this) {
+            GEMINI -> provider.template == ProviderTemplate.GOOGLE && provider.apiKey.isNotBlank()
+            COMPATIBLE, DIFFUSION, COMFY -> provider.template == null && provider.endpoint.isNotBlank()
+            NOVELAI -> provider.template == null && provider.apiKey.isNotBlank()
+            COMFY_RUNPOD -> provider.template == null && provider.endpoint.isNotBlank() && provider.apiKey.isNotBlank()
+            HORDE -> false
+        }
     }
 
     fun initialModel(provider: Provider) = when (this) {
         GEMINI -> DEFAULT_GEMINI_IMAGE
         COMPATIBLE, COMFY, COMFY_RUNPOD -> provider.defaultModel
         NOVELAI -> provider.defaultModel.ifBlank { "nai-diffusion-4-curated-preview" }
-        DIFFUSION -> ""
+        DIFFUSION, HORDE -> ""
     }
 }
 
@@ -57,6 +61,7 @@ internal class ImageService(private val geminiBase: String = "https://generative
             ImageProtocol.COMPATIBLE -> compatible(options)
             ImageProtocol.DIFFUSION -> diffusion(options)
             ImageProtocol.NOVELAI -> novelAi(options)
+            ImageProtocol.HORDE -> Horde(options.provider).image(options)
             ImageProtocol.COMFY, ImageProtocol.COMFY_RUNPOD ->
                 ComfyService().generate(options, comfy ?: ComfyInputs(defaultComfyWorkflow), readImage)
         }

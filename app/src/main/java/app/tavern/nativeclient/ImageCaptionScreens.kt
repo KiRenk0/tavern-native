@@ -42,6 +42,14 @@ internal fun CaptionSettingsScreen(state: TavernState, model: TavernViewModel, c
                         enabled = enabled) { Text("导入模型 ZIP") }
                 }
             }
+        } else if (options.source == CaptionSource.HORDE) {
+            val services = state.prefs.providers.filter(ImageProtocol.HORDE::available)
+            val id = options.hordeProviderId.orEmpty()
+            SelectField("图片描述提供商", id, (listOf("", id) + services.map(Provider::id)).distinct(),
+                { key -> if (key.isEmpty()) "自动选择 AI Horde 连接" else services.firstOrNull { it.id == key }?.name ?: "服务不可用" },
+                enabled) { options = options.copy(hordeProviderId = it.takeIf(String::isNotBlank)) }
+            if (services.isEmpty()) Text("请先在自定义提供商处保存 AI Horde 连接。", style = MaterialTheme.typography.bodySmall)
+            Text("图片将发送至 AI Horde。描述由在线节点生成。", style = MaterialTheme.typography.bodySmall)
         } else {
             SelectField("图片描述提供商", options.selection?.providerId.orEmpty(), listOf("") + providers.map(Provider::id), { id ->
                 if (id.isEmpty()) "自动（当前对话或 Google Gemini）" else providers.firstOrNull { it.id == id }?.name ?: "服务不可用"
@@ -82,7 +90,7 @@ internal fun CaptionSettingsScreen(state: TavernState, model: TavernViewModel, c
         GroupToggle("聊天模型仅接收图片文字描述", options.textOnly, enabled) { options = options.copy(textOnly = it) }
         Text("开启后，聊天请求用文字代替原图，适用于只接收文本的聊天模型。", style = MaterialTheme.typography.bodySmall)
         Button({ model.saveCaptionSettings(options.copy(selection = options.selection?.let { it.copy(model = it.model.trim()) }), close) },
-            enabled = enabled && (options.source == CaptionSource.LOCAL || options.selection?.model?.isBlank() != true),
+            enabled = enabled && (options.source != CaptionSource.MULTIMODAL || options.selection?.model?.isBlank() != true),
             modifier = Modifier.fillMaxWidth()) { Text("保存图片描述设置") }
     }
 }

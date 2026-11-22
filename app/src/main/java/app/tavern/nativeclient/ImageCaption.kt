@@ -10,7 +10,7 @@ private const val MAX_CAPTION_CONTEXT = 24_000
 private val captionMacro = Regex("""\{\{(caption|user|char)\}\}""")
 
 internal enum class CaptionSource(val label: String) {
-    MULTIMODAL("多模态模型"), LOCAL("手机本地（ViT-GPT2）")
+    MULTIMODAL("多模态模型"), LOCAL("手机本地（ViT-GPT2）"), HORDE("AI Horde")
 }
 
 internal data class CaptionSettings(
@@ -22,7 +22,12 @@ internal data class CaptionSettings(
     val ask: Boolean = false,
     val refine: Boolean = false,
     val textOnly: Boolean = false,
+    val hordeProviderId: String? = null,
 ) {
+    fun hordeProvider(prefs: Preferences) = prefs.providers.firstOrNull {
+        ImageProtocol.HORDE.available(it) && (hordeProviderId == null || it.id == hordeProviderId)
+    }
+
     fun connection(prefs: Preferences, chat: Chat?) = if (selection != null) {
         prefs.resolve(selection)?.takeIf { supportsImageCaptions(it.provider) }
     } else prefs.connectionFor(chat)?.takeIf { supportsImageCaptions(it.provider) }
@@ -44,7 +49,8 @@ internal data class CaptionSettings(
     }
 
     fun json() = jsonOf("source" to source.name, "selection" to selection?.json(), "prompt" to prompt,
-        "template" to template, "automatic" to automatic, "ask" to ask, "refine" to refine, "textOnly" to textOnly)
+        "template" to template, "automatic" to automatic, "ask" to ask, "refine" to refine, "textOnly" to textOnly,
+        "hordeProvider" to hordeProviderId)
 
     companion object {
         fun from(row: JSONObject?) = CaptionSettings(
@@ -54,12 +60,14 @@ internal data class CaptionSettings(
             template = row?.string("template")?.take(MAX_IMAGE_CAPTION)?.ifBlank { DEFAULT_CAPTION_TEMPLATE } ?: DEFAULT_CAPTION_TEMPLATE,
             automatic = row?.optBoolean("automatic") == true, ask = row?.optBoolean("ask") == true,
             refine = row?.optBoolean("refine") == true, textOnly = row?.optBoolean("textOnly") == true,
+            hordeProviderId = row?.string("hordeProvider")?.takeIf(String::isNotBlank),
         )
     }
 }
 
 internal fun supportsImageCaptions(provider: Provider) =
-    provider.ready && provider.template != ProviderTemplate.DEEPSEEK && provider.protocol != ApiProtocol.KOBOLD_TEXT
+    provider.ready && provider.template != ProviderTemplate.DEEPSEEK && provider.protocol != ApiProtocol.KOBOLD_TEXT &&
+        provider.protocol != ApiProtocol.NOVELAI_TEXT && provider.protocol != ApiProtocol.HORDE_TEXT
 
 internal data class CaptionImageTarget(val image: ChatImage, val messageIndex: Int? = null)
 
@@ -88,7 +96,7 @@ internal fun promptImageCaptions(history: List<Message>, settings: CaptionSettin
 
 internal suspend fun captionMultimodal(connection: ModelConnection, image: ChatImage, bytes: ByteArray,
                                        instruction: String): String {
-    require(bytes.isNotEmpty() && bytes.size <= MAX_STORED_IMAGE) { "图片大小无效" }
+    require(bytes.isNotEmpty() && bytes.size <= image.storageLimit) { "图片大小无效" }
     val messages = JSONArray(PromptLine("user", instruction.ifBlank { DEFAULT_CAPTION_PROMPT }, listOf(image.dataUrl(bytes))).wireRows())
     return ModelService.utility(connection, messages, maxTokens = null).take(MAX_IMAGE_CAPTION)
 }

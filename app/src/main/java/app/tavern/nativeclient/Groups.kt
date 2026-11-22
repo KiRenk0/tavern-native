@@ -29,6 +29,7 @@ internal data class TavernGroup(
     val autoDelaySeconds: Int = 5,
     val hideMutedSprites: Boolean = false,
     val favorite: Boolean = false,
+    val avatar: GroupAvatar? = null,
 ) {
     fun members(cards: List<Card>): List<Card> {
         val byId = cards.associateBy(Card::id)
@@ -83,10 +84,34 @@ internal data class TavernGroup(
         GroupPromptMode.JOIN_ALL -> members(cards)
     }.filterNot { it.id == speaker.id }
 
+    fun openingMessages(
+        chat: Chat, cards: List<Card>, prefs: Preferences, preset: PromptPreset?, random: Random = Random.Default,
+    ): Pair<List<Message>, MacroVariableChanges> {
+        val members = members(cards)
+        val names = members.map(Card::name)
+        val active = members.filterNot { it.id in mutedIds }.map(Card::name)
+        val persona = prefs.personaFor(chat)
+        val variables = MacroVariables(chat.options.variables, prefs.scriptVariables)
+        val model = prefs.connectionFor(chat)?.model.orEmpty()
+        val messages = buildList {
+            for (card in members) {
+                val greeting = card.greetings.randomOrNull(random) ?: continue
+                val group = GroupPrompt(this@TavernGroup, promptMembers(cards, card), names, active)
+                val macros = ConversationMacros(card, persona, this, group, chat.options,
+                    model = model, chatId = chat.id, variables = variables)
+                val rules = prefs.regex.runtime(card, persona.name, preset, names)
+                val text = rules.transform(macros.expand(greeting.trim(), write = true), RegexSite.REPLY, RegexStage.STORAGE)
+                if (text.isNotBlank()) add(Message("assistant", card.name, text, characterId = card.id, groupTurnId = newId()))
+            }
+        }
+        return messages to variables.changes()
+    }
+
     fun json() = jsonOf("name" to name, "members" to JSONArray(memberIds), "disabled_members" to JSONArray(mutedIds),
         "activation_strategy" to order.ordinal, "generation_mode" to promptMode.ordinal, "allow_self_responses" to allowSelf,
         "generation_mode_join_prefix" to prefix, "generation_mode_join_suffix" to suffix,
-        "auto_mode_delay" to autoDelaySeconds, "hideMutedSprites" to hideMutedSprites, "fav" to favorite)
+        "auto_mode_delay" to autoDelaySeconds, "hideMutedSprites" to hideMutedSprites, "fav" to favorite,
+        "avatar_url" to avatar?.dataUrl.orEmpty())
 
     companion object {
         fun from(id: String, raw: String): TavernGroup {
@@ -97,7 +122,7 @@ internal data class TavernGroup(
                 GroupPromptMode.entries.getOrElse(value.optInt("generation_mode")) { GroupPromptMode.SWAP },
                 value.optBoolean("allow_self_responses"), value.string("generation_mode_join_prefix"),
                 value.string("generation_mode_join_suffix"), value.optInt("auto_mode_delay", 5).coerceIn(1, 999),
-                value.optBoolean("hideMutedSprites"), value.optBoolean("fav"))
+                value.optBoolean("hideMutedSprites"), value.optBoolean("fav"), GroupAvatar.fromDataUrl(value.string("avatar_url")))
         }
     }
 }

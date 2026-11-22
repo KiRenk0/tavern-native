@@ -33,10 +33,23 @@ internal data class Generation(
     val chatId: String, val id: String = newId(), val text: String = "",
     val replacedMessages: Int = 0, val speaker: String = "", val action: ReplyAction = ReplyAction.NORMAL,
     val characterId: String? = null, val reasoning: String = "",
+    val hiddenReplyPrefix: String? = null,
+    val groupQueue: List<Card> = emptyList(),
 )
 
-internal data class ModelCatalog(val providerId: String, val endpoint: String, val models: List<String>, val contexts: Map<String, Int>)
-internal data class PromptCapture(val chatId: String, val model: String, val messages: JSONArray, val loreBudget: LoreBudgetUsage? = null)
+internal data class ModelCatalog(
+    val providerId: String, val endpoint: String, val models: List<String>, val contexts: Map<String, Int>,
+    val novelAiTier: Int? = null,
+    val hordeOutputs: Map<String, Int>? = null,
+)
+internal data class PromptCapture(
+    val chatId: String,
+    val model: String,
+    val messages: JSONArray,
+    val loreBudget: LoreBudgetUsage? = null,
+    val contextBudget: PromptBudgetUsage? = null,
+    val providerId: String? = null,
+)
 
 internal data class TavernState(
     val cards: List<Card> = emptyList(),
@@ -50,6 +63,7 @@ internal data class TavernState(
     val prefs: Preferences = Preferences(),
     val busy: Boolean = true,
     val generation: Generation? = null,
+    val googleReplies: List<OpenGoogleReply> = emptyList(),
     val autoChatId: String? = null,
     val temporaryPersonaId: String? = null,
     val suggestedDraft: DraftSuggestion? = null,
@@ -58,6 +72,7 @@ internal data class TavernState(
     val scriptDialog: ScriptDialog? = null,
     val toolProgress: String? = null,
     val messageSelection: MessageSelectionRequest? = null,
+    val archiveJump: ChatArchiveJump? = null,
     val draftImages: Map<String, List<ChatImage>> = emptyMap(),
     val draftImageCaptions: Map<String, Map<String, String>> = emptyMap(),
     val draftDocuments: Map<String, List<ChatDocument>> = emptyMap(),
@@ -77,6 +92,7 @@ internal data class TavernState(
     val dataDocuments: List<DataDocument> = emptyList(),
     val openDocument: DocumentText? = null,
     val openDataBank: Boolean = false,
+    val offeredCardLore: List<String> = emptyList(),
     val notice: String? = null,
     val catalog: ModelCatalog? = null,
     val remoteCards: List<RemoteCard>? = null,
@@ -97,6 +113,7 @@ internal data class TavernState(
     fun captionReady(options: CaptionSettings = prefs.captions) = when (options.source) {
         CaptionSource.MULTIMODAL -> options.connection(prefs, chat) != null
         CaptionSource.LOCAL -> localCaptionInstalled
+        CaptionSource.HORDE -> options.hordeProvider(prefs) != null
     }
 
     fun imageCaption(chatId: String, target: CaptionImageTarget): String = if (target.messageIndex == null) {
@@ -121,8 +138,8 @@ internal data class TavernState(
 
     fun replyingCharacter(message: Message): Card? {
         if (message.role != "assistant") return null
-        val members = group?.members(cards)
-            ?: return card?.takeIf { message.groupTurnId == null || message.isBy(it) }
+        val members = group?.members(cards) ?: return message.characterId?.let { id -> cards.firstOrNull { it.id == id } }
+            ?: card?.takeIf { message.groupTurnId == null || message.isBy(it) }
         if (message.characterId != null && cards.any { it.id == message.characterId }) {
             return members.firstOrNull { it.id == message.characterId }
         }
@@ -155,10 +172,13 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     override val resolver: ContentResolver = application.contentResolver
     override val savedImages = ChatImageStore(File(application.filesDir, "chat-images"))
     override val savedDocuments = ChatDocumentStore(File(application.filesDir, "chat-documents"))
+    override val savedVideos = ChatVideoStore(File(application.filesDir, "chat-videos"))
     override var temporaryMedia: TemporaryChatMedia? = null
     override val imageStore get() = temporaryMedia?.images ?: savedImages
     override val documentStore get() = temporaryMedia?.documents ?: savedDocuments
-    override val embedded = EmbeddedLibrary(File(application.noBackupFilesDir, "sillytavern/data/default-user"), savedDocuments, savedImages)
+    override val videoStore get() = temporaryMedia?.videos ?: savedVideos
+    override val embedded = EmbeddedLibrary(File(application.noBackupFilesDir, "sillytavern/data/default-user"),
+        savedDocuments, savedImages, savedVideos)
     val canImportEmbedded get() = embedded.exists
     override val imageService = ImageService()
     override val translationService = TranslationService()
@@ -171,7 +191,7 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     override val localCaptioner = LocalCaptioner(File(application.noBackupFilesDir, "caption-model")) {
         application.assets.open("caption-model/vocab.txt")
     }
-    override val loreTokenizers = LoreTokenizers(application.assets::open)
+    override val chatTokenizers = ChatTokenizers(application.assets::open)
     override val embeddingService = EmbeddingService(local = localEmbeddings)
     override val vectorSearch by lazy { VectorSearch(store, embeddingService) }
     override val mutable = MutableStateFlow(TavernState(busy = false))
@@ -236,6 +256,16 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun portrait(card: Card) = store.portraitFile(card.id)
     fun personaAvatar(persona: PersonaProfile) = persona.avatar?.let(store::personaAvatar)
     fun imageFile(image: ChatImage) = imageStore.file(image)
+    fun videoFile(video: ChatVideo) = videoStore.file(video)
+    fun exportVideo(uri: Uri, video: ChatVideo) = media.exportVideo(uri, video)
+    fun importVideo(chatId: String, uri: Uri, messageIndex: Int? = null) = media.importVideo(chatId, uri, messageIndex)
+    fun generateVideo(chatId: String, request: VideoRequest) = media.generateVideo(chatId, request)
+    fun removeMessageMedia(chatId: String, index: Int, filename: String? = null) = media.removeMessageMedia(chatId, index, filename)
+    fun setMessageMedia(chatId: String, index: Int, display: MessageMediaDisplay? = null, selected: Int? = null) =
+        media.setMessageMedia(chatId, index, display, selected)
+    fun backgroundFile(image: ChatImage) = media.backgroundFile(image)
+    suspend fun conversationStatistics(chat: Chat? = null, cardId: String? = null, groupId: String? = null) =
+        chats.conversationStatistics(chat, cardId, groupId)
 
     override fun work(completed: () -> Unit, action: suspend () -> Unit) {
         if (current.busy || current.generation != null || current.scriptRunning) return
@@ -286,7 +316,8 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
         requireNotNull(resolver.openOutputStream(uri, "wt")) { "无法写入所选文件" }.use { it.write(bytes) }
     }
 
-    override suspend fun persist(chat: Chat, drawing: GalleryImage?, scriptGlobals: Map<String, String>?) {
+    override suspend fun persist(chat: Chat, drawing: GalleryImage?, scriptGlobals: Map<String, String>?,
+                                 replyGallery: List<GalleryImage>) {
         val changedChat = current.chat?.id != chat.id
         val (saved, history) = withContext(Dispatchers.IO) {
             val validated = chat.copy(messages = chat.messages.removeInvalidSummaries())
@@ -294,7 +325,7 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
                 if (scriptGlobals != null) store.commitScriptVariables(null, scriptGlobals)
                 emptyList()
             } else {
-                if (scriptGlobals == null) store.save(validated, drawing)
+                if (scriptGlobals == null) store.save(validated, drawing, replyGallery)
                 else store.commitScriptVariables(validated, scriptGlobals)
                 if (changedChat) store.rememberLastChat(validated.id)
                 store.chats(validated.cardId, validated.groupId)
@@ -380,6 +411,7 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
                 lastPrompt = it.lastPrompt?.takeUnless { prompt -> prompt.chatId == id },
                 manualExpressions = it.manualExpressions.filterValues { expression -> expression.chatId != id },
                 messageSelection = it.messageSelection?.takeUnless { request -> request.chatId == id },
+                archiveJump = it.archiveJump?.takeUnless { jump -> jump.chatId == id },
             )
         }
     }
@@ -392,9 +424,15 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
                 groupId = chat.groupId,
                 chat = chat,
                 history = history,
+                googleReplies = it.googleReplies.filter { reply -> reply.chatId == chat.id },
+                archiveJump = null,
                 temporaryPersonaId = it.temporaryPersonaId.takeUnless { resetPersona },
             )
         }
+    }
+
+    fun clearGoogleReplies(chatId: String) {
+        mutable.update { it.copy(googleReplies = it.googleReplies.filterNot { reply -> reply.chatId == chatId }) }
     }
 
     // --- Chat documents ---
@@ -406,12 +444,14 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
 
     // --- Media: Voice, Images, Captions, Drawing, Expressions ---
     fun voiceForeground(visible: Boolean) = media.voiceForeground(visible)
+    fun previewReplySound() = media.playReplySound(preview = true)
     fun saveVoice(options: VoicePreferences, done: () -> Unit) = media.saveVoice(options, done)
     suspend fun systemVoices(): List<DeviceVoice> = media.systemVoices()
     fun previewVoice(options: VoicePreferences, voice: String, line: String) = media.previewVoice(options, voice, line)
     fun stopNarration() = media.stopNarration()
     fun narrate(message: Message, automatic: Boolean = false) = media.narrate(message, automatic)
     fun attachImages(chatId: String, documents: List<Uri>, ready: ((ChatImage) -> Unit)? = null) = media.attachImages(chatId, documents, ready)
+    fun attachMessageImages(chatId: String, index: Int, documents: List<Uri>) = media.attachImages(chatId, documents, messageIndex = index)
     fun removeDraftImage(chatId: String, image: ChatImage) = media.removeDraftImage(chatId, image)
     fun saveCaptionSettings(settings: CaptionSettings, done: () -> Unit) = media.saveCaptionSettings(settings, done)
     fun generateImageCaption(image: ChatImage, prompt: String, done: (String) -> Unit) = media.generateImageCaption(image, prompt, done)
@@ -433,6 +473,7 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun exportComfyWorkflow(uri: Uri, workflow: ComfyWorkflow) = media.exportComfyWorkflow(uri, workflow)
     fun testComfy(provider: Provider, protocol: ImageProtocol) = media.testComfy(provider, protocol)
     fun loadComfyOptions(provider: Provider, done: (ComfyCatalog) -> Unit) = media.loadComfyOptions(provider, done)
+    fun loadHordeImageModels(provider: Provider, done: (List<String>) -> Unit) = media.loadHordeImageModels(provider, done)
     fun showImageGallery() = media.showImageGallery()
     suspend fun expressionSprites(card: Card): List<ExpressionSprite> = media.expressionSprites(card)
     suspend fun expressionFrame(chatId: String, subject: ExpressionSubject, forScene: Boolean = false): ExpressionFrame? =
@@ -449,19 +490,52 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun clearDrawingBackground(chatId: String) = media.clearDrawingBackground(chatId)
     fun setDrawingBackground(chatId: String, image: ChatImage) = media.setDrawingBackground(chatId, image)
     fun importChatBackground(chatId: String, uri: Uri) = media.importChatBackground(chatId, uri)
+    fun importBackgrounds(uris: List<Uri>) = media.importBackgrounds(uris)
+    fun addLibraryBackground(image: ChatImage) = media.addLibraryBackground(image)
+    fun selectLibraryBackground(id: String?) = media.selectLibraryBackground(id)
+    fun renameLibraryBackground(id: String, name: String) = media.renameLibraryBackground(id, name)
+    fun removeLibraryBackground(id: String) = media.removeLibraryBackground(id)
+    fun setBackgroundFit(fit: BackgroundFit) = media.setBackgroundFit(fit)
     fun previousDrawing(chatId: String, index: Int) = media.previousDrawing(chatId, index)
     fun nextDrawing(chatId: String, index: Int): Boolean = media.nextDrawing(chatId, index)
 
     // --- Providers, Appearance, Presets, Profiles & Regex ---
     fun savePrefs(prefs: Preferences) = provider.savePrefs(prefs)
+    fun saveTextSystem(settings: TextSystemSettings, done: () -> Unit = {}) = provider.saveTextSystem(settings, done)
+    fun saveCustomStops(settings: CustomStoppingStrings, done: () -> Unit) = provider.saveCustomStops(settings, done)
+    fun saveReplyFormatting(value: ReplyFormatting, includeReasoning: Boolean?, done: () -> Unit) =
+        provider.saveReplyFormatting(value, includeReasoning, done)
     fun setVisualNovel(enabled: Boolean) = provider.setVisualNovel(enabled)
     fun setCardScriptsEnabled(enabled: Boolean) = provider.setCardScriptsEnabled(enabled)
     fun setChatAppearance(appearance: ChatAppearance) = provider.setChatAppearance(appearance)
+    fun setSwipeGestures(enabled: Boolean) = provider.setSwipeGestures(enabled)
+    fun setShowGroupQueue(enabled: Boolean) = provider.setShowGroupQueue(enabled)
+    fun setChatHandling(handling: ChatHandling) = provider.setChatHandling(handling)
+    suspend fun builtInChatThemes() = provider.builtInChatThemes()
+    fun saveChatTheme(name: String) = provider.saveChatTheme(name)
+    fun updateChatTheme(id: String) = provider.saveChatTheme(name = null, existingId = id)
+    fun applyChatTheme(id: String) = provider.applyChatTheme(id)
+    fun deleteChatTheme(id: String) = provider.deleteChatTheme(id)
+    fun importChatTheme(uri: Uri) = provider.importChatTheme(uri)
+    fun exportChatTheme(uri: Uri, id: String) = provider.exportChatTheme(uri, id)
     fun tokenCounterFor(connection: ModelConnection?): TextTokenCounter = provider.tokenCounterFor(connection)
+
+    suspend fun inspectTokens(connection: ModelConnection?, text: String, selection: TextTokenizer, remote: Boolean) =
+        chatTokenizers.inspect(connection, text, selection, remote)
+
+    suspend fun countChatTokens(chat: Chat, connection: ModelConnection?, selection: TextTokenizer) =
+        chatTokenizers.countChat(chat, connection, selection)
     fun setWelcomeAssistant(card: Card?) = provider.setWelcomeAssistant(card)
     fun setAutoOpenLastChat(enabled: Boolean) = provider.setAutoOpenLastChat(enabled)
     fun setReplyAutomation(options: ReplyAutomation, done: () -> Unit) = provider.setReplyAutomation(options, done)
     fun reportDraft(chatId: String, present: Boolean) = provider.reportDraft(chatId, present)
+
+    fun loadChatDraft(chat: Chat): String =
+        if (current.prefs.chatHandling.restoreDraft && !chat.isTemporary) store.chatDraft(chat.id) else ""
+
+    fun saveChatDraft(chat: Chat, text: String) {
+        if (current.prefs.chatHandling.restoreDraft && !chat.isTemporary) store.saveChatDraft(chat.id, text)
+    }
     fun setRecentChats(visible: Boolean, count: Int) = provider.setRecentChats(visible, count)
     fun toggleRecentPin(id: String) = provider.toggleRecentPin(id)
     fun setDefaultAuthorNote(note: AuthorNote, done: () -> Unit) = provider.setDefaultAuthorNote(note, done)
@@ -484,6 +558,8 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun setDefaultProvider(provider: Provider) = this.provider.setDefaultProvider(provider)
     fun deleteProvider(provider: Provider, done: () -> Unit) = this.provider.deleteProvider(provider, done)
     fun loadModels(provider: Provider, persistCatalog: Boolean = false) = this.provider.loadModels(provider, persistCatalog)
+    fun loadFormattingMetadata(provider: Provider, model: String, done: (BackendModelFormatting) -> Unit) =
+        this.provider.loadFormattingMetadata(provider, model, done)
     fun switchModel(selection: ModelSelection?) = provider.switchModel(selection)
     fun saveConnectionProfile(draft: ConnectionProfile, done: () -> Unit) = provider.saveConnectionProfile(draft, done)
     fun deleteConnectionProfile(profileId: String, done: () -> Unit) = provider.deleteConnectionProfile(profileId, done)
@@ -514,6 +590,7 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun bindSubjectPersona(id: String?) = library.bindSubjectPersona(id)
     fun saveCard(card: Card, done: () -> Unit) = library.saveCard(card, done)
     fun sortLibrary(sort: LibrarySort) = library.sortLibrary(sort)
+    fun setCharacterLibrary(options: CharacterLibraryOptions) = library.setCharacterLibrary(options)
     fun showLibraryFolders(show: Boolean) = library.showLibraryFolders(show)
     fun toggleLibraryFavorite(id: String) = library.toggleLibraryFavorite(id)
     fun saveLibraryTag(tag: LibraryTag, done: () -> Unit) = library.saveLibraryTag(tag, done)
@@ -525,8 +602,8 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun importLibraryTags(uri: Uri) = library.importLibraryTags(uri)
     fun addExample() = library.addExample()
     fun importCard(uri: Uri) = library.importCard(uri)
-    fun importCards(uris: List<Uri>) = library.importCards(uris)
-    fun importExternalContent(addresses: String): Boolean = library.importExternalContent(addresses)
+    fun importCards(uris: List<Uri>, mode: CardTagImport) = library.importCards(uris, mode)
+    fun importExternalContent(addresses: String, mode: CardTagImport): Boolean = library.importExternalContent(addresses, mode)
     fun updateCardFromLink(card: Card, address: String): Boolean = library.updateCardFromLink(card, address)
     fun updateCardFromFile(card: Card, uri: Uri) = library.updateCardFromFile(card, uri)
     fun duplicateCard(card: Card) = library.duplicateCard(card)
@@ -539,11 +616,28 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun openGroup(group: TavernGroup) = library.openGroup(group)
     fun deleteGroup(group: TavernGroup) = library.deleteGroup(group)
     fun newGroupChat(group: TavernGroup) = library.newGroupChat(group)
+    fun openFavoriteConversation(item: LibraryItem) = library.openFavoriteConversation(item)
 
     // --- Backup & Remote ---
     fun importEmbedded() = backup.importEmbedded()
     fun importOriginalBackup(uri: Uri) = backup.importOriginalBackup(uri)
     fun exportOriginalBackup(uri: Uri) = backup.exportOriginalBackup(uri)
+    suspend fun settingsSnapshots() = backup.settingsSnapshots()
+    suspend fun chatBackups() = withContext(Dispatchers.IO) { store.chatBackups() }
+    suspend fun previewChatBackup(id: Long) = withContext(Dispatchers.IO) { store.chatBackup(id) }
+    fun setAutomaticChatBackups(enabled: Boolean) = work { withContext(Dispatchers.IO) { store.setAutomaticChatBackups(enabled) } }
+    fun saveChatBackup(id: String) = work {
+        withContext(Dispatchers.IO) { store.saveChatBackup(id) }
+        notice("当前聊天已备份")
+    }
+    fun deleteChatBackup(id: Long) = work { withContext(Dispatchers.IO) { store.deleteChatBackup(id) } }
+    fun restoreChatBackup(id: Long, done: () -> Unit) = chats.restoreChatBackup(id, done)
+    fun createSettingsSnapshot(name: String) = backup.createSettingsSnapshot(name)
+    fun renameSettingsSnapshot(id: String, name: String) = backup.renameSettingsSnapshot(id, name)
+    fun deleteSettingsSnapshot(id: String) = backup.deleteSettingsSnapshot(id)
+    fun importSettingsSnapshot(uri: Uri) = backup.importSettingsSnapshot(uri)
+    fun exportSettingsSnapshot(id: String, uri: Uri) = backup.exportSettingsSnapshot(id, uri)
+    fun restoreSettingsSnapshot(id: String) = backup.restoreSettingsSnapshot(id)
     fun listRemote(address: String, handle: String, password: String, basicUser: String, basicPassword: String) =
         backup.listRemote(address, handle, password, basicUser, basicPassword)
     fun clearRemote() = backup.clearRemote()
@@ -565,7 +659,11 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
 
     // --- World Books, Shared Memory 2.0, Vectors & Data Bank ---
     fun saveBook(book: WorldBook, done: () -> Unit) = world.saveBook(book, done)
+    fun importCardLore(ids: List<String>, done: () -> Unit = {}) = world.importCardLore(ids, done)
+    fun dismissCardLoreOffer() = mutable.update { it.copy(offeredCardLore = emptyList()) }
     fun deleteBook(book: WorldBook) = world.deleteBook(book)
+    fun transferLoreEntry(sourceId: String, targetId: String, entryId: Int, move: Boolean, done: (Int) -> Unit) =
+        world.transferEntry(sourceId, targetId, entryId, move, done)
     fun importBook(uri: Uri, displayName: String) = world.importBook(uri, displayName)
     fun exportBook(uri: Uri, book: WorldBook) = world.exportBook(uri, book)
     fun saveVectorPreferences(options: VectorPreferences, done: () -> Unit) = world.saveVectorPreferences(options, done)
@@ -579,7 +677,7 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun closeDataDocument() = world.closeDataDocument()
     fun saveDataDocument(document: DataDocument, text: String?, done: () -> Unit) = world.saveDataDocument(document, text, done)
     fun importDataDocuments(owner: DataOwner, uris: List<Uri>) = world.importDataDocuments(owner, uris)
-    fun importDataUrl(owner: DataOwner, url: String) = world.importDataUrl(owner, url)
+    fun importDataUrls(owner: DataOwner, urls: List<String>) = world.importDataUrls(owner, urls)
     fun exportDataDocument(document: DataDocument, uri: Uri) = world.exportDataDocument(document, uri)
     fun deleteDataDocument(id: String) = world.deleteDataDocument(id)
     fun indexDataDocuments(owner: DataOwner) = world.indexDataDocuments(owner)
@@ -603,23 +701,37 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun newChat(card: Card, greeting: String) = chats.newChat(card, greeting)
     fun startWelcomeChat(message: String, opened: () -> Unit) = chats.startWelcomeChat(message, opened)
     fun openChat(id: String) = chats.openChat(id)
+    fun reloadChat(id: String) = chats.reloadChat(id)
+    suspend fun searchChats(scope: ChatArchiveScope, query: String, after: ChatArchiveCursor?) =
+        withContext(Dispatchers.IO) { store.searchChats(scope, ChatArchiveQuery(query), after) }
+    fun openArchiveHit(hit: ChatArchiveHit, query: String) = chats.openArchiveHit(hit, query)
+    fun dismissArchiveJump(jump: ChatArchiveJump) = mutable.update {
+        if (it.archiveJump == jump) it.copy(archiveJump = null) else it
+    }
     fun openTemporaryChat(uri: Uri? = null, title: String = "临时聊天") = chats.openTemporaryChat(uri, title)
     fun renameChat(chat: Chat, name: String) = chats.renameChat(chat, name)
-    fun forkChat(position: Int, checkpoint: Boolean, requestedName: String = "") = chats.forkChat(position, checkpoint, requestedName)
+    fun renameChatFile(id: String, name: String, done: () -> Unit) = chats.renameChatFile(id, name, done)
+    fun refreshCheckpoint(position: Int, checkpointId: String) = chats.refreshCheckpoint(position, checkpointId)
+    fun forkChat(position: Int, checkpoint: Boolean, requestedName: String = "", swipe: Int? = null) =
+        chats.forkChat(position, checkpoint, requestedName, swipe)
     fun convertToGroup(done: () -> Unit) = chats.convertToGroup(done)
     fun copyChatTo(ownerId: String, toGroup: Boolean, done: () -> Unit) = chats.copyChatTo(ownerId, toGroup, done)
     fun loadChatImportHistory(ownerId: String, fromGroup: Boolean, loaded: (List<ChatSummary>) -> Unit) =
         chats.loadChatImportHistory(ownerId, fromGroup, loaded)
     fun importLocalChat(sourceOwnerId: String, chatId: String, done: () -> Unit) = chats.importLocalChat(sourceOwnerId, chatId, done)
     fun removeChat(chat: ChatSummary) = chats.removeChat(chat)
-    fun importChat(uri: Uri, title: String) = chats.importChat(uri, title)
+    fun importChats(uris: List<Uri>) = chats.importChats(uris)
     fun exportChat(uri: Uri, chat: Chat, subject: String, withAttachments: Boolean = false) = chats.exportChat(uri, chat, subject, withAttachments)
     fun exportChatText(uri: Uri, chat: Chat) = chats.exportChatText(uri, chat)
-    fun editMessage(chat: Chat, index: Int, text: String) = chats.editMessage(chat, index, text)
+    fun exportChatFile(uri: Uri, id: String, format: ChatExportFormat) = chats.exportChatFile(uri, id, format)
+    fun editMessage(chat: Chat, index: Int, text: String, done: () -> Unit = {}) = chats.editMessage(chat, index, text, done)
     fun editReasoning(chat: Chat, index: Int, text: String) = chats.editReasoning(chat, index, text)
-    fun deleteMessages(chat: Chat, indices: Set<Int>, includeTools: Boolean = true) = chats.deleteMessages(chat, indices, includeTools)
-    fun duplicateMessage(chat: Chat, index: Int) = chats.duplicateMessage(chat, index)
-    fun moveMessage(chat: Chat, index: Int, direction: Int) = chats.moveMessage(chat, index, direction)
+    fun deleteMessages(chat: Chat, indices: Set<Int>, includeTools: Boolean = true, done: () -> Unit = {}) =
+        chats.deleteMessages(chat, indices, includeTools, done)
+    fun duplicateMessage(chat: Chat, index: Int, draft: String? = null, done: () -> Unit = {}) =
+        chats.duplicateMessage(chat, index, draft, done)
+    fun moveMessage(chat: Chat, index: Int, direction: Int, done: () -> Unit = {}) =
+        chats.moveMessage(chat, index, direction, done)
     fun swipe(chat: Chat, messageIndex: Int, option: Int) = chats.swipe(chat, messageIndex, option)
     fun removeReplyAlternative(chatId: String, messageIndex: Int, option: Int) = chats.removeReplyAlternative(chatId, messageIndex, option)
     fun saveTranslation(options: TranslationOptions, done: () -> Unit) = chats.saveTranslation(options, done)
@@ -630,12 +742,16 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun translateChat(options: TranslationOptions) = chats.translateChat(options)
     fun clearTranslations() = chats.clearTranslations()
     fun saveMemory(options: MemoryOptions, text: String, done: () -> Unit) = chats.saveMemory(options, text, done)
+    fun saveSummaryExtras(settings: SummaryExtrasSettings, done: () -> Unit) = chats.saveSummaryExtras(settings, done)
     fun restoreMemory() = chats.restoreMemory()
     fun summarizeChat(options: MemoryOptions) = chats.summarizeChat(options)
     fun send(text: String, interpretCommands: Boolean = true): Boolean = generation.send(text, interpretCommands)
+    fun submitChatDraft(text: String): Boolean = generation.send(text, allowContinueWhenEmpty = true)
     fun regenerate() = generation.regenerate()
     fun continueReply() = generation.continueReply()
     fun nextAlternative() = generation.nextAlternative()
+    fun rerollToken(chatId: String, message: Message, token: Int, candidate: ReplyTokenCandidate) =
+        generation.rerollToken(chatId, message, token, candidate)
     fun impersonate() = generation.impersonate()
     fun consumeDraft(suggestion: DraftSuggestion) = generation.consumeDraft(suggestion)
     fun speakAs(character: Card) = generation.speakAs(character)

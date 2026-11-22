@@ -23,16 +23,18 @@ internal interface CoordinatorHost {
     val current: TavernState
     val savedImages: ChatImageStore
     val savedDocuments: ChatDocumentStore
+    val savedVideos: ChatVideoStore
     var temporaryMedia: TemporaryChatMedia?
     val imageStore: ChatImageStore
     val documentStore: ChatDocumentStore
+    val videoStore: ChatVideoStore
     val embedded: EmbeddedLibrary
     val imageService: ImageService
     val translationService: TranslationService
     val localExpressions: LocalExpressions
     val localEmbeddings: LocalEmbeddings
     val localCaptioner: LocalCaptioner
-    val loreTokenizers: LoreTokenizers
+    val chatTokenizers: ChatTokenizers
     val embeddingService: EmbeddingService
     val vectorSearch: VectorSearch
     var draftInProgress: String?
@@ -52,7 +54,8 @@ internal interface CoordinatorHost {
     fun utilityConnection(chat: Chat): ModelConnection
     fun cancelUtility()
     fun writeUri(uri: Uri, bytes: ByteArray)
-    suspend fun persist(chat: Chat, drawing: GalleryImage? = null, scriptGlobals: Map<String, String>? = null)
+    suspend fun persist(chat: Chat, drawing: GalleryImage? = null, scriptGlobals: Map<String, String>? = null,
+                        replyGallery: List<GalleryImage> = emptyList())
     suspend fun persistPreferences(prefs: Preferences)
     suspend fun persistMacroVariables(chatId: String?, changes: MacroVariableChanges)
     suspend fun refreshRecentChats()

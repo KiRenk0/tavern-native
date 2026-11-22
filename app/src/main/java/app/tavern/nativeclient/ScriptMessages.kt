@@ -44,15 +44,24 @@ internal fun Message.withoutAlternative(option: Int): Message {
     }
     val originalIndices = variants.indices.filterNot { it == option }
     val alternativeReasoning = originalIndices.map { if (it == index) reasoning else variantReasoning.getOrNull(it) }
+    val alternativeMetrics = originalIndices.map(::metricsAt)
+    val alternativePrefixes = originalIndices.map(::hiddenPrefixAt)
+    val alternativeMedia = originalIndices.map(::replyMediaAt)
+    val alternativeSources = originalIndices.map(::webReplyAt)
+    val alternativeTokens = originalIndices.map(::replyTokensAt)
     val info = raw?.let(::JSONObject)?.apply {
         optJSONArray("swipe_info")?.let { existing ->
             put("swipe_info", JSONArray(originalIndices.map { existing.opt(it) ?: JSONObject() }))
         }
     }?.toString()
     val changed = copy(variants = originalIndices.map(variants::get), variantReasoning = alternativeReasoning,
+        variantMetrics = alternativeMetrics, variantHiddenPrefixes = alternativePrefixes,
+        variantReplyMedia = alternativeMedia, variantWebReplies = alternativeSources, variantReplyTokens = alternativeTokens,
         index = newIndex, raw = info)
     if (option != index) return changed
     return changed.copy(text = changed.variants[newIndex], reasoning = alternativeReasoning[newIndex],
+        replyMetrics = alternativeMetrics[newIndex], hiddenReplyPrefix = alternativePrefixes[newIndex],
+        replyMedia = alternativeMedia[newIndex], webReply = alternativeSources[newIndex], replyTokens = alternativeTokens[newIndex],
         translation = null, wireText = null, summary = null)
 }
 
@@ -64,8 +73,13 @@ internal fun Message.withScriptAlternative(value: String, select: Boolean): Mess
     val added = jsonOf("send_date" to Instant.now().toString(),
         "extra" to jsonOf("api" to "manual", "model" to "slash command"))
     json.put("swipe_info", JSONArray(rows + added))
-    if (select) return selected.copy(raw = json.toString())
-    return copy(variants = selected.variants, variantReasoning = selected.variantReasoning, raw = json.toString())
+    val metrics = ReplyMetrics(provider = "STscript", model = "slash command", api = "manual")
+    val newMetrics = selected.variantMetrics.dropLast(1) + metrics
+    if (select) return selected.copy(raw = json.toString(), replyMetrics = metrics, variantMetrics = newMetrics)
+    return copy(variants = selected.variants, variantReasoning = selected.variantReasoning,
+        variantMetrics = newMetrics, variantHiddenPrefixes = selected.variantHiddenPrefixes,
+        variantReplyMedia = selected.variantReplyMedia, variantWebReplies = selected.variantWebReplies,
+        variantReplyTokens = selected.variantReplyTokens, raw = json.toString())
 }
 
 internal fun List<Message>.deletionIndices(selected: Set<Int>, includeTools: Boolean): Set<Int> = buildSet {

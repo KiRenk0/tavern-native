@@ -16,6 +16,7 @@ internal class TemporaryChatMedia(cache: File) {
     private val directory = Files.createTempDirectory(cache.toPath(), prefix).toFile()
     val images = ChatImageStore(File(directory, "images"))
     val documents = ChatDocumentStore(File(directory, "documents"))
+    val videos = ChatVideoStore(File(directory, "videos"))
     fun close() { directory.deleteRecursively() }
 
     companion object {

@@ -77,6 +77,7 @@ internal enum class PresetUtility(val key: String, val label: String, val fallba
     SCENARIO_FORMAT("scenario_format", "场景模板", "{{scenario}}"),
     PERSONALITY_FORMAT("personality_format", "性格模板", "{{personality}}"),
     WORLD_FORMAT("wi_format", "世界书模板", "{0}"),
+    EMPTY_INPUT("send_if_empty", "空消息替代文字"),
 }
 
 internal enum class PresetSampling(val key: String, val wire: String, val label: String) {
@@ -105,6 +106,7 @@ internal data class PromptPreset(
     val continuePrefill: Boolean = false,
     val squashSystem: Boolean = false,
     val regexRules: List<RegexRule> = emptyList(),
+    val chatCompletion: ChatCompletionPreset = ChatCompletionPreset(),
 ) {
     fun text(utility: PresetUtility) = utilities[utility] ?: utility.fallback
 
@@ -118,6 +120,7 @@ internal data class PromptPreset(
         "continue_prefill" to continuePrefill,
         "squash_system_messages" to squashSystem,
     ).apply {
+        chatCompletion.writeTo(this)
         PresetUtility.entries.forEach { put(it.key, text(it)) }
         sampling.forEach { (option, value) -> option.number(value)?.let { put(option.key, it) } }
         if (regexRules.isNotEmpty()) {
@@ -178,7 +181,8 @@ internal data class PromptPreset(
                     if (option.number(value) != null) option to value else null
                 }.toMap(),
                 json.optBoolean("continue_prefill"), json.optBoolean("squash_system_messages"),
-                RegexRule.fromArray(json.optJSONObject("extensions")?.optJSONArray("regex_scripts")))
+                RegexRule.fromArray(json.optJSONObject("extensions")?.optJSONArray("regex_scripts")),
+                ChatCompletionPreset.read(json))
         }
     }
 }

@@ -105,7 +105,10 @@ internal fun toolVariables(arguments: JSONObject): Map<String, String> = buildMa
     add("arg", arguments)
 }
 
-internal fun boundedJsonObject(raw: String, invalid: String): JSONObject {
+internal fun boundedJsonObject(raw: String, invalid: String): JSONObject =
+    boundedJsonValue(raw, invalid) as? JSONObject ?: throw IllegalArgumentException(invalid)
+
+internal fun boundedJsonValue(raw: String, invalid: String): Any {
     // Android's JSON reader is recursive. Bound the nesting before deserializing.
     var quoted = false
     var escaped = false
@@ -125,7 +128,7 @@ internal fun boundedJsonObject(raw: String, invalid: String): JSONObject {
     require(depth == 0 && !quoted) { invalid }
     val input = JSONTokener(raw)
     return try {
-        (input.nextValue() as JSONObject).also { require(input.nextClean().code == 0) }
+        input.nextValue().also { require(input.nextClean().code == 0) }
     } catch (e: Exception) {
         throw IllegalArgumentException(invalid, e)
     }
@@ -199,20 +202,135 @@ internal data class ToolTurn(
 
 internal const val MAX_MODEL_TEXT = 1_000_000
 
-internal class CompletionAccumulator {
+internal class CompletionAccumulator(
+    stops: List<String> = emptyList(),
+    private val captureGeminiParts: Boolean = false,
+    val geminiGrounding: GeminiGrounding? = null,
+) {
     private val text = StringBuilder()
+    private val stopFilter = stops.takeIf(List<String>::isNotEmpty)?.let(::InstructStopFilter)
     private val shownReasoning = StringBuilder()
     private val reasoning = StringBuilder()
     private var explicitReasoning = false
     private val parts = sortedMapOf<Int, CallParts>()
     private var assistantMetadata: JSONObject? = null
     private val reasoningDetails = linkedMapOf<String, JSONObject>()
+    private val pictures = linkedMapOf<String, ReplyRaster>()
+    private val partsForReplay = mutableListOf<ReplyContentPart>()
+    private val pendingReplayText = StringBuilder()
+    private var replayOverflow = false
+    private var signatureCharacters = 0
+    private val webSources = linkedMapOf<String, ReplySource>()
+    var tokenCollector: ReplyTokenCollector? = null
+    var webTranscript: JSONArray? = null
+        private set
+    var rejectedImage = false
+        private set
     var finishReason: String = ""
     var interruption: String? = null
+    var usage = ResponseTokens()
     val hasText get() = text.isNotBlank()
-    val hasOutput get() = hasText || parts.isNotEmpty()
+    val visibleText get() = text.toString()
+    val visibleReasoning get() = shownReasoning.toString()
+    fun tokenTrace() = tokenCollector?.finish(visibleText)
+    val images get() = pictures.values.toList()
+    val geminiReplayParts get() = if (replayOverflow || reachedTextStop || interruption != null ||
+        partsForReplay.none { it.signature != null }) emptyList() else buildList {
+        addAll(partsForReplay)
+        if (pendingReplayText.isNotEmpty()) add(ReplyContentPart(text = pendingReplayText.toString()))
+    }
+    val hasOutput get() = hasText || pictures.isNotEmpty() || parts.isNotEmpty()
+    val reachedTextStop get() = stopFilter?.stopped == true
+    val hasReceivedText get() = hasText || stopFilter?.hasPending == true
+    val hasReceivedReply get() = hasReceivedText || pictures.isNotEmpty()
+    val hasToolCalls get() = parts.isNotEmpty()
+    val sources get() = webSources.values.toList()
+
+    fun appendCitations(values: JSONArray?) {
+        values?.objects().orEmpty().forEach { row -> appendCitation(row.optJSONObject("url_citation") ?: row) }
+    }
+
+    fun appendCitation(row: JSONObject) {
+        val source = ReplySource.read(row) ?: return
+        val earlier = webSources[source.url]
+        if (earlier == null && webSources.size < MAX_REPLY_SOURCES ||
+            earlier != null && earlier.title == earlier.domain && source.title != source.domain) {
+            webSources[source.url] = source
+        }
+    }
+
+    fun captureWebTranscript(values: JSONArray?) {
+        if (values != null) webTranscript = values
+    }
 
     fun appendText(fragment: String, token: (String) -> Unit) {
+        recordText(stopFilter?.append(fragment) ?: fragment, token)
+    }
+
+    fun appendGeminiText(fragment: String, signature: String, token: (String) -> Unit) {
+        appendText(fragment, token)
+        val opaque = boundedReplySignature(signature)
+        if (fragment.isNotEmpty() || opaque != null) addReplayPart(ReplyContentPart(text = fragment, signature = opaque))
+    }
+
+    fun appendGeminiImage(mime: String, data: String, signature: String) {
+        if (reachedTextStop) return
+        val image = ReplyRaster.read(mime, data)
+        if (addImage(image) && image != null) {
+            addReplayPart(ReplyContentPart(imageKey = image.key, signature = boundedReplySignature(signature)))
+        }
+    }
+
+    fun appendOpenAiImages(message: JSONObject) {
+        if (reachedTextStop) return
+        val blocks = message.optJSONArray("images")?.objects().orEmpty() +
+            message.optJSONArray("content")?.objects().orEmpty().filter { it.string("type") in setOf("image_url", "output_image") }
+        blocks.forEach { block ->
+            val url = block.optJSONObject("image_url")?.string("url") ?: block.string("image_url")
+            if (url.isNotEmpty()) addImage(ReplyRaster.fromDataUrl(url))
+        }
+    }
+
+    private fun addImage(image: ReplyRaster?): Boolean {
+        if (image != null && image.key in pictures) return false
+        if (image == null || pictures.size >= MAX_CHAT_IMAGES ||
+            pictures.values.sumOf { it.bytes.size } + image.bytes.size > MAX_REPLY_IMAGE_BYTES) {
+            rejectedImage = true
+            return false
+        }
+        pictures[image.key] = image
+        return true
+    }
+
+    private fun addReplayPart(part: ReplyContentPart) {
+        if (!captureGeminiParts || replayOverflow || reachedTextStop) return
+        signatureCharacters += part.signature?.length ?: 0
+        val unsigned = part.text != null && part.signature == null
+        val additions = if (!unsigned && pendingReplayText.isNotEmpty()) 2 else 1
+        if (partsForReplay.size + additions > MAX_REPLAY_PARTS || signatureCharacters > 512 * 1024) {
+            replayOverflow = true
+            partsForReplay.clear()
+            pendingReplayText.clear()
+        } else if (unsigned) pendingReplayText.append(part.text)
+        else {
+            if (pendingReplayText.isNotEmpty()) {
+                partsForReplay += ReplyContentPart(text = pendingReplayText.toString())
+                pendingReplayText.clear()
+            }
+            partsForReplay += part
+        }
+    }
+
+    fun finishText(token: (String) -> Unit) {
+        val filter = stopFilter ?: return
+        recordText(filter.flush(), token)
+        if (filter.stopped) {
+            interruption = null
+            finishReason = "stop"
+        }
+    }
+
+    private fun recordText(fragment: String, token: (String) -> Unit) {
         if (fragment.isEmpty()) return
         text.append(fragment)
         check(text.length <= MAX_MODEL_TEXT && shownReasoning.length <= MAX_MODEL_TEXT) { "生成内容超过上限" }
@@ -264,12 +382,11 @@ internal class CompletionAccumulator {
         }
         val rawReasoning = message.opt("reasoning_content") as? String
         val thought = rawReasoning ?: (message.opt("reasoning") as? String).orEmpty()
-        text.append(content)
         shownReasoning.append(thought)
         check(text.length <= MAX_MODEL_TEXT && shownReasoning.length <= MAX_MODEL_TEXT) { "生成内容超过上限" }
         if (thought.isNotEmpty()) onReasoning(thought)
-        if (content.isNotEmpty()) token(content)
-        if (!acceptTools) return
+        appendText(content, token)
+        if (!acceptTools || reachedTextStop) return
         if (rawReasoning != null) {
             explicitReasoning = true
             reasoning.append(rawReasoning)
