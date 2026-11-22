@@ -169,14 +169,21 @@ internal class WhisperRecorder(private val context: Context) {
                     onError("未录到声音")
                     return@launch
                 }
-                onPartial("正在上传 Whisper 识别…")
-                val text = transcribeWhisper(
-                    endpoint = options.sttEndpoint,
-                    apiKey = options.sttApiKey,
-                    model = options.sttModel,
-                    language = options.language,
-                    wavBytes = wav,
-                )
+                val local = options.sttBackend == SttBackend.WHISPER_LOCAL
+                onPartial(if (local) "正在本机 Whisper 离线转写…" else "正在上传 Whisper 识别…")
+                val text = if (local) {
+                    withContext(Dispatchers.Default) {
+                        LocalWhisperStt(localWhisperDir(context)).transcribeWav(wav, options.language)
+                    }
+                } else {
+                    transcribeWhisper(
+                        endpoint = options.sttEndpoint,
+                        apiKey = options.sttApiKey,
+                        model = options.sttModel,
+                        language = options.language,
+                        wavBytes = wav,
+                    )
+                }
                 release()
                 onResult(text)
             } catch (e: Exception) {

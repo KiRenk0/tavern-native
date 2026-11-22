@@ -91,6 +91,19 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
                 }
             }
             TtsBackend.EDGE_TTS -> Unit
+            TtsBackend.AZURE -> {
+                azureSpeechRoot(options.azureRegion, options.ttsEndpoint)
+                require(options.ttsApiKey.isNotBlank()) { "请填写 Azure Speech 订阅密钥" }
+                require(options.azureVoice.isNotBlank()) { "请选择或填写 Azure 音色名称" }
+            }
+            TtsBackend.ALLTALK -> {
+                allTalkRoot(options.ttsEndpoint)
+                require(options.allTalkVoice.isNotBlank()) { "请选择或填写 AllTalk 音色文件" }
+            }
+            TtsBackend.KOKORO -> {
+                kokoroRoot(options.ttsEndpoint)
+                require(options.kokoroVoice.isNotBlank()) { "请选择或填写 Kokoro 音色 ID" }
+            }
             TtsBackend.ELEVENLABS -> {
                 if (options.ttsEndpoint.isNotBlank()) checkedAddress(options.ttsEndpoint)
                 require(options.ttsApiKey.isNotBlank() && options.elevenLabsVoiceId.isNotBlank()) {
@@ -123,6 +136,7 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
             require(options.sttEndpoint.isNotBlank()) { "请填写 Whisper STT 接口地址" }
             checkedAddress(options.sttEndpoint)
         }
+        val validatedRvc = options.rvc.validated()
         if (options.filter.isNotBlank()) {
             val result = regexTest(RegexRule(pattern = options.filter), "朗读测试", RegexNames(null, ""))
             require(result.issue == null) { result.issue ?: "朗读正则无效" }
@@ -131,7 +145,7 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
             "识别语言应使用语言标签，例如 zh-CN"
         }
         stopNarration()
-        host.persistPreferences(host.current.prefs.copy(voice = options))
+        host.persistPreferences(host.current.prefs.copy(voice = options.copy(rvc = validatedRvc)))
         done()
     }
 

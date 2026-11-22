@@ -89,7 +89,11 @@ internal data class ImageProfile(
         "shape" to shape.name, "tuning" to tuning.json(), "workflow" to workflowId)
 
     fun resolve(providers: List<Provider>, prompt: String, references: List<ChatImage> = emptyList()): ImageRequest? {
-        val provider = providers.firstOrNull { it.id == providerId && protocol.available(it) } ?: return null
+        val provider = if (providerId == POLLINATIONS_BUILTIN_ID && protocol == ImageProtocol.POLLINATIONS) {
+            pollinationsBuiltinProvider()
+        } else {
+            providers.firstOrNull { it.id == providerId && protocol.available(it) } ?: return null
+        }
         return ImageRequest(provider, protocol, model, shape, prompt, references, tuning, workflowId)
     }
 

@@ -192,7 +192,7 @@ internal fun NanoBananaDrawingDialog(state: TavernState, chat: Chat, viewModel: 
 @Composable
 internal fun ImageGenerationDialog(state: TavernState, chat: Chat, viewModel: TavernViewModel, initialPrompt: String,
                                   references: List<ChatImage>, target: Int?, dismiss: () -> Unit, configure: () -> Unit) {
-    val providers = state.prefs.providers.filter { provider -> ImageProtocol.entries.any { it.available(provider) } }
+    val providers = allImageProviders(state.prefs.providers)
     if (providers.isEmpty()) {
         AlertDialog(onDismissRequest = dismiss, title = { Text("生成图片") },
             text = { Text("请在设置中填写 Google Gemini API Key，或添加自己的图像服务。") },
@@ -244,7 +244,7 @@ internal fun ImageGenerationDialog(state: TavernState, chat: Chat, viewModel: Ta
     var denoise by rememberSaveable(provider.id, protocol) { mutableStateOf(tuningDefaults.denoise?.toString().orEmpty()) }
     val arguments = buildMap {
         put("negative", negative)
-        if (protocol != ImageProtocol.GEMINI) {
+        if (protocol !in setOf(ImageProtocol.GEMINI, ImageProtocol.IMAGEN, ImageProtocol.XAI)) {
             put("width", width)
             put("height", height)
         }
@@ -298,8 +298,10 @@ internal fun ImageGenerationDialog(state: TavernState, chat: Chat, viewModel: Ta
                 }
                 if (!protocol.usesWorkflow || keys?.contains("model") != false) {
                     val label = when {
-                        protocol == ImageProtocol.DIFFUSION -> "检查点（留空使用服务当前模型）"
+                        protocol in setOf(ImageProtocol.DIFFUSION, ImageProtocol.DRAW_THINGS, ImageProtocol.SD_NEXT) ->
+                            "检查点（留空使用服务当前模型）"
                         protocol == ImageProtocol.HORDE -> "AI Horde 图像模型（可选）"
+                        protocol == ImageProtocol.POLLINATIONS -> "Pollinations 模型（默认 flux）"
                         protocol.usesWorkflow -> "检查点 / UNet 文件名"
                         else -> "图像模型 ID"
                     }
@@ -307,7 +309,12 @@ internal fun ImageGenerationDialog(state: TavernState, chat: Chat, viewModel: Ta
                         TextButton({ viewModel.loadHordeImageModels(provider) { hordeModels = it } },
                             enabled = !state.busy) { Text("读取在线图像模型") }
                     }
-                    DrawingInput(label, model, if (protocol == ImageProtocol.HORDE) hordeModels else comfyCatalog?.checkpoints.orEmpty()) {
+                    val modelChoices = when {
+                        protocol == ImageProtocol.HORDE -> hordeModels
+                        protocol == ImageProtocol.COMFY -> comfyCatalog?.checkpoints.orEmpty()
+                        else -> suggestedImageModels(protocol)
+                    }
+                    DrawingInput(label, model, modelChoices) {
                         model = it
                     }
                 }
@@ -344,7 +351,7 @@ internal fun ImageGenerationDialog(state: TavernState, chat: Chat, viewModel: Ta
                 TextButton({ advanced = !advanced }) { Text(if (advanced) "收起生成参数" else "生成参数") }
                 if (advanced) {
                     DrawingInput("负面提示词", negative) { negative = it }
-                    if (protocol != ImageProtocol.GEMINI) {
+                    if (protocol !in setOf(ImageProtocol.GEMINI, ImageProtocol.IMAGEN, ImageProtocol.XAI)) {
                         DrawingInput("宽度（像素）", width) { width = it }
                         DrawingInput("高度（像素）", height) { height = it }
                     }
@@ -376,7 +383,7 @@ internal fun ImageGenerationDialog(state: TavernState, chat: Chat, viewModel: Ta
                     workflow.id.takeIf { protocol.usesWorkflow })
                 if (viewModel.generateImage(chat.id, request, mode, target, rememberService)) dismiss()
             }, enabled = !state.busy && text.isNotBlank() && tuning.isSuccess &&
-                (model.isNotBlank() || protocol in setOf(ImageProtocol.DIFFUSION, ImageProtocol.HORDE) ||
+                (model.isNotBlank() || protocol.modelOptional ||
                     protocol.usesWorkflow && keys?.contains("model") == false)) { Text("生成") }
         },
     )

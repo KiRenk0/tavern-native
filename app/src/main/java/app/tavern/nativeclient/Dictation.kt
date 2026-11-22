@@ -124,7 +124,8 @@ internal fun DictationButton(options: VoicePreferences, enabled: Boolean, paused
     var whisperProgress by remember { mutableStateOf<DictationProgress?>(null) }
     val deliver by rememberUpdatedState(onTranscript)
     val error by rememberUpdatedState(onError)
-    val progress = if (options.sttBackend == SttBackend.WHISPER_API) whisperProgress else dictation.progress
+    val usesWhisper = options.sttBackend == SttBackend.WHISPER_API || options.sttBackend == SttBackend.WHISPER_LOCAL
+    val progress = if (usesWhisper) whisperProgress else dictation.progress
     LaunchedEffect(progress) { onProgress(progress) }
     DisposableEffect(lifecycle, dictation, whisper) {
         val observer = LifecycleEventObserver { _, event ->
@@ -145,11 +146,16 @@ internal fun DictationButton(options: VoicePreferences, enabled: Boolean, paused
     }
     fun start() {
         pausedPlayback()
-        if (options.sttBackend == SttBackend.WHISPER_API) {
+        if (usesWhisper) {
             whisperProgress = DictationProgress(finishing = false, partial = "准备录音…")
             whisper.start(
                 options,
-                onPartial = { status -> whisperProgress = DictationProgress(finishing = status.contains("上传"), partial = status) },
+                onPartial = { status ->
+                    whisperProgress = DictationProgress(
+                        finishing = status.contains("上传") || status.contains("离线转写"),
+                        partial = status,
+                    )
+                },
                 onResult = { text ->
                     whisperProgress = null
                     deliver(text)
@@ -168,7 +174,7 @@ internal fun DictationButton(options: VoicePreferences, enabled: Boolean, paused
         else if (!granted) error("语音输入需要麦克风权限")
     }
     IconButton(onClick = {
-        if (options.sttBackend == SttBackend.WHISPER_API) {
+        if (usesWhisper) {
             if (whisperProgress?.finishing == true) {
                 whisper.release()
                 whisperProgress = null

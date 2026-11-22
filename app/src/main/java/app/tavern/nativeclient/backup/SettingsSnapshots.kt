@@ -46,6 +46,9 @@ internal class SettingsSnapshot private constructor(val name: String, val create
                 },
                 sttApiKey = if (voice.sttBackend == currentVoice.sttBackend && sameAddress(voice.sttEndpoint, currentVoice.sttEndpoint))
                     currentVoice.sttApiKey else voice.sttApiKey,
+                rvc = voice.rvc.copy(
+                    apiKey = if (sameAddress(voice.rvc.endpoint, currentVoice.rvc.endpoint)) currentVoice.rvc.apiKey else voice.rvc.apiKey,
+                ),
             ),
             sync = sync.copy(
                 webDavPassword = if (sameSync) currentSync.webDavPassword else sync.webDavPassword,

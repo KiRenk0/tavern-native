@@ -10,18 +10,34 @@ import java.util.zip.ZipInputStream
 internal enum class ImageProtocol(val label: String, val source: String) {
     GEMINI("Google Gemini", "google"), COMPATIBLE("OpenAI 兼容", "openai"), DIFFUSION("AUTOMATIC1111 / Forge", "auto"),
     NOVELAI("NovelAI", "novelai"), HORDE("AI Horde", "horde"),
-    COMFY("ComfyUI", "comfy"), COMFY_RUNPOD("ComfyUI · RunPod", "comfyrunpod");
+    COMFY("ComfyUI", "comfy"), COMFY_RUNPOD("ComfyUI · RunPod", "comfyrunpod"),
+    POLLINATIONS("Pollinations.ai", "pollinations"),
+    STABILITY("Stability AI", "stability"),
+    DRAW_THINGS("Draw Things", "drawthings"),
+    SD_NEXT("SD.Next", "sdnext"),
+    TOGETHER("Together AI", "together"),
+    IMAGEN("Google Imagen / Vertex", "imagen"),
+    XAI("xAI (Grok Imagine)", "xai"),
+    NANOGPT("NanoGPT", "nanogpt"),
+    HUGGINGFACE("HuggingFace Inference", "huggingface");
 
     val usesWorkflow get() = this == COMFY || this == COMFY_RUNPOD
-    val supportsReferences get() = this == GEMINI || usesWorkflow
-    val usesSamplerParameters get() = this == DIFFUSION || this == NOVELAI || this == HORDE || usesWorkflow
+    val supportsReferences get() = this == GEMINI || this == DRAW_THINGS || usesWorkflow
+    val usesSamplerParameters
+        get() = this in setOf(
+            DIFFUSION, DRAW_THINGS, SD_NEXT, NOVELAI, HORDE, POLLINATIONS, STABILITY, TOGETHER, NANOGPT, HUGGINGFACE,
+        ) || usesWorkflow
+    val modelOptional get() = this in setOf(DIFFUSION, DRAW_THINGS, SD_NEXT, HORDE, POLLINATIONS)
 
     fun available(provider: Provider): Boolean {
         if (provider.protocol == ApiProtocol.HORDE_TEXT) return this == HORDE && provider.endpoint.isNotBlank()
+        if (provider.id == POLLINATIONS_BUILTIN_ID) return this == POLLINATIONS
         return when (this) {
             GEMINI -> provider.template == ProviderTemplate.GOOGLE && provider.apiKey.isNotBlank()
-            COMPATIBLE, DIFFUSION, COMFY -> provider.template == null && provider.endpoint.isNotBlank()
-            NOVELAI -> provider.template == null && provider.apiKey.isNotBlank()
+            IMAGEN -> (provider.template == ProviderTemplate.GOOGLE || provider.template == null) && provider.apiKey.isNotBlank()
+            COMPATIBLE, DIFFUSION, DRAW_THINGS, SD_NEXT, COMFY -> provider.template == null && provider.endpoint.isNotBlank()
+            POLLINATIONS -> provider.template == null
+            NOVELAI, STABILITY, TOGETHER, XAI, NANOGPT, HUGGINGFACE -> provider.template == null && provider.apiKey.isNotBlank()
             COMFY_RUNPOD -> provider.template == null && provider.endpoint.isNotBlank() && provider.apiKey.isNotBlank()
             HORDE -> false
         }
@@ -31,7 +47,14 @@ internal enum class ImageProtocol(val label: String, val source: String) {
         GEMINI -> DEFAULT_GEMINI_IMAGE
         COMPATIBLE, COMFY, COMFY_RUNPOD -> provider.defaultModel
         NOVELAI -> provider.defaultModel.ifBlank { "nai-diffusion-4-curated-preview" }
-        DIFFUSION, HORDE -> ""
+        POLLINATIONS -> provider.defaultModel.ifBlank { "flux" }
+        STABILITY -> provider.defaultModel.ifBlank { "sd3.5-large" }
+        TOGETHER -> provider.defaultModel.ifBlank { "black-forest-labs/FLUX.1-schnell-Free" }
+        IMAGEN -> provider.defaultModel.ifBlank { "imagen-3.0-generate-002" }
+        XAI -> provider.defaultModel.ifBlank { "grok-2-image" }
+        NANOGPT -> provider.defaultModel.ifBlank { "flux-pro" }
+        HUGGINGFACE -> provider.defaultModel.ifBlank { "black-forest-labs/FLUX.1-schnell" }
+        DIFFUSION, DRAW_THINGS, SD_NEXT, HORDE -> ""
     }
 }
 
@@ -64,6 +87,10 @@ internal class ImageService(private val geminiBase: String = "https://generative
             ImageProtocol.HORDE -> Horde(options.provider).image(options)
             ImageProtocol.COMFY, ImageProtocol.COMFY_RUNPOD ->
                 ComfyService().generate(options, comfy ?: ComfyInputs(defaultComfyWorkflow), readImage)
+            ImageProtocol.POLLINATIONS, ImageProtocol.STABILITY, ImageProtocol.DRAW_THINGS,
+            ImageProtocol.SD_NEXT, ImageProtocol.TOGETHER, ImageProtocol.IMAGEN,
+            ImageProtocol.XAI, ImageProtocol.NANOGPT, ImageProtocol.HUGGINGFACE ->
+                ExtendedImageBackends.generate(options, readImage)
         }
     }
 

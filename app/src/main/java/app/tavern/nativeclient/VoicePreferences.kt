@@ -1,5 +1,10 @@
 package app.tavern.nativeclient
 
+import app.tavern.nativeclient.media.DEFAULT_ALLTALK_LANGUAGE
+import app.tavern.nativeclient.media.DEFAULT_AZURE_REGION
+import app.tavern.nativeclient.media.DEFAULT_AZURE_VOICE
+import app.tavern.nativeclient.media.DEFAULT_KOKORO_VOICE
+import app.tavern.nativeclient.media.RvcSettings
 import org.json.JSONObject
 import java.util.Locale
 
@@ -11,9 +16,12 @@ internal enum class TtsBackend(val label: String, val usesProvider: Boolean = fa
     SYSTEM("Android 系统朗读"),
     OPENAI_COMPAT("OpenAI 兼容 TTS", usesProvider = true),
     EDGE_TTS("Edge 微软神经语音（免费）"),
+    AZURE("Azure Speech TTS"),
     ELEVENLABS("ElevenLabs"),
     FISH_AUDIO("Fish Audio"),
     GPT_SOVITS("GPT-SoVITS（本地/自建）"),
+    ALLTALK("AllTalk TTS（本地/自建）"),
+    KOKORO("Kokoro TTS（本地/自建）"),
     GEMINI_NATIVE("Google Gemini TTS", usesProvider = true),
     NOVELAI("NovelAI TTS", usesProvider = true),
     VITS("VITS", localPort = 23456),
@@ -23,7 +31,8 @@ internal enum class TtsBackend(val label: String, val usesProvider: Boolean = fa
     COSYVOICE("CosyVoice（非官方接口）", localPort = 9880);
 
     val selfHosted get() = localPort != null
-    val hasOwnCredentials get() = this == ELEVENLABS || this == FISH_AUDIO || this == GPT_SOVITS || selfHosted
+    val hasOwnCredentials
+        get() = this in setOf(AZURE, ELEVENLABS, FISH_AUDIO, GPT_SOVITS, ALLTALK, KOKORO) || selfHosted
 
     fun accepts(provider: Provider): Boolean = when (this) {
         OPENAI_COMPAT -> provider.template == null
@@ -43,6 +52,7 @@ internal data class TtsCredentials(val endpoint: String = "", val key: String = 
 internal enum class SttBackend(val label: String) {
     SYSTEM("Android 系统语音识别"),
     WHISPER_API("Whisper API（兼容接口）"),
+    WHISPER_LOCAL("本机离线 Whisper（ONNX）"),
 }
 
 internal data class VoicePreferences(
@@ -90,6 +100,12 @@ internal data class VoicePreferences(
     val novelAiTtsProvider: String = "",
     val novelAiTtsVoice: String = DEFAULT_NOVELAI_TTS_VOICE,
     val selfHostedVoices: Map<TtsBackend, SelfHostedVoiceOptions> = emptyMap(),
+    val azureRegion: String = DEFAULT_AZURE_REGION,
+    val azureVoice: String = DEFAULT_AZURE_VOICE,
+    val allTalkVoice: String = "",
+    val allTalkLanguage: String = DEFAULT_ALLTALK_LANGUAGE,
+    val kokoroVoice: String = DEFAULT_KOKORO_VOICE,
+    val rvc: RvcSettings = RvcSettings(),
 ) {
     val activeBackend: TtsBackend get() = ttsBackend
     val selfHostedVoice get() = selfHostedVoices[activeBackend] ?: SelfHostedVoiceOptions()
@@ -133,9 +149,12 @@ internal data class VoicePreferences(
             TtsBackend.SYSTEM -> ""
             TtsBackend.OPENAI_COMPAT -> backendId
             TtsBackend.EDGE_TTS -> "edge"
+            TtsBackend.AZURE -> "azure"
             TtsBackend.ELEVENLABS -> "elevenlabs"
             TtsBackend.FISH_AUDIO -> "fish"
             TtsBackend.GPT_SOVITS -> "gptsovits"
+            TtsBackend.ALLTALK -> "alltalk"
+            TtsBackend.KOKORO -> "kokoro"
             TtsBackend.GEMINI_NATIVE -> "gemini:$geminiTtsProvider"
             TtsBackend.NOVELAI -> "novelai:$novelAiTtsProvider"
             TtsBackend.VITS, TtsBackend.STYLE_BERT_VITS2, TtsBackend.XTTS, TtsBackend.SILERO, TtsBackend.COSYVOICE ->
@@ -147,9 +166,12 @@ internal data class VoicePreferences(
             TtsBackend.SYSTEM -> systemVoice
             TtsBackend.OPENAI_COMPAT -> backendVoice
             TtsBackend.EDGE_TTS -> edgeVoice.ifBlank { "zh-CN-XiaoxiaoNeural" }
+            TtsBackend.AZURE -> azureVoice.ifBlank { DEFAULT_AZURE_VOICE }
             TtsBackend.ELEVENLABS -> elevenLabsVoiceId
             TtsBackend.FISH_AUDIO -> fishReferenceId
             TtsBackend.GPT_SOVITS -> gptSovitsRefAudio
+            TtsBackend.ALLTALK -> allTalkVoice
+            TtsBackend.KOKORO -> kokoroVoice.ifBlank { DEFAULT_KOKORO_VOICE }
             TtsBackend.GEMINI_NATIVE -> geminiTtsVoice.ifBlank { DEFAULT_GEMINI_TTS_VOICE }
             TtsBackend.NOVELAI -> novelAiTtsVoice.ifBlank { DEFAULT_NOVELAI_TTS_VOICE }
             TtsBackend.VITS, TtsBackend.STYLE_BERT_VITS2, TtsBackend.XTTS, TtsBackend.SILERO, TtsBackend.COSYVOICE -> selfHostedVoice.voice
@@ -204,6 +226,12 @@ internal data class VoicePreferences(
         "sttModel" to sttModel,
         "language" to language, "requireOffline" to requireOffline, "shortcuts" to JSONObject(shortcuts),
         "translatedText" to translatedText,
+        "azureRegion" to azureRegion,
+        "azureVoice" to azureVoice,
+        "allTalkVoice" to allTalkVoice,
+        "allTalkLanguage" to allTalkLanguage,
+        "kokoroVoice" to kokoroVoice,
+        "rvc" to rvc.json(seal),
     )
 
     companion object {
@@ -262,6 +290,12 @@ internal data class VoicePreferences(
                 selfHostedVoices = TtsBackend.entries.filter(TtsBackend::selfHosted).mapNotNull { backend ->
                     row.optJSONObject("selfHostedVoices")?.optJSONObject(backend.name)?.let { backend to SelfHostedVoiceOptions.from(it) }
                 }.toMap(),
+                azureRegion = row.string("azureRegion").ifBlank { DEFAULT_AZURE_REGION },
+                azureVoice = row.string("azureVoice").ifBlank { DEFAULT_AZURE_VOICE },
+                allTalkVoice = row.string("allTalkVoice"),
+                allTalkLanguage = row.string("allTalkLanguage").ifBlank { DEFAULT_ALLTALK_LANGUAGE },
+                kokoroVoice = row.string("kokoroVoice").ifBlank { DEFAULT_KOKORO_VOICE },
+                rvc = RvcSettings.from(row.optJSONObject("rvc"), unseal),
             )
         }
     }

@@ -3,9 +3,52 @@ package app.tavern.nativeclient
 import org.json.JSONObject
 import java.net.URI
 import java.util.Base64
+import java.util.Locale
 
 internal val originalImageExtensions = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "avif", "heic", "heif")
-private val localImageRoots = listOf("user/images/", "backgrounds/", "characters/")
+private val localImageRoots = listOf(
+    "user/images/",
+    "backgrounds/",
+    "characters/",
+    "User Avatars/",
+    "user avatars/",
+    "user/assets/",
+    "assets/",
+    "thumbnails/",
+)
+
+internal fun resolveOriginalMediaPath(reference: String): String? {
+    val trimmed = reference.trim()
+    if (trimmed.isEmpty()) return null
+    val uri = runCatching { URI(trimmed) }.getOrNull()
+    if (uri != null && (uri.isAbsolute || uri.rawAuthority != null)) return null
+    val candidates = listOfNotNull(
+        uri?.rawPath?.let(::decodeAndCheckOriginalPath),
+        decodeAndCheckOriginalPath(trimmed),
+    ).distinct()
+    return candidates.firstOrNull { candidate ->
+        localImageRoots.any { root -> candidate.startsWith(root, ignoreCase = true) } &&
+            candidate.substringAfterLast('.').lowercase(Locale.ROOT) in originalImageExtensions
+    }
+}
+
+internal fun isSupportedImageHeader(bytes: ByteArray): Boolean {
+    if (bytes.size < 4) return false
+    val b0 = bytes[0].toInt() and 0xFF
+    val b1 = bytes[1].toInt() and 0xFF
+    val b2 = bytes[2].toInt() and 0xFF
+    val b3 = bytes[3].toInt() and 0xFF
+    val isPng = b0 == 0x89 && b1 == 0x50 && b2 == 0x4E && b3 == 0x47
+    val isJpeg = b0 == 0xFF && b1 == 0xD8 && b2 == 0xFF
+    val isGif = b0 == 0x47 && b1 == 0x49 && b2 == 0x46 && b3 == 0x38
+    val isBmp = b0 == 0x42 && b1 == 0x4D
+    val isWebp = bytes.size >= 12 && b0 == 0x52 && b1 == 0x49 && b2 == 0x46 && b3 == 0x46 &&
+        bytes[8] == 'W'.code.toByte() && bytes[9] == 'E'.code.toByte() &&
+        bytes[10] == 'B'.code.toByte() && bytes[11] == 'P'.code.toByte()
+    val isIsoBmff = bytes.size >= 12 && bytes[4] == 'f'.code.toByte() && bytes[5] == 't'.code.toByte() &&
+        bytes[6] == 'y'.code.toByte() && bytes[7] == 'p'.code.toByte()
+    return isPng || isJpeg || isGif || isBmp || isWebp || isIsoBmff
+}
 
 internal class OriginalLibraryMedia(
     private val source: OriginalLibrarySource,
@@ -20,9 +63,31 @@ internal class OriginalLibraryMedia(
     private val nativeVideos = mutableMapOf<String, Boolean>()
     private val restoredVideos = mutableMapOf<String, ChatVideo?>()
     private var inlineCount = 0
+    var personaAvatarCount = 0
+        private set
     var missing = 0
         private set
     val imageCount get() = restoredImages.values.count { it != null } + nativeImages.values.count { it } + inlineCount
+
+    fun userAvatarFiles(): Map<String, OriginalLibraryFile> {
+        val result = linkedMapOf<String, OriginalLibraryFile>()
+        for (dir in listOf("User Avatars", "user avatars")) {
+            for (entry in source.files(dir)) {
+                if (!safeOriginalPath(entry.relativePath)) continue
+                if (entry.extension.lowercase(Locale.ROOT) !in originalImageExtensions) continue
+                result.putIfAbsent(entry.name, entry)
+            }
+        }
+        return result
+    }
+
+    fun readPersonaAvatar(file: OriginalLibraryFile): ByteArray? = asset {
+        require(safeOriginalPath(file.relativePath)) { "不安全的人设头像路径" }
+        val bytes = file.bytes(MAX_IMAGE_SOURCE)
+        require(isSupportedImageHeader(bytes)) { "人设头像不是有效的图片格式" }
+        personaAvatarCount++
+        bytes
+    }
 
     fun document(filename: String): OriginalLibraryFile? = source.file("user/files/$filename") ?: source.file("files/$filename")
 
@@ -106,18 +171,22 @@ internal class OriginalLibraryMedia(
         val store = images ?: return BackgroundLibrary()
         val configured = settings?.string("name").orEmpty()
         var active: String? = null
-        val items = source.files("backgrounds").filter {
-            it.name != "__transparent.png" && it.extension.lowercase() in originalImageExtensions
+        val backgroundFiles = source.allFiles("backgrounds").ifEmpty { source.files("backgrounds") }
+        val items = backgroundFiles.filter {
+            it.name != "__transparent.png" && safeOriginalPath(it.relativePath) &&
+                it.extension.lowercase(Locale.ROOT) in originalImageExtensions
         }.mapNotNull { file ->
-            val saved = portableFiles?.optJSONObject(file.name)?.let(BackgroundEntry::from)
-            val entry = if (saved == null) imageAt("backgrounds/${file.name}")?.let { BackgroundEntry(it, file.modified) } else {
+            val relName = file.relativePath.removePrefix("backgrounds/")
+            val saved = (portableFiles?.optJSONObject(relName) ?: portableFiles?.optJSONObject(file.name))
+                ?.let(BackgroundEntry::from)
+            val entry = if (saved == null) imageAt(file.relativePath)?.let { BackgroundEntry(it, file.modified) } else {
                 asset {
                     store.restore(saved.image, file.bytes(saved.image.storageLimit))
                     nativeImages[saved.image.filename] = true
                     saved
                 }
             }
-            if (entry != null && file.name == configured) active = entry.image.id
+            if (entry != null && (file.name == configured || relName == configured)) active = entry.image.id
             entry
         }
         return BackgroundLibrary(items.distinctBy { it.image.id }, active, BackgroundFit.from(settings?.string("fitting").orEmpty()))
@@ -171,9 +240,28 @@ internal class OriginalLibraryMedia(
     fun gallery(names: List<String>): List<GalleryImage> {
         if (images == null) return emptyList()
         return names.filter { safeOriginalPath(it) && '/' !in it }.distinct().flatMap { name ->
-            val path = "user/images/$name"
-            source.files(path).filter { it.extension.lowercase() in originalImageExtensions }.mapNotNull { entry ->
-                imageAt("$path/${entry.name}")?.let { GalleryImage(it, "", entry.modified.coerceAtLeast(0)) }
+            val roots = listOf("user/images/$name", "user/assets/$name", "assets/$name")
+            roots.flatMap { root ->
+                val entries = source.allFiles(root).ifEmpty { source.files(root) }
+                entries.filter {
+                    safeOriginalPath(it.relativePath) && it.extension.lowercase(Locale.ROOT) in originalImageExtensions
+                }.mapNotNull { entry ->
+                    imageAt(entry.relativePath)?.let { GalleryImage(it, "", entry.modified.coerceAtLeast(0)) }
+                }
+            }
+        }.distinctBy { it.image.id }
+    }
+
+    fun extraAssetImages(excludedPrefixes: Set<String> = emptySet()): List<GalleryImage> {
+        if (images == null) return emptyList()
+        val roots = listOf("user/assets", "assets")
+        return roots.flatMap { root ->
+            source.allFiles(root).filter { entry ->
+                safeOriginalPath(entry.relativePath) &&
+                    entry.extension.lowercase(Locale.ROOT) in originalImageExtensions &&
+                    excludedPrefixes.none { prefix -> entry.relativePath.startsWith(prefix, ignoreCase = true) }
+            }.mapNotNull { entry ->
+                imageAt(entry.relativePath)?.let { GalleryImage(it, entry.relativePath, entry.modified.coerceAtLeast(0)) }
             }
         }.distinctBy { it.image.id }
     }
@@ -191,12 +279,7 @@ internal class OriginalLibraryMedia(
                 store.import(bytes, "聊天图片").also { inlineCount++ }
             }
         }
-        val decoded = runCatching { URI(reference).path }.getOrNull()
-        val candidates = listOfNotNull(decoded, reference).distinct().map { it.removePrefix("./").removePrefix("/") }
-        val path = candidates.firstOrNull { candidate ->
-            safeOriginalPath(candidate) && localImageRoots.any(candidate::startsWith) &&
-                candidate.substringAfterLast('.').lowercase() in originalImageExtensions
-        } ?: return null
+        val path = resolveOriginalMediaPath(reference) ?: return null
         return imageAt(path)
     }
 

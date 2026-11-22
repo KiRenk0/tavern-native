@@ -33,12 +33,18 @@ private val novelAiVoices = listOf("Ligeia", "Aini", "Orea", "Claea", "Lim", "Au
     "Ogma", "Raid", "Pega", "Lam").map { ServiceVoice(it) }
 
 internal val TtsBackend.hasVoiceCatalog: Boolean
-    get() = selfHosted || this == TtsBackend.GEMINI_NATIVE || this == TtsBackend.NOVELAI || this == TtsBackend.ELEVENLABS
+    get() = selfHosted || this in setOf(
+        TtsBackend.GEMINI_NATIVE, TtsBackend.NOVELAI, TtsBackend.ELEVENLABS,
+        TtsBackend.AZURE, TtsBackend.ALLTALK, TtsBackend.KOKORO,
+    )
 
 internal suspend fun listServiceVoices(options: VoicePreferences): List<ServiceVoice> = when (options.activeBackend) {
     TtsBackend.GEMINI_NATIVE -> geminiVoices
     TtsBackend.NOVELAI -> novelAiVoices
     TtsBackend.ELEVENLABS -> elevenLabsVoices(options)
+    TtsBackend.AZURE -> listAzureVoices(options)
+    TtsBackend.ALLTALK -> listAllTalkVoices(options)
+    TtsBackend.KOKORO -> listKokoroVoices(options)
     else -> if (options.activeBackend.selfHosted) selfHostedVoiceCatalog(options) else emptyList()
 }
 

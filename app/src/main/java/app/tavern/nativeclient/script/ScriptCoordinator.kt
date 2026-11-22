@@ -351,27 +351,9 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
             "source" -> {
                 val saved = settings.defaultProfile(providers)
                 if (text.isBlank()) return saved?.protocol?.source.orEmpty()
-                val protocol = when (text.lowercase()) {
-                    "google", "gemini" -> ImageProtocol.GEMINI
-                    "openai", "compatible" -> ImageProtocol.COMPATIBLE
-                    "auto", "automatic1111", "sd", "forge" -> ImageProtocol.DIFFUSION
-                    "novelai", "nai" -> ImageProtocol.NOVELAI
-                    "comfy", "comfyui" -> ImageProtocol.COMFY
-                    "comfyrunpod", "runpod" -> ImageProtocol.COMFY_RUNPOD
-                    else -> null
-                }
-                val providerName = named["provider"] ?: text.takeIf { protocol == null }
-                val provider = requireNotNull(providers.sortedByDescending { it.id == saved?.providerId }.firstOrNull { candidate ->
-                    (providerName == null || candidate.id == providerName || candidate.name.equals(providerName, true)) &&
-                        (protocol?.available(candidate) ?: ImageProtocol.entries.any { it.available(candidate) })
-                }) { "请先配置对应的绘图服务" }
-                val selected = protocol ?: saved?.protocol?.takeIf { it.available(provider) }
-                    ?: ImageProtocol.entries.first { it.available(provider) }
-                val model = named["model"] ?: selected.initialModel(provider)
-                val profile = if (saved?.providerId == provider.id && saved.protocol == selected && "model" !in named) saved
-                else ImageProfile(provider.id, selected, model, workflowId = settings.comfyWorkflowId.takeIf { selected.usesWorkflow })
+                val profile = resolveImageProfileForSource(text, providers, settings, named["provider"], named["model"])
                 host.persistPreferences(host.current.prefs.copy(drawing = settings.copy(profile = profile)))
-                return selected.source
+                return profile.protocol.source
             }
             "workflow" -> {
                 if (text.isBlank()) return host.current.comfyWorkflow(settings.comfyWorkflowId)?.name.orEmpty()
@@ -385,7 +367,9 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
         }
         val chat = requireNotNull(host.current.chat) { "请先打开对话" }
         val mode = DrawingMode.from(text)
-        val profile = requireNotNull(settings.defaultProfile(providers)) { "请先在生成图片窗口保存默认绘图服务" }
+        val profile = named["source"]?.takeIf(String::isNotBlank)?.let { source ->
+            resolveImageProfileForSource(source, providers, settings, named["provider"], named["model"])
+        } ?: requireNotNull(settings.defaultProfile(providers)) { "请先在生成图片窗口保存默认绘图服务" }
         val references = host.current.draftImages[chat.id].orEmpty().takeIf { profile.protocol.supportsReferences }.orEmpty()
         val request = requireNotNull(profile.resolve(providers, "", references)) { "绘图服务不可用" }
         val truthy = setOf("true", "1", "yes", "on")

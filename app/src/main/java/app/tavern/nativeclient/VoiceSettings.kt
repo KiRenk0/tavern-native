@@ -1,6 +1,8 @@
 package app.tavern.nativeclient
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts.OpenDocument
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -13,17 +15,32 @@ import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import app.tavern.nativeclient.media.DEFAULT_ALLTALK_LANGUAGE
+import app.tavern.nativeclient.media.DEFAULT_AZURE_REGION
+import app.tavern.nativeclient.media.DEFAULT_AZURE_VOICE
+import app.tavern.nativeclient.media.DEFAULT_KOKORO_VOICE
+import app.tavern.nativeclient.media.LocalWhisperStt
 import app.tavern.nativeclient.media.ServiceVoice
+import app.tavern.nativeclient.media.allTalkLanguages
 import app.tavern.nativeclient.media.curatedEdgeVoices
+import app.tavern.nativeclient.media.curatedKokoroVoices
 import app.tavern.nativeclient.media.geminiTtsModels
 import app.tavern.nativeclient.media.hasVoiceCatalog
+import app.tavern.nativeclient.media.listRvcModels
 import app.tavern.nativeclient.media.listServiceVoices
+import app.tavern.nativeclient.media.localWhisperDir
+import app.tavern.nativeclient.media.rvcF0Methods
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.Locale
+import kotlin.math.roundToInt
 
 private val voiceSaver = Saver<VoicePreferences, String>(save = { it.json().toString() }, restore = { VoicePreferences.from(JSONObject(it)) })
 private const val SAMPLE = "你好，欢迎来到酒馆。"
@@ -84,6 +101,46 @@ internal fun VoiceSettings(state: TavernState, model: TavernViewModel, close: ()
                 ) { options = options.copy(edgeVoice = it) }
                 Field("自定义音色名称（ShortName）", options.edgeVoice, { options = options.copy(edgeVoice = it) }, enabled = enabled)
                 Text("免 API Key，通过微软 Edge 语音 WebSocket 合成神经语音。", style = MaterialTheme.typography.bodySmall)
+            }
+            TtsBackend.AZURE -> {
+                Field("Azure 区域代码", options.azureRegion, { options = options.copy(azureRegion = it) }, enabled = enabled,
+                    placeholder = DEFAULT_AZURE_REGION)
+                Field("自定义终结点（可选，留空按区域生成）", options.ttsEndpoint, { options = options.copy(ttsEndpoint = it) },
+                    enabled = enabled, type = KeyboardType.Uri, placeholder = "https://eastus.tts.speech.microsoft.com")
+                Field("Azure Speech 订阅密钥", options.ttsApiKey, { options = options.copy(ttsApiKey = it) }, secret = true, enabled = enabled)
+                Field("默认音色名称（ShortName）", options.azureVoice, { options = options.copy(azureVoice = it) }, enabled = enabled,
+                    placeholder = DEFAULT_AZURE_VOICE)
+                OutlinedButton({ voiceTarget = "" }, enabled = enabled && options.ttsApiKey.isNotBlank()) {
+                    Text("读取并选择 Azure 音色")
+                }
+            }
+            TtsBackend.ALLTALK -> {
+                Field("AllTalk 服务地址", options.ttsEndpoint, { options = options.copy(ttsEndpoint = it) },
+                    enabled = enabled, type = KeyboardType.Uri, placeholder = "http://127.0.0.1:7851")
+                Field("API Key（如无鉴权可留空）", options.ttsApiKey, { options = options.copy(ttsApiKey = it) }, secret = true, enabled = enabled)
+                Field("默认音色文件（如 female_01.wav）", options.allTalkVoice, { options = options.copy(allTalkVoice = it) }, enabled = enabled)
+                SelectField("朗读语言", options.allTalkLanguage, (allTalkLanguages + options.allTalkLanguage).distinct(), { it }, enabled) {
+                    options = options.copy(allTalkLanguage = it)
+                }
+                OutlinedButton({ voiceTarget = "" }, enabled = enabled && options.ttsEndpoint.isNotBlank()) {
+                    Text("读取并选择 AllTalk 音色")
+                }
+            }
+            TtsBackend.KOKORO -> {
+                Field("Kokoro TTS 服务地址", options.ttsEndpoint, { options = options.copy(ttsEndpoint = it) },
+                    enabled = enabled, type = KeyboardType.Uri, placeholder = "http://127.0.0.1:8880")
+                Field("API Key（如无鉴权可留空）", options.ttsApiKey, { options = options.copy(ttsApiKey = it) }, secret = true, enabled = enabled)
+                SelectField(
+                    "预设音色",
+                    options.kokoroVoice,
+                    (curatedKokoroVoices.map { it.id } + options.kokoroVoice).distinct(),
+                    { id -> curatedKokoroVoices.firstOrNull { it.id == id }?.name ?: id },
+                    enabled,
+                ) { options = options.copy(kokoroVoice = it) }
+                Field("音色 ID（支持混音如 af_heart+af_bella）", options.kokoroVoice, { options = options.copy(kokoroVoice = it) }, enabled = enabled)
+                OutlinedButton({ voiceTarget = "" }, enabled = enabled) {
+                    Text("读取并选择 Kokoro 音色")
+                }
             }
             TtsBackend.ELEVENLABS -> {
                 Field("API 地址（留空默认官方）", options.ttsEndpoint, { options = options.copy(ttsEndpoint = it) }, enabled = enabled,
@@ -164,6 +221,9 @@ internal fun VoiceSettings(state: TavernState, model: TavernViewModel, close: ()
         val selectedVoice = options.actorVoice(actor.takeIf(String::isNotBlank))
         val canPreview = when (activeTts) {
             TtsBackend.SYSTEM, TtsBackend.EDGE_TTS -> true
+            TtsBackend.AZURE -> options.ttsApiKey.isNotBlank() && selectedVoice.isNotBlank()
+            TtsBackend.ALLTALK -> options.ttsEndpoint.isNotBlank() && selectedVoice.isNotBlank()
+            TtsBackend.KOKORO -> options.ttsEndpoint.isNotBlank() && selectedVoice.isNotBlank()
             TtsBackend.OPENAI_COMPAT -> options.backendId.isNotBlank() && options.backendModel.isNotBlank() && options.backendVoice.isNotBlank()
             TtsBackend.ELEVENLABS -> options.ttsApiKey.isNotBlank() && options.elevenLabsVoiceId.isNotBlank()
             TtsBackend.FISH_AUDIO -> options.ttsApiKey.isNotBlank()
@@ -180,11 +240,15 @@ internal fun VoiceSettings(state: TavernState, model: TavernViewModel, close: ()
             Spacer(Modifier.width(8.dp))
             Text(if (playing) "停止试听" else "试听选定音色")
         }
-        if (!activeTts.selfHosted && activeTts != TtsBackend.GEMINI_NATIVE && activeTts != TtsBackend.NOVELAI) {
+        if (!activeTts.selfHosted && activeTts !in setOf(TtsBackend.GEMINI_NATIVE, TtsBackend.NOVELAI, TtsBackend.ALLTALK)) {
             VoiceSlider("语速", options.speed, enabled) { options = options.copy(speed = it) }
         }
-        if (activeTts == TtsBackend.SYSTEM || activeTts == TtsBackend.EDGE_TTS) {
+        if (activeTts in setOf(TtsBackend.SYSTEM, TtsBackend.EDGE_TTS, TtsBackend.AZURE)) {
             VoiceSlider("音高", options.pitch, enabled) { options = options.copy(pitch = it) }
+        }
+        if (activeTts != TtsBackend.SYSTEM) {
+            HorizontalDivider()
+            RvcSettingsSection(options.rvc, enabled) { options = options.copy(rvc = it) }
         }
         GroupToggle("有引号时只读引号中的文字", options.quoteOnly, enabled) { options = options.copy(quoteOnly = it) }
         GroupToggle("跳过星号内的动作描写", options.skipActions, enabled) { options = options.copy(skipActions = it) }
@@ -204,6 +268,9 @@ internal fun VoiceSettings(state: TavernState, model: TavernViewModel, close: ()
             Field("API Key（本地服务可留空）", options.sttApiKey, { options = options.copy(sttApiKey = it) }, secret = true, enabled = enabled)
             Field("模型名", options.sttModel, { options = options.copy(sttModel = it) }, enabled = enabled,
                 placeholder = "whisper-1")
+        }
+        if (options.sttBackend == SttBackend.WHISPER_LOCAL) {
+            LocalWhisperModelSection(enabled)
         }
         SelectField("识别结果", options.dictationMode, DictationMode.entries, DictationMode::label, enabled) { options = options.copy(dictationMode = it) }
         Field("识别语言标签（可选）", options.language, { options = options.copy(language = it) },
@@ -238,6 +305,11 @@ internal fun VoiceSettings(state: TavernState, model: TavernViewModel, close: ()
                         sttEndpoint = options.sttEndpoint.trim(),
                         sttApiKey = options.sttApiKey.trim(),
                         sttModel = options.sttModel.trim().ifBlank { "whisper-1" },
+                        azureRegion = options.azureRegion.trim().ifBlank { DEFAULT_AZURE_REGION },
+                        azureVoice = options.azureVoice.trim().ifBlank { DEFAULT_AZURE_VOICE },
+                        allTalkVoice = options.allTalkVoice.trim(),
+                        allTalkLanguage = options.allTalkLanguage.trim().ifBlank { DEFAULT_ALLTALK_LANGUAGE },
+                        kokoroVoice = options.kokoroVoice.trim().ifBlank { DEFAULT_KOKORO_VOICE },
                         shortcuts = shortcutPairs.toMap(),
                     ),
                     ::leave,
@@ -249,6 +321,9 @@ internal fun VoiceSettings(state: TavernState, model: TavernViewModel, close: ()
         val select: (String) -> Unit = { voice ->
             options = if (target.isNotEmpty()) options.withVoice(target, voice) else when (activeTts) {
                 TtsBackend.SYSTEM -> options.copy(systemVoice = voice)
+                TtsBackend.AZURE -> options.copy(azureVoice = voice)
+                TtsBackend.ALLTALK -> options.copy(allTalkVoice = voice)
+                TtsBackend.KOKORO -> options.copy(kokoroVoice = voice)
                 TtsBackend.GEMINI_NATIVE -> options.copy(geminiTtsVoice = voice)
                 TtsBackend.NOVELAI -> options.copy(novelAiTtsVoice = voice)
                 TtsBackend.ELEVENLABS -> options.copy(elevenLabsVoiceId = voice)
@@ -319,10 +394,143 @@ private fun SpeechProviderField(
 
 private fun canUseServiceVoiceCatalog(options: VoicePreferences, providers: List<Provider>) =
     when (options.activeBackend) {
-        TtsBackend.ELEVENLABS -> options.ttsApiKey.isNotBlank()
+        TtsBackend.ELEVENLABS, TtsBackend.AZURE -> options.ttsApiKey.isNotBlank()
+        TtsBackend.ALLTALK -> options.ttsEndpoint.isNotBlank()
+        TtsBackend.KOKORO -> true
         TtsBackend.GEMINI_NATIVE, TtsBackend.NOVELAI -> options.speechProvider(providers) != null
         else -> options.activeBackend.selfHosted && options.ttsEndpoint.isNotBlank()
     }
+
+@Composable
+private fun RvcSettingsSection(
+    rvc: app.tavern.nativeclient.media.RvcSettings,
+    enabled: Boolean,
+    change: (app.tavern.nativeclient.media.RvcSettings) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var models by remember { mutableStateOf<List<String>>(emptyList()) }
+    var loadingModels by remember { mutableStateOf(false) }
+    var modelError by remember { mutableStateOf<String?>(null) }
+    FormHeading("RVC 变声后处理")
+    GroupToggle("TTS 合成后启用 RVC 变声", rvc.enabled, enabled) { change(rvc.copy(enabled = it)) }
+    if (rvc.enabled) {
+        Field("RVC / Extras 服务地址", rvc.endpoint, { change(rvc.copy(endpoint = it)) },
+            enabled = enabled, type = KeyboardType.Uri, placeholder = "http://192.168.1.20:5100")
+        Field("API Key（如无鉴权可留空）", rvc.apiKey, { change(rvc.copy(apiKey = it)) }, secret = true, enabled = enabled)
+        Field("RVC 模型名称", rvc.modelName, { change(rvc.copy(modelName = it)) }, enabled = enabled)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(
+                onClick = {
+                    loadingModels = true
+                    modelError = null
+                    scope.launch {
+                        try {
+                            models = listRvcModels(rvc)
+                            if (models.isEmpty()) modelError = "服务端没有可用的 RVC 模型"
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            modelError = e.localizedMessage ?: "无法读取 RVC 模型列表"
+                        } finally {
+                            loadingModels = false
+                        }
+                    }
+                },
+                enabled = enabled && !loadingModels && rvc.endpoint.isNotBlank(),
+            ) { Text(if (loadingModels) "正在读取…" else "读取 RVC 模型") }
+        }
+        modelError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        if (models.isNotEmpty()) {
+            SelectField("选择 RVC 模型", rvc.modelName, (models + rvc.modelName).filter(String::isNotBlank).distinct(),
+                { it }, enabled) { change(rvc.copy(modelName = it)) }
+        }
+        SelectField("音高提取算法 (F0)", rvc.f0Method, rvcF0Methods, { it }, enabled) { change(rvc.copy(f0Method = it)) }
+        Column {
+            Text("变调 (Pitch Shift) · ${if (rvc.pitchShift >= 0) "+${rvc.pitchShift}" else "${rvc.pitchShift}"} 半音",
+                style = MaterialTheme.typography.labelLarge)
+            Slider(rvc.pitchShift.toFloat(), { change(rvc.copy(pitchShift = it.roundToInt())) },
+                enabled = enabled, valueRange = -24f..24f, steps = 47)
+        }
+        Column {
+            Text("检索特征占比 (Index Rate) · ${String.format(Locale.ROOT, "%.2f", rvc.indexRate)}",
+                style = MaterialTheme.typography.labelLarge)
+            Slider(rvc.indexRate, { change(rvc.copy(indexRate = (it * 20f).roundToInt() / 20f)) },
+                enabled = enabled, valueRange = 0f..1f, steps = 19)
+        }
+        Column {
+            Text("中值滤波半径 (Filter Radius) · ${rvc.filterRadius}", style = MaterialTheme.typography.labelLarge)
+            Slider(rvc.filterRadius.toFloat(), { change(rvc.copy(filterRadius = it.roundToInt())) },
+                enabled = enabled, valueRange = 0f..7f, steps = 6)
+        }
+    }
+}
+
+@Composable
+private fun LocalWhisperModelSection(enabled: Boolean) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val stt = remember(context) { LocalWhisperStt(localWhisperDir(context.applicationContext)) }
+    var status by remember { mutableStateOf(stt.status()) }
+    var busy by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    val importer = rememberLauncherForActivityResult(OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        busy = true
+        message = "正在导入本地 Whisper ONNX 模型包…"
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    requireNotNull(context.contentResolver.openInputStream(uri)) { "无法打开模型包" }.use { input ->
+                        stt.importArchive(input)
+                    }
+                }
+                status = stt.status()
+                message = "本地 Whisper ONNX 模型已就绪"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                message = e.localizedMessage ?: "导入本地 Whisper 模型失败"
+            } finally {
+                busy = false
+            }
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        val statusText = if (status.installed) {
+            "本地 Whisper ONNX 模型已安装（${String.format(Locale.ROOT, "%.1f", status.totalBytes / (1024.0 * 1024.0))} MB）"
+        } else {
+            "尚未安装本地 Whisper 模型（缺少：${status.missingParts.joinToString("、") { it.filename }}）"
+        }
+        Text(statusText, style = MaterialTheme.typography.bodySmall)
+        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+        message?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton({ importer.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
+                enabled = enabled && !busy) { Text("导入 ONNX 模型包 (.zip)") }
+            if (status.totalBytes > 0L) {
+                TextButton(
+                    onClick = {
+                        busy = true
+                        scope.launch {
+                            try {
+                                withContext(Dispatchers.IO) { stt.remove() }
+                                status = stt.status()
+                                message = "已移除本地 Whisper 模型"
+                            } catch (e: Exception) {
+                                message = e.localizedMessage ?: "移除模型失败"
+                            } finally {
+                                busy = false
+                            }
+                        }
+                    },
+                    enabled = enabled && !busy,
+                ) { Text("移除模型") }
+            }
+        }
+        Text("支持包含 encoder.onnx、decoder.onnx 与 vocab.json（或 tokenizer.json）的 ZIP 模型包，全流程本机离线运行。",
+            style = MaterialTheme.typography.bodySmall)
+    }
+}
 
 @Composable
 private fun ServiceVoicePicker(model: TavernViewModel, options: VoicePreferences, actor: String, playing: Boolean,

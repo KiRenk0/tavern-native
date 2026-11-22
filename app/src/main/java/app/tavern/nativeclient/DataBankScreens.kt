@@ -88,7 +88,7 @@ internal fun DataBankPanel(state: TavernState, model: TavernViewModel, fromChat:
                 Button({ picker.launch(arrayOf("*/*")) }, modifier = Modifier.weight(1f), enabled = enabled) { Text("导入文件") }
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton({ web = true }, modifier = Modifier.weight(1f), enabled = enabled) { Text("导入网页") }
+                TextButton({ web = true }, modifier = Modifier.weight(1f), enabled = enabled) { Text("导入网页 / 外部源") }
                 TextButton({ model.indexDataDocuments(owner) }, modifier = Modifier.weight(1f),
                     enabled = enabled && documents.any(DataDocument::enabled)) { Text("建立索引") }
             }
@@ -189,15 +189,83 @@ private fun DataDocumentEditor(value: DocumentText, choices: List<DataOwnerChoic
 
 @Composable
 private fun WebDocumentDialog(enabled: Boolean, close: () -> Unit, submit: (List<String>) -> Unit) {
+    var kind by rememberSaveable { mutableStateOf(ExternalSourceKind.AUTO) }
     var input by rememberSaveable { mutableStateOf("") }
-    val urls = remember(input) { webDocumentLinks(input) }
-    AlertDialog(onDismissRequest = close, title = { Text("导入网页") }, text = {
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Field("每行一个网页地址", input, { input = it }, placeholder = "https://example.com/article", lines = 5, enabled = enabled)
-            if (urls.size > MAX_WEB_DOCUMENTS) Text("每批最多导入 $MAX_WEB_DOCUMENTS 个网页", color = MaterialTheme.colorScheme.error)
+    var secondary by rememberSaveable { mutableStateOf("") }
+    var lang by rememberSaveable { mutableStateOf("") }
+    val resolved = remember(kind, input, secondary, lang) {
+        runCatching {
+            when (kind) {
+                ExternalSourceKind.AUTO -> webDocumentLinks(input)
+                ExternalSourceKind.YOUTUBE -> webDocumentLinks(input).map { buildYouTubeImportUrl(it, lang) }
+                ExternalSourceKind.FANDOM -> if (parseFandomUrl(input) != null) listOf(input.trim())
+                else if (input.isNotBlank() && secondary.isNotBlank()) listOf(buildFandomImportUrl(input, secondary))
+                else emptyList()
+                ExternalSourceKind.MEDIAWIKI -> if (parseMediaWikiUrl(input) != null && secondary.isBlank()) listOf(input.trim())
+                else if (input.isNotBlank() && secondary.isNotBlank()) listOf(buildMediaWikiImportUrl(input, secondary))
+                else emptyList()
+            }
+        }
+    }
+    val urls = resolved.getOrDefault(emptyList())
+    val errorText = resolved.exceptionOrNull()?.message
+    AlertDialog(onDismissRequest = close, title = { Text("导入网页与外部资料源") }, text = {
+        Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            SelectField("资料来源", kind, ExternalSourceKind.entries, ExternalSourceKind::label, enabled) { next ->
+                kind = next
+            }
+            when (kind) {
+                ExternalSourceKind.AUTO -> {
+                    Field(
+                        "每行一个地址（支持网页 / YouTube / Fandom / 维基百科 / MediaWiki）",
+                        input,
+                        { input = it },
+                        placeholder = "https://en.wikipedia.org/wiki/Role-playing_game",
+                        lines = 5,
+                        enabled = enabled,
+                    )
+                }
+                ExternalSourceKind.YOUTUBE -> {
+                    Field(
+                        "YouTube 链接或 11 位视频 ID（每行一个）",
+                        input,
+                        { input = it },
+                        placeholder = "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                        lines = 3,
+                        enabled = enabled,
+                    )
+                    Field("优先字幕语言代码（可选，如 zh / en / ja）", lang, { lang = it }, enabled = enabled)
+                }
+                ExternalSourceKind.FANDOM -> {
+                    Field(
+                        "Fandom 词条链接或站点子域名",
+                        input,
+                        { input = it },
+                        placeholder = "elderscrolls 或 https://elderscrolls.fandom.com/wiki/Skyrim",
+                        enabled = enabled,
+                    )
+                    if (parseFandomUrl(input) == null) {
+                        Field("词条名称", secondary, { secondary = it }, placeholder = "Skyrim", enabled = enabled)
+                    }
+                }
+                ExternalSourceKind.MEDIAWIKI -> {
+                    Field(
+                        "维基百科 / MediaWiki 词条链接或站点地址",
+                        input,
+                        { input = it },
+                        placeholder = "https://zh.wikipedia.org",
+                        enabled = enabled,
+                    )
+                    if (parseMediaWikiUrl(input) == null) {
+                        Field("词条名称", secondary, { secondary = it }, placeholder = "桌面角色扮演游戏", enabled = enabled)
+                    }
+                }
+            }
+            errorText?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            if (urls.size > MAX_WEB_DOCUMENTS) Text("每批最多导入 $MAX_WEB_DOCUMENTS 个来源", color = MaterialTheme.colorScheme.error)
         }
     }, dismissButton = { TextButton(close) { Text("取消") } }, confirmButton = {
-        Button({ submit(urls) }, enabled = enabled && urls.size in 1..MAX_WEB_DOCUMENTS) { Text("导入") }
+        Button({ submit(urls) }, enabled = enabled && errorText == null && urls.size in 1..MAX_WEB_DOCUMENTS) { Text("导入") }
     })
 }
 

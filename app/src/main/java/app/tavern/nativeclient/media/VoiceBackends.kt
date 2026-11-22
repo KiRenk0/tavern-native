@@ -295,21 +295,25 @@ internal object EdgeTtsClient {
 internal suspend fun synthesizeBackendAudio(narration: Narration): ByteArray {
     val options = narration.options
     val voice = narration.voice.ifBlank { options.defaultVoice }
-    return when (options.activeBackend) {
+    val synthesized = when (options.activeBackend) {
         TtsBackend.SYSTEM -> error("系统朗读不使用音频下载管线")
         TtsBackend.OPENAI_COMPAT -> {
             val backend = requireNotNull(narration.backend) { "请选择 OpenAI 兼容语音服务" }
             synthesizeSpeech(backend, options.backendModel, voice, narration.text, options.speed)
         }
         TtsBackend.EDGE_TTS -> EdgeTtsClient.synthesize(narration.text, voice, options.speed, options.pitch)
+        TtsBackend.AZURE -> synthesizeAzureSpeech(options, voice, narration.text)
         TtsBackend.ELEVENLABS -> synthesizeElevenLabs(options, voice, narration.text)
         TtsBackend.FISH_AUDIO -> synthesizeFishAudio(options, voice, narration.text)
         TtsBackend.GPT_SOVITS -> synthesizeGptSovits(options, voice, narration.text)
+        TtsBackend.ALLTALK -> synthesizeAllTalk(options, voice, narration.text)
+        TtsBackend.KOKORO -> synthesizeKokoro(options, voice, narration.text)
         TtsBackend.GEMINI_NATIVE -> synthesizeGeminiVoice(requireNotNull(narration.backend), options, voice, narration.text)
         TtsBackend.NOVELAI -> synthesizeNovelAiVoice(requireNotNull(narration.backend), voice, narration.text)
         TtsBackend.VITS, TtsBackend.STYLE_BERT_VITS2, TtsBackend.XTTS, TtsBackend.SILERO, TtsBackend.COSYVOICE ->
             synthesizeSelfHostedVoice(options, voice, narration.text)
     }
+    return if (options.rvc.enabled) convertAudioWithRvc(synthesized, options.rvc) else synthesized
 }
 
 internal suspend fun synthesizeElevenLabs(options: VoicePreferences, voiceId: String, text: String): ByteArray {

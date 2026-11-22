@@ -235,9 +235,28 @@ internal class EmbeddedLibrary(
             groupCount++
         }
         val prefs = store.prefs()
-        val avatarFiles = source.files("User Avatars").associateBy(OriginalLibraryFile::name)
+        val avatarFiles = media.userAvatarFiles()
+        val avatarFilesLower = avatarFiles.entries.associate { (k, v) -> k.lowercase() to v }
+        val claimedAvatars = mutableSetOf<String>()
         val personas = prefs.personas.associateByTo(linkedMapOf(), PersonaProfile::id)
         val links = prefs.personaConnections.toMutableMap()
+        fun findAvatarFile(name: String): OriginalLibraryFile? =
+            avatarFiles[name] ?: avatarFilesLower[name.lowercase()]
+                ?: avatarFiles.values.firstOrNull { it.nameWithoutExtension.equals(name.substringBeforeLast('.'), true) }
+        fun restoreAvatarFor(existingAvatar: String?, originalKey: String, isPlaceholder: Boolean): String? {
+            if (existingAvatar != null && store.personaAvatar(existingAvatar).isFile) return existingAvatar
+            if (isPlaceholder) return existingAvatar
+            val file = findAvatarFile(originalKey) ?: return existingAvatar
+            claimedAvatars += file.name.lowercase()
+            var restoredId = existingAvatar
+            attempt {
+                val bytes = media.readPersonaAvatar(file) ?: return@attempt
+                val asset = existingAvatar ?: sourceId("persona-avatar:${file.name}")
+                store.writePersonaAvatar(asset, bytes)
+                restoredId = asset
+            }
+            return restoredId
+        }
         for ((original, id) in personaIds) {
             val description = descriptions?.optJSONObject(original) ?: JSONObject()
             description.optJSONArray("connections")?.objects().orEmpty().forEach { link ->
@@ -251,20 +270,36 @@ internal class EmbeddedLibrary(
             val existing = personas[id]?.takeUnless {
                 nativeBackup && id == PersonaProfile.LEGACY_ID && startingPersonas == listOf(PersonaProfile.legacy())
             }
-            var avatar = existing?.avatar
-            if (avatar == null && !(nativeBackup && description.optBoolean("tavern_native_placeholder_avatar"))) {
-                avatarFiles[original]?.let { file -> attempt {
-                    val asset = sourceId("persona-avatar:$original")
-                    store.writePersonaAvatar(asset, file.bytes())
-                    avatar = asset
-                } }
-            }
+            val isPlaceholder = nativeBackup && description.optBoolean("tavern_native_placeholder_avatar")
+            val avatar = restoreAvatarFor(existing?.avatar, original, isPlaceholder)
             personas[id] = existing?.copy(avatar = avatar) ?: PersonaProfile(
                 id, personaNames?.string(original).orEmpty(), description.string("description"), description.string("title"),
                 PersonaPosition.entries.firstOrNull { it.code == description.optInt("position") } ?: PersonaPosition.PROMPT,
                 description.optInt("depth", 2).coerceAtLeast(0),
                 PromptRole.entries.getOrElse(description.optInt("role")) { PromptRole.SYSTEM },
                 worldFor(description.string("lorebook"))?.id.orEmpty(), avatar)
+        }
+        val legacyUserAvatar = settings?.string("user_avatar").orEmpty().trim()
+        if (legacyUserAvatar.isNotBlank() && legacyUserAvatar !in personaIds) {
+            val targetId = prefs.defaultPersonaId.takeIf { it in personas } ?: personas.keys.firstOrNull()
+            if (targetId != null) {
+                val current = personas.getValue(targetId)
+                val restored = restoreAvatarFor(current.avatar, legacyUserAvatar, isPlaceholder = false)
+                if (restored != current.avatar) personas[targetId] = current.copy(avatar = restored)
+            }
+        }
+        for ((filename, file) in avatarFiles) {
+            if (filename.lowercase() in claimedAvatars || filename.equals("user-default.png", true)) continue
+            val id = sourceId("persona:$filename")
+            val existing = personas[id]
+            val avatar = restoreAvatarFor(existing?.avatar, filename, isPlaceholder = false)
+            if (avatar != null) {
+                personas[id] = existing?.copy(avatar = avatar) ?: PersonaProfile(
+                    id = id,
+                    name = file.nameWithoutExtension.ifBlank { "用户" },
+                    avatar = avatar,
+                )
+            }
         }
         val profiles = personas.values.toList()
         val useSourceDefaults = prefs.personas == listOf(PersonaProfile.legacy())

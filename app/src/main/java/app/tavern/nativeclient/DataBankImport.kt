@@ -70,7 +70,9 @@ internal fun webDocumentLinks(input: String): List<String> = input.lineSequence(
     .filter(String::isNotEmpty).distinct().take(MAX_WEB_DOCUMENTS + 1).toList()
 
 internal suspend fun importWebDocument(value: String): ImportedDocument {
-    val url = runCatching { URI(value.trim()) }.getOrNull()
+    val trimmed = value.trim()
+    importExternalSourceIfMatched(trimmed)?.let { return it }
+    val url = runCatching { URI(trimmed) }.getOrNull()
     require(url != null && url.scheme in setOf("http", "https") && url.host != null && url.rawUserInfo == null) { "请输入有效的网页地址" }
     return request(url.toString(), headers = mapOf("Accept" to "text/html, application/xhtml+xml, text/plain"), followRedirects = true) { input, type ->
         val format = type.substringBefore(';').trim().lowercase(Locale.ROOT)

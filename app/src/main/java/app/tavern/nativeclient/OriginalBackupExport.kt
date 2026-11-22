@@ -18,7 +18,15 @@ private val backupBlankPortrait = Base64.getDecoder().decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=")
 private val windowsDevice = Regex("(?i)(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\\..*)?")
 
-internal data class BackupExportResult(val cards: Int, val groups: Int, val chats: Int, val books: Int, val missing: Int)
+internal data class BackupExportResult(
+    val cards: Int,
+    val groups: Int,
+    val chats: Int,
+    val books: Int,
+    val missing: Int,
+    val personaAvatars: Int = 0,
+    val mediaFiles: Int = 0,
+)
 
 internal fun writeOriginalBackup(
     output: OutputStream, store: TavernStore, documents: ChatDocumentStore, images: ChatImageStore,
@@ -80,6 +88,7 @@ private class OriginalBackupWriter(
     private val media = mutableMapOf<String, Boolean>()
     private var missing = 0
     private var chatCount = 0
+    private var personaAvatarCount = 0
 
     fun write(): BackupExportResult {
         val filterNames = cards.uniqueLoreFilenames().mapValues { (_, id) -> avatars.getValue(id).loreFilenameStem() } +
@@ -97,7 +106,15 @@ private class OriginalBackupWriter(
         val groupChats = BackupNames()
         for (group in groups) writeGroup(group, groupChats)
         addJson("settings.json", settings().also(::writeBackgrounds))
-        return BackupExportResult(cards.size, groups.size, chatCount, books.size, missing)
+        return BackupExportResult(
+            cards = cards.size,
+            groups = groups.size,
+            chats = chatCount,
+            books = books.size,
+            missing = missing,
+            personaAvatars = personaAvatarCount,
+            mediaFiles = media.values.count { it } + personaAvatarCount,
+        )
     }
 
     private fun writeCard(card: Card) {
@@ -218,6 +235,7 @@ private class OriginalBackupWriter(
             }
             val portrait = persona.avatar?.let(store::personaAvatar)?.takeIf { it.isFile }?.inputStream()?.use { it.readLimited() }
             if (persona.avatar != null && portrait == null) missing++
+            if (portrait != null) personaAvatarCount++
             add("User Avatars/$filename", portrait ?: backupBlankPortrait)
             personas.put(filename, persona.name)
             descriptions.put(filename, jsonOf("description" to persona.description, "title" to persona.title,
