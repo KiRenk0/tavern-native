@@ -37,6 +37,10 @@ internal interface CoordinatorHost {
     val chatTokenizers: ChatTokenizers
     val embeddingService: EmbeddingService
     val vectorSearch: VectorSearch
+    val eventBus: TavernEventBus
+    val audioEngine: DynamicAudioEngine
+    val webSearchEngine: WebSearchEngine
+    val assetsManager: AssetsManager
     var draftInProgress: String?
 
     val media: MediaCoordinator

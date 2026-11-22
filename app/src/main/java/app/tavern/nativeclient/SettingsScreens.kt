@@ -205,6 +205,7 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
     var syncSettings by rememberSaveable { mutableStateOf(false) }
     var snapshotsOpen by rememberSaveable { mutableStateOf(false) }
     var themesOpen by rememberSaveable { mutableStateOf(false) }
+    var extensionsHub by rememberSaveable { mutableStateOf(false) }
     var temperature by rememberSaveable(prefs.temperature) { mutableStateOf(prefs.temperature) }
     var maxTokens by rememberSaveable(prefs.maxTokens) { mutableStateOf(prefs.maxTokens) }
     var reasoning by rememberSaveable(prefs.includeReasoning) { mutableStateOf(prefs.includeReasoning) }
@@ -215,6 +216,10 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
     val selected = editor
     if (themesOpen) {
         ChatThemeSettingsScreen(state, model) { themesOpen = false }
+        return
+    }
+    if (extensionsHub) {
+        ExtensionHubScreen(state, model) { extensionsHub = false }
         return
     }
     if (snapshotsOpen) {
@@ -406,6 +411,11 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
             Text(if (prefs.sync.configured) "WebDAV 云同步与跨设备联动 · 已配置" else "WebDAV 云同步与跨设备联动")
         }
         GroupToggle("启用角色卡扩展脚本（MVU 面板 / 离线沙盒桥接）", prefs.cardScriptsEnabled, !state.busy, model::setCardScriptsEnabled)
+        OutlinedButton({ extensionsHub = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Outlined.Extension, null)
+            Spacer(Modifier.width(8.dp))
+            Text("扩展中心（网络搜索 / 动态音频 / 素材 / 沙盒权限）")
+        }
         OutlinedButton({ replyAutomation = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
             Icon(Icons.Outlined.Bolt, null)
             Spacer(Modifier.width(8.dp))

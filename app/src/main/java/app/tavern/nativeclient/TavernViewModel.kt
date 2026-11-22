@@ -194,6 +194,10 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     override val chatTokenizers = ChatTokenizers(application.assets::open)
     override val embeddingService = EmbeddingService(local = localEmbeddings)
     override val vectorSearch by lazy { VectorSearch(store, embeddingService) }
+    override val eventBus = TavernEventBus()
+    override val audioEngine = DynamicAudioEngine(AndroidMediaPlayerAudioBackend(application))
+    override val webSearchEngine = WebSearchEngine()
+    override val assetsManager = AssetsManager(File(application.filesDir, "tavern-assets"))
     override val mutable = MutableStateFlow(TavernState(busy = false))
     val state = mutable.asStateFlow()
     override val current get() = mutable.value
@@ -210,10 +214,12 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     override val backup = BackupCoordinator(this)
 
     init {
+        GenerationForegroundService.registerStopHandler { stop() }
         viewModelScope.launch {
             state.map { it.chat?.id }.distinctUntilChanged().collect { id ->
                 val reading = media.activeNarrationChatId()
                 if (reading != null && reading != id) media.stopNarration()
+                if (id != null) eventBus.emit(TavernCoreEvent.CHAT_CHANGED, jsonOf("chat_id" to id))
             }
         }
         work {
@@ -241,6 +247,9 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     }
 
     override fun onCleared() {
+        GenerationForegroundService.unregisterStopHandler()
+        GenerationForegroundService.stop(app)
+        audioEngine.release()
         media.close()
         val tempMedia = temporaryMedia
         Dispatchers.IO.dispatch(EmptyCoroutineContext) {
@@ -758,4 +767,24 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun toggleAuto() = generation.toggleAuto()
     fun stopAuto() = generation.stopAuto()
     fun stop() = generation.stop()
+
+    fun saveExtensions(config: ExtensionHubConfig) = work {
+        persistPreferences(current.prefs.copy(extensions = config))
+    }
+
+    fun handleSharedImport(plan: ShareImportPlan) {
+        if (plan.candidates.isEmpty()) {
+            plan.rejectedReasons.firstOrNull()?.let(::notice)
+            return
+        }
+        val uris = plan.uris
+        if (uris.isNotEmpty()) {
+            val mode = current.prefs.characterLibrary.tagImport.takeUnless { it == CardTagImport.ASK }
+                ?: CardTagImport.NONE
+            library.importCards(uris, mode)
+            if (plan.rejectedCount > 0) {
+                notice("已忽略 ${plan.rejectedCount} 个不支持的文件，正在导入 ${uris.size} 张角色卡")
+            }
+        }
+    }
 }

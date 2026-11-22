@@ -30,7 +30,25 @@ internal object ScriptExtensions {
         updateWorldActivation: suspend (List<WorldBook>) -> Unit = { error("当前脚本环境不支持切换全局世界书") },
         createBoundBook: suspend (WorldBook, ScriptWorldBinding) -> Unit = { _, _ -> error("当前脚本环境不支持创建关联世界书") },
         notice: (String) -> Unit = {},
+        audioCommand: ((String, String, Map<String, String>) -> String)? = null,
+        webSearchCommand: (suspend (String) -> String)? = null,
     ): String? = when (name) {
+        "bgm", "ambient" -> audioCommand?.invoke(name, text, named)
+            ?: app.tavern.nativeclient.DynamicAudioEngine().handleSlashCommand(
+                name,
+                text,
+                named,
+                state.prefs.extensions.dynamicAudio,
+            )
+        "websearch" -> {
+            val query = text.trim()
+            if (query.isEmpty()) ""
+            else webSearchCommand?.invoke(query) ?: run {
+                val cfg = state.prefs.extensions.webSearch
+                val engine = app.tavern.nativeclient.WebSearchEngine()
+                engine.formatForPrompt(engine.search(query, cfg), cfg)
+            }
+        }
         "world", "getchatbook", "getchatlore", "getchatwi", "getglobalbooks", "getgloballore", "getglobalwi",
         "getpersonabook", "getpersonalore", "getpersonawi", "getcharbook", "getcharlore", "getcharwi" ->
             worldBookCommand(name, named, text, state, updateWorldActivation, createBoundBook, notice)

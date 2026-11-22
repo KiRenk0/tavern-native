@@ -56,6 +56,7 @@ internal fun decodePreferences(j: JSONObject, unseal: (String) -> String, global
         replyFormatting = ReplyFormatting.from(j.optJSONObject("replyFormatting")),
         exampleBudget = ExampleBudget.entries.firstOrNull { it.name == j.string("exampleBudget") }
             ?: ExampleBudget.AVAILABLE_SPACE,
+        extensions = ExtensionHubConfig.from(j.optJSONObject("extensions"), unseal),
     )
 }
 
@@ -98,6 +99,7 @@ internal fun encodePreferences(prefs: Preferences, seal: (String) -> String): JS
         "customStops" to prefs.customStops.json(),
         "replyFormatting" to prefs.replyFormatting.json(),
         "exampleBudget" to prefs.exampleBudget.name,
+        "extensions" to prefs.extensions.json(seal),
         "temperature" to prefs.temperature, "maxTokens" to prefs.maxTokens,
         "theme" to prefs.theme, "dynamicColor" to prefs.dynamicColor,
         "server" to prefs.server, "handle" to prefs.handle,

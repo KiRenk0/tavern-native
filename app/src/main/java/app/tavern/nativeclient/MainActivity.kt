@@ -65,18 +65,49 @@ import java.text.DateFormat
 import java.util.Date
 
 class MainActivity : ComponentActivity() {
+    private val pendingShareIntent = mutableStateOf<Intent?>(null)
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (ShareImportHandler.isShareIntent(intent)) {
+            setIntent(intent)
+            pendingShareIntent.value = intent
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (ShareImportHandler.isShareIntent(intent)) {
+            pendingShareIntent.value = intent
+        }
         enableEdgeToEdge()
         setContent {
             val model: TavernViewModel = viewModel { TavernViewModel(application) }
             val state by model.state.collectAsStateWithLifecycle()
+            val shareIntent by pendingShareIntent
+            LaunchedEffect(shareIntent) {
+                val incoming = shareIntent ?: return@LaunchedEffect
+                pendingShareIntent.value = null
+                val plan = ShareImportHandler.buildImportPlan(
+                    intent = incoming,
+                    resolveName = { uri -> applicationContext.documentName(uri) },
+                    resolveMime = { uri -> contentResolver.getType(uri) },
+                )
+                model.handleSharedImport(plan)
+            }
             val lifecycle = LocalLifecycleOwner.current.lifecycle
             DisposableEffect(lifecycle, model) {
                 val observer = LifecycleEventObserver { _, event ->
                     when (event) {
-                        Lifecycle.Event.ON_START -> model.voiceForeground(true)
-                        Lifecycle.Event.ON_STOP -> { model.stopAuto(); model.voiceForeground(false) }
+                        Lifecycle.Event.ON_START -> {
+                            model.voiceForeground(true)
+                            model.audioEngine.setAppForeground(true, model.current.prefs.extensions.dynamicAudio)
+                        }
+                        Lifecycle.Event.ON_STOP -> {
+                            model.stopAuto()
+                            model.voiceForeground(false)
+                            model.audioEngine.setAppForeground(false, model.current.prefs.extensions.dynamicAudio)
+                        }
                         else -> Unit
                     }
                 }

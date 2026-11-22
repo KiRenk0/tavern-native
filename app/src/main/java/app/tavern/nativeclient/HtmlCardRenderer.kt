@@ -8,6 +8,9 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import app.tavern.nativeclient.chat.StreamingFadeText
+import app.tavern.nativeclient.script.CardSandboxHtml
+import app.tavern.nativeclient.script.CardSandboxPolicy
+import app.tavern.nativeclient.script.TavernHelperHost
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -54,6 +57,8 @@ internal fun RichMessageContent(
     mvuStateJson: String = "{}",
     onRunScript: ((String) -> Unit)? = null,
     streamFadeIn: Boolean = false,
+    sandboxPolicy: CardSandboxPolicy = CardSandboxPolicy(allowScripts = cardScriptsEnabled),
+    helperHost: TavernHelperHost? = null,
 ) {
     val scheme = MaterialTheme.colorScheme
     val blocks = remember(text, appearance.renderHtmlCards) {
@@ -176,17 +181,22 @@ internal fun RichMessageContent(
                     cardScriptsEnabled = cardScriptsEnabled,
                     mvuStateJson = mvuStateJson,
                     onRunScript = onRunScript,
+                    sandboxPolicy = sandboxPolicy,
+                    helperHost = helperHost,
                 )
                 is RichBlock.HtmlCardBlock -> {
-                    if (cardScriptsEnabled && block.rawHtml.contains("<script", ignoreCase = true)) {
+                    val effectiveScripts = cardScriptsEnabled || sandboxPolicy.allowScripts
+                    if (effectiveScripts && block.rawHtml.contains("<script", ignoreCase = true)) {
                         app.tavern.nativeclient.script.CardScriptWebView(
                             rawHtml = block.rawHtml,
                             label = block.label,
                             mvuStateJson = mvuStateJson,
                             onRunScript = onRunScript,
+                            sandboxPolicy = sandboxPolicy.copy(allowScripts = true),
+                            helperHost = helperHost,
                         )
                     } else {
-                        HtmlStatusCard(block)
+                        HtmlStatusCard(block, sandboxPolicy = sandboxPolicy.copy(allowScripts = false))
                     }
                 }
                 is RichBlock.Paragraph -> {
@@ -331,6 +341,8 @@ private fun DetailsBlockCard(
     cardScriptsEnabled: Boolean = false,
     mvuStateJson: String = "{}",
     onRunScript: ((String) -> Unit)? = null,
+    sandboxPolicy: CardSandboxPolicy = CardSandboxPolicy(allowScripts = cardScriptsEnabled),
+    helperHost: TavernHelperHost? = null,
 ) {
     var expanded by rememberSaveable(block.summary, block.openByDefault) { mutableStateOf(block.openByDefault) }
     val scheme = MaterialTheme.colorScheme
@@ -373,6 +385,8 @@ private fun DetailsBlockCard(
                     cardScriptsEnabled = cardScriptsEnabled,
                     mvuStateJson = mvuStateJson,
                     onRunScript = onRunScript,
+                    sandboxPolicy = sandboxPolicy,
+                    helperHost = helperHost,
                 )
             }
         }
@@ -381,13 +395,17 @@ private fun DetailsBlockCard(
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-private fun HtmlStatusCard(block: RichBlock.HtmlCardBlock) {
+private fun HtmlStatusCard(
+    block: RichBlock.HtmlCardBlock,
+    sandboxPolicy: CardSandboxPolicy = CardSandboxPolicy(allowScripts = false),
+) {
     val scheme = MaterialTheme.colorScheme
     val dark = isSystemInDarkTheme() || scheme.surface.luminanceCompat() < 0.4f
     var collapsed by rememberSaveable(block.label) { mutableStateOf(false) }
     var showSource by rememberSaveable(block.label) { mutableStateOf(false) }
-    val wrappedHtml = remember(block.rawHtml, dark, scheme) {
-        sanitizeCardHtml(
+    val latestPolicy by rememberUpdatedState(sandboxPolicy)
+    val wrappedHtml = remember(block.rawHtml, dark, scheme, sandboxPolicy) {
+        CardSandboxHtml.sanitizeStaticCardHtml(
             rawHtml = block.rawHtml,
             darkTheme = dark,
             bgHex = scheme.surface.toHexCss(),
@@ -396,6 +414,7 @@ private fun HtmlStatusCard(block: RichBlock.HtmlCardBlock) {
             mutedHex = scheme.onSurfaceVariant.toHexCss(),
             accentHex = scheme.primary.toHexCss(),
             borderHex = scheme.outlineVariant.toHexCss(),
+            policy = sandboxPolicy,
         )
     }
 
@@ -458,6 +477,7 @@ private fun HtmlStatusCard(block: RichBlock.HtmlCardBlock) {
                                 setBackgroundColor(0)
                                 isVerticalScrollBarEnabled = false
                                 isHorizontalScrollBarEnabled = true
+                                val allowNet = latestPolicy.allowNetwork && latestPolicy.normalizedDomains.isNotEmpty()
                                 settings.apply {
                                     javaScriptEnabled = false
                                     allowFileAccess = false
@@ -466,9 +486,9 @@ private fun HtmlStatusCard(block: RichBlock.HtmlCardBlock) {
                                     allowFileAccessFromFileURLs = false
                                     @Suppress("DEPRECATION")
                                     allowUniversalAccessFromFileURLs = false
-                                    blockNetworkLoads = true
-                                    blockNetworkImage = true
-                                    loadsImagesAutomatically = false
+                                    blockNetworkLoads = !allowNet
+                                    blockNetworkImage = !allowNet
+                                    loadsImagesAutomatically = allowNet
                                     setSupportZoom(false)
                                     builtInZoomControls = false
                                     displayZoomControls = false
@@ -479,15 +499,23 @@ private fun HtmlStatusCard(block: RichBlock.HtmlCardBlock) {
                                     override fun shouldInterceptRequest(
                                         view: WebView?,
                                         request: WebResourceRequest?,
-                                    ): WebResourceResponse = WebResourceResponse(
-                                        "text/plain",
-                                        "utf-8",
-                                        ByteArrayInputStream(ByteArray(0)),
-                                    )
+                                    ): WebResourceResponse? {
+                                        val url = request?.url?.toString().orEmpty()
+                                        if (latestPolicy.isUrlAllowed(url)) return null
+                                        return WebResourceResponse(
+                                            "text/plain",
+                                            "utf-8",
+                                            ByteArrayInputStream(ByteArray(0)),
+                                        )
+                                    }
                                 }
                             }
                         },
                         update = { view ->
+                            val allowNet = latestPolicy.allowNetwork && latestPolicy.normalizedDomains.isNotEmpty()
+                            view.settings.blockNetworkLoads = !allowNet
+                            view.settings.blockNetworkImage = !allowNet
+                            view.settings.loadsImagesAutomatically = allowNet
                             if (view.tag != wrappedHtml) {
                                 view.tag = wrappedHtml
                                 view.loadDataWithBaseURL(null, wrappedHtml, "text/html", "utf-8", null)

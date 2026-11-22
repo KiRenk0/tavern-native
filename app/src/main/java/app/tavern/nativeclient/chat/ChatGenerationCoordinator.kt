@@ -295,6 +295,13 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
         autoTimer?.cancel()
         autoTimer = null
         host.mutable.update { it.copy(generation = generation) }
+        host.eventBus.emit(TavernCoreEvent.GENERATION_STARTED, jsonOf("chat_id" to chat.id, "speaker" to generation.speaker))
+        GenerationForegroundService.startOrUpdate(
+            context = host.app,
+            title = "正在生成回复 · ${generation.speaker}",
+            status = "后台生成中，可点击停止",
+            kind = GenerationForegroundService.KIND_LLM,
+        )
         generator = host.scope.launch {
             var completed = false
             var receivedReply = false
@@ -305,6 +312,7 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                 if (addUser) {
                     withContext(NonCancellable) { host.persist(chat) }
                     if (!preserveDraftAttachments) host.clearDraftAttachments(chat.id)
+                    host.eventBus.emit(TavernCoreEvent.MESSAGE_SENT, jsonOf("chat_id" to chat.id, "message_id" to chat.messages.lastIndex))
                     host.media.narrate(chat.messages.last(), automatic = true)
                     host.script.quickEvent(QuickEvent.USER)
                 }
@@ -633,6 +641,12 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                         }
                         ongoing = host.current.chat ?: ongoing
                         receivedReply = true
+                        host.eventBus.emit(TavernCoreEvent.MESSAGE_RECEIVED, jsonOf("chat_id" to chat.id, "message_id" to ongoing.messages.lastIndex))
+                        host.audioEngine.evaluateTriggers(
+                            config = host.current.prefs.extensions.dynamicAudio,
+                            backgroundName = host.current.prefs.backgrounds.effective(ongoing)?.filename,
+                            messageText = ongoing.messages.lastOrNull()?.text,
+                        )
                         host.media.narrate(ongoing.messages.last(), automatic = true)
                         host.script.quickEvent(QuickEvent.AI)
                         break
@@ -651,6 +665,8 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                 host.notice(e.localizedMessage ?: "生成失败，请重试")
             } finally {
                 host.mutable.update { it.copy(generation = null) }
+                GenerationForegroundService.stop(host.app)
+                host.eventBus.emit(TavernCoreEvent.GENERATION_ENDED, jsonOf("chat_id" to chat.id, "completed" to completed))
                 if (completed && host.current.autoChatId == chat.id) scheduleAuto()
                 else if (!completed) stopAuto()
             }

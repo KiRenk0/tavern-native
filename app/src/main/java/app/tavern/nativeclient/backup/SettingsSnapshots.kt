@@ -65,6 +65,17 @@ internal class SettingsSnapshot private constructor(val name: String, val create
                 val extras = saved.summaryExtras
                 extras.copy(apiKey = if (sameAddress(extras.endpoint, current.summaryExtras.endpoint)) current.summaryExtras.apiKey else extras.apiKey)
             },
+            extensions = if (!config.has("extensions")) current.extensions else {
+                val ext = saved.extensions
+                val ws = ext.webSearch
+                val curWs = current.extensions.webSearch
+                val key = if (ws.apiKey.isBlank() && ws.backend == curWs.backend && sameAddress(ws.effectiveEndpoint, curWs.effectiveEndpoint)) {
+                    curWs.apiKey
+                } else {
+                    ws.apiKey
+                }
+                ext.copy(webSearch = ws.copy(apiKey = key))
+            },
         )
     }
 

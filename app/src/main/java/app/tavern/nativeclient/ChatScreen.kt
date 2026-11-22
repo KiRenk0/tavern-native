@@ -262,10 +262,16 @@ internal fun ChatScreen(chat: Chat, state: TavernState, model: TavernViewModel, 
     val keyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val showStage = visualNovel && !historyExpanded && selected == null && !searchOpen && !keyboardVisible
     val activePreset = state.presetFor(chat)
-    val mvuComputation = remember(messages, chat.options.variables) {
+    val mvuComputation = remember(messages, chat.options.variables, state.card, state.books) {
+        val (initial, schema) = app.tavern.nativeclient.script.MvuEngine.resolveInitialStateWithSchema(
+            variables = chat.options.variables,
+            card = state.card,
+            books = state.books,
+        )
         app.tavern.nativeclient.script.MvuEngine.recomputeMvuState(
             messages = messages,
-            initial = app.tavern.nativeclient.script.MvuEngine.initialStateFrom(chat.options.variables),
+            initial = initial,
+            schema = schema,
         )
     }
     val mvuStateJson = remember(mvuComputation) { mvuComputation.statData.toString() }

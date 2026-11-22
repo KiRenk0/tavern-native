@@ -652,6 +652,7 @@ internal data class Preferences(
     val customStops: CustomStoppingStrings = CustomStoppingStrings(),
     val replyFormatting: ReplyFormatting = ReplyFormatting(),
     val exampleBudget: ExampleBudget = ExampleBudget.AVAILABLE_SPACE,
+    val extensions: ExtensionHubConfig = ExtensionHubConfig(),
 ) {
     fun personaFor(chat: Chat? = null, subjectId: String? = chat?.cardId ?: chat?.groupId,
                    temporaryId: String? = null): PersonaProfile =
