@@ -70,6 +70,8 @@ internal data class TavernState(
     val lastPrompt: PromptCapture? = null,
     val scriptRunning: Boolean = false,
     val scriptDialog: ScriptDialog? = null,
+    val scriptDebug: app.tavern.nativeclient.script.ScriptDebugSnapshot? = null,
+    val reasoningCollapse: app.tavern.nativeclient.script.ReasoningCollapseState = app.tavern.nativeclient.script.ReasoningCollapseState(),
     val toolProgress: String? = null,
     val messageSelection: MessageSelectionRequest? = null,
     val archiveJump: ChatArchiveJump? = null,
@@ -499,12 +501,16 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun clearDrawingBackground(chatId: String) = media.clearDrawingBackground(chatId)
     fun setDrawingBackground(chatId: String, image: ChatImage) = media.setDrawingBackground(chatId, image)
     fun importChatBackground(chatId: String, uri: Uri) = media.importChatBackground(chatId, uri)
-    fun importBackgrounds(uris: List<Uri>) = media.importBackgrounds(uris)
+    fun importBackgrounds(uris: List<Uri>, folder: String = "") = media.importBackgrounds(uris, folder)
     fun addLibraryBackground(image: ChatImage) = media.addLibraryBackground(image)
     fun selectLibraryBackground(id: String?) = media.selectLibraryBackground(id)
     fun renameLibraryBackground(id: String, name: String) = media.renameLibraryBackground(id, name)
     fun removeLibraryBackground(id: String) = media.removeLibraryBackground(id)
     fun setBackgroundFit(fit: BackgroundFit) = media.setBackgroundFit(fit)
+    fun createBackgroundFolder(path: String) = media.createBackgroundFolder(path)
+    fun moveLibraryBackground(id: String, folder: String) = media.moveLibraryBackground(id, folder)
+    fun renameBackgroundFolder(oldPath: String, newName: String) = media.renameBackgroundFolder(oldPath, newName)
+    fun deleteBackgroundFolder(path: String) = media.deleteBackgroundFolder(path)
     fun previousDrawing(chatId: String, index: Int) = media.previousDrawing(chatId, index)
     fun nextDrawing(chatId: String, index: Int): Boolean = media.nextDrawing(chatId, index)
 
@@ -586,6 +592,8 @@ internal class TavernViewModel(application: Application) : AndroidViewModel(appl
     fun dismissMessageSelection() = chats.dismissMessageSelection()
     fun runScript(source: String, input: String = ""): Boolean = script.runScript(source, input)
     fun runQuickReply(set: QuickReplySet, item: QuickReply, input: String): Boolean = script.runQuickReply(set, item, input)
+    fun debugQuickReply(set: QuickReplySet, item: QuickReply, input: String = ""): Boolean = script.debugQuickReply(set, item, input)
+    fun stepScriptDebug(action: app.tavern.nativeclient.script.DebugAction) = script.stepDebugAction(action)
     fun completeScriptDialog(id: String, response: String?) = script.completeScriptDialog(id, response)
 
     // --- Library: Personas, Cards, Tags & Groups ---

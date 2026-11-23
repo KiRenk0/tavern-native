@@ -191,7 +191,10 @@ internal fun evaluateLore(
     render: (String) -> String = { expand(it, card, persona.name) },
     renderEntry: (LoreEntry, String) -> LoreExpansion = { _, text -> LoreExpansion(render(text)) },
 ): LoreEvaluation {
-    val candidates = loreCandidates(card, books, persona, options, settings, tagIds)
+    val candidates = loreCandidates(card, books, persona, options, settings, tagIds) +
+        app.tavern.nativeclient.script.ScriptPromptInjections.loreCandidates(options, render)
+    val injectionScan = app.tavern.nativeclient.script.ScriptPromptInjections.scanText(options, render)
+    val effectiveExtraScan = listOf(extraScan, injectionScan).filter(String::isNotBlank).joinToString("\n")
     val count = history.size
     val effects = history.asReversed().firstNotNullOfOrNull(Message::loreEffects).orEmpty()
         .filterValues { count > it.start && count < it.cooldownEnd }.toMutableMap()
@@ -237,8 +240,8 @@ internal fun evaluateLore(
         }
         val sources = item.rules.sources.mapNotNull(sourceText::get).map(render)
         val recursed = recursionText.takeUnless { pass == LorePass.EXPANSION }.orEmpty()
-        val fragments = if (boundaries) listOf(messages) + sources + extraScan + recursed
-            else listOf(messages, extraScan) + sources + recursed
+        val fragments = if (boundaries) listOf(messages) + sources + effectiveExtraScan + recursed
+            else listOf(messages, effectiveExtraScan) + sources + recursed
         val nonempty = fragments.filter(String::isNotBlank)
         if (nonempty.isEmpty()) return ""
         return nonempty.joinToString(separator, prefix = if (boundaries) "\u0001" else "")

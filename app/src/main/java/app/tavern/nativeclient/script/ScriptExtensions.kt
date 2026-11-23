@@ -32,6 +32,13 @@ internal object ScriptExtensions {
         notice: (String) -> Unit = {},
         audioCommand: ((String, String, Map<String, String>) -> String)? = null,
         webSearchCommand: (suspend (String) -> String)? = null,
+        ask: suspend (app.tavern.nativeclient.ScriptDialog) -> String? = { null },
+        setTemporaryPersona: (String?) -> Unit = {},
+        openTemporaryChat: suspend (String) -> String = { error("当前脚本环境不支持打开临时聊天") },
+        builtInThemes: suspend () -> List<app.tavern.nativeclient.ChatTheme> = { emptyList() },
+        builtInContexts: suspend () -> List<app.tavern.nativeclient.TextContextTemplate> = { emptyList() },
+        builtInInstructs: suspend () -> List<app.tavern.nativeclient.InstructTemplate> = { emptyList() },
+        updateReasoningCollapse: (ReasoningCollapseState) -> Unit = {},
     ): String? = when (name) {
         "bgm", "ambient" -> audioCommand?.invoke(name, text, named)
             ?: app.tavern.nativeclient.DynamicAudioEngine().handleSlashCommand(
@@ -72,6 +79,17 @@ internal object ScriptExtensions {
         "flushvar" -> "".also { clearVariables(false) }
         "flushglobalvar" -> "".also { clearVariables(true) }
         "re-replace" -> regexReplace(named, text)
+        "inject", "listinjects", "list-injects", "injects", "flushinject", "flushinjects", "flush-inject" ->
+            ScriptPromptInjections.execute(name, named, text, state, saveChat, ask, notice)
+        in ScriptTagPersonaCommands.commandNames ->
+            ScriptTagPersonaCommands.execute(name, named, text, state, saveChat, savePrefs, setTemporaryPersona, openTemporaryChat)
+        in ScriptQrCommands.commandNames ->
+            ScriptQrCommands.execute(name, named, text, state, savePrefs)
+        in ScriptConfigCommands.commandNames ->
+            ScriptConfigCommands.execute(
+                name, named, text, state, saveChat, savePrefs,
+                builtInThemes, builtInContexts, builtInInstructs, updateReasoningCollapse,
+            )
         else -> null
     }
 

@@ -596,7 +596,10 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
         SelectField("默认媒体显示", appearance.defaultMediaDisplay, MessageMediaDisplay.entries, { it.label }, !state.busy) {
             model.setChatAppearance(appearance.copy(defaultMediaDisplay = it))
         }
-        GroupToggle("减少聊天滚动动画", appearance.reducedMotion, !state.busy) {
+        GroupToggle("高对比度模式（无障碍）", appearance.highContrast, !state.busy) {
+            model.setChatAppearance(appearance.copy(highContrast = it))
+        }
+        GroupToggle("减少动态效果与滚动动画（无障碍）", appearance.reducedMotion, !state.busy) {
             model.setChatAppearance(appearance.copy(reducedMotion = it))
         }
         SelectField("应用内提示位置", appearance.noticePosition, NoticePosition.entries, { it.label }, !state.busy) {

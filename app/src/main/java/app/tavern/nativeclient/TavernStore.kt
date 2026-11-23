@@ -849,22 +849,37 @@ internal class TavernStore(context: Context) : SQLiteOpenHelper(context, "tavern
 
     fun save(book: WorldBook) = writableDatabase.transaction {
         val old = books().firstOrNull { it.id == book.id }
+        val stored = if (old != null && old.name != book.name) book.renamed(book.name) else book
         val values = ContentValues().apply {
-            put("id", book.id)
-            put("name", book.name)
-            put("enabled", if (book.enabled) 1 else 0)
-            put("payload", book.raw)
+            put("id", stored.id)
+            put("name", stored.name)
+            put("enabled", if (stored.enabled) 1 else 0)
+            put("payload", stored.raw)
         }
         if (old == null) insertOrThrow("world_books", null, values)
         else {
-            update("world_books", values, "id = ?", arrayOf(book.id))
-            if (old.name != book.name) {
-                cards().filter { it.worldName == old.name }.forEach { save(it.withWorld(book.name)) }
-                // A legacy chat may identify its world by name alone. Keep it attached across renames.
-                update("chats", ContentValues().apply {
-                    put("world_book_id", book.id)
-                    put("world_book_name", book.name)
-                }, "world_book_id = ? OR (world_book_id = '' AND world_book_name = ?)", arrayOf(book.id, old.name))
+            update("world_books", values, "id = ?", arrayOf(stored.id))
+            if (old.name != stored.name) {
+                cards().forEach { card ->
+                    var updated = card
+                    if (updated.worldName == old.name) updated = updated.withWorld(stored.name)
+                    if (old.name in updated.additionalWorldBookIds) {
+                        updated = updated.withAdditionalWorldBooks(
+                            updated.additionalWorldBookIds.map { if (it == old.name) stored.id else it },
+                        )
+                    }
+                    if (updated != card) save(updated)
+                }
+                groups().filter { it.worldBookName == old.name }.forEach { save(it.withWorld(stored.name)) }
+                val chatIds = rawQuery(
+                    "SELECT id FROM chats WHERE world_book_id = ? OR (world_book_id = '' AND world_book_name = ?)",
+                    arrayOf(stored.id, old.name),
+                ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getString(0)) } }
+                for (chatId in chatIds) {
+                    val chat = readChat("chats", chatId, this)
+                    val relinked = chat.relinkWorldBook(stored.id, old.name, stored.name)
+                    if (relinked != chat) writeChat(relinked)
+                }
             }
         }
     }

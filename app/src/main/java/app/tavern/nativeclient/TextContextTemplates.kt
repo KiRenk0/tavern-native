@@ -92,6 +92,7 @@ internal object StoryString {
         "firstincludedmessageid", "firstdisplayedmessageid", "charnotes", "charcreatornotes", "creatornotes",
         "chardepthprompt", "charprompt", "charinstruction", "charversion", "characterversion", "charactercardversion",
         "greeting", "charfirstmessage", "ismobile", "stat_data",
+        "maxcontexttokens", "maxresponsetokens", "defaultexpression", "lastexpression", "availableexpressions",
     ).joinToString("|")
     private val runtimeTags = Regex(
         """(?<![\\{])\{\{(?!\{)(?=\s*(?:[.$][\p{L}_]|//|[\w-]+::|(?:$simpleStoryMacros)\s*\}\}))""",

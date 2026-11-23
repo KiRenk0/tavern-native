@@ -43,6 +43,12 @@ internal class TavernScriptHost(
         { _, _ -> error("当前脚本环境不支持创建关联世界书") },
     private val chatAction: suspend (ScriptChatAction, Chat, String) -> Unit =
         { _, _, _ -> error("当前脚本环境不支持操作聊天档案") },
+    private val setTemporaryPersona: (String?) -> Unit = {},
+    private val openTemporaryChat: suspend (String) -> String = { error("当前脚本环境不支持打开临时聊天") },
+    private val builtInThemes: suspend () -> List<ChatTheme> = { emptyList() },
+    private val builtInContexts: suspend () -> List<TextContextTemplate> = { emptyList() },
+    private val builtInInstructs: suspend () -> List<InstructTemplate> = { emptyList() },
+    private val updateReasoningCollapse: (app.tavern.nativeclient.script.ReasoningCollapseState) -> Unit = {},
     private val notice: (String) -> Unit,
 ) : StScriptHost {
     private val state get() = snapshot()
@@ -73,14 +79,30 @@ internal class TavernScriptHost(
         val group = config.group?.let {
             GroupPrompt(it, emptyList(), it.members(config.cards).map(Card::name), it.participants(config.cards).map(Card::name))
         }
-        val macros = ConversationMacros(config.regexCard(), config.persona, chat?.messages.orEmpty(), group,
-            chat?.options ?: ConversationOptions(), config.prefs.scriptVariables, config.prefs.connectionFor(chat)?.model.orEmpty(),
-            chat?.id.orEmpty(), allowHidden = true)
+        val activeCard = config.regexCard()
+        val effective = config.prefs.effectiveConfig(chat)
+        val connection = effective.connection
+        val preset = config.presetFor(chat)
+        val contextLimit = connection?.contextTokens(presetLimit = preset.chatCompletionFor(connection)?.contextLimit)
+        val configuredOutput = (effective.sampling.maxTokens.takeIf(String::isNotBlank) ?: config.prefs.maxTokens).toIntOrNull()
+            ?: preset?.sampling?.get(PresetSampling.MAX_TOKENS)?.toIntOrNull()
+        val responseLimit = connection?.outputReserve(configuredOutput, contextLimit ?: DEFAULT_CONTEXT_TOKENS)
+            ?: configuredOutput
+        val lastExpr = activeCard?.id?.let { id -> config.manualExpressions[id]?.takeIf { it.chatId == chat?.id }?.label }
+        val macros = ConversationMacros(
+            activeCard, config.persona, chat?.messages.orEmpty(), group,
+            chat?.options ?: ConversationOptions(), config.prefs.scriptVariables, connection?.model.orEmpty(),
+            chat?.id.orEmpty(), allowHidden = true,
+            maxContextTokens = contextLimit,
+            maxResponseTokens = responseLimit,
+            lastExpression = lastExpr,
+        )
         return macros.read(name, args)
     }
 
     override fun quickReply(name: String): String? = state.prefs.quickReplies.find(name, state.chat)?.message
     override fun registerTool(tool: ModelTool) = addTool(tool)
+    override fun onAbort(message: String) = notice(message)
 
     override suspend fun command(name: String, named: Map<String, String>, text: String): String? = when (name) {
         "flat", "default", "bubble", "bubbles", "single", "story" -> {
@@ -158,12 +180,30 @@ internal class TavernScriptHost(
         "tools-unregister", "tool-unregister" -> tools("unregister", named, text)
         "setinput" -> text.also { input = it; draft(it) }
         "popup", "input", "buttons" -> {
-            val choices = named["labels"]?.let { labels ->
+            val buttonItems = named["labels"]?.let { labels ->
                 val raw = variable(labels, false) ?: variable(labels, true) ?: labels
-                JSONArray(raw).strings()
+                val array = JSONArray(raw)
+                (0 until array.length()).mapNotNull { idx ->
+                    when (val item = array.opt(idx)) {
+                        is String -> ScriptDialogButton(item)
+                        is org.json.JSONObject -> item.string("label").takeIf(String::isNotBlank)?.let {
+                            ScriptDialogButton(it, item.string("icon"), item.string("tooltip"))
+                        }
+                        else -> null
+                    }
+                }
             }.orEmpty()
-            ask(ScriptDialog(kind = name, title = named["title"] ?: if (name == "input") "脚本输入" else "脚本提示",
-                text = text, buttons = choices, initial = named["default"].orEmpty())).orEmpty()
+            ask(ScriptDialog(
+                kind = name,
+                title = named["title"] ?: if (name == "input") "脚本输入" else "脚本提示",
+                text = text,
+                buttons = buttonItems.map(ScriptDialogButton::label),
+                initial = named["default"].orEmpty(),
+                placeholder = named["placeholder"].orEmpty(),
+                tooltip = named["tooltip"].orEmpty(),
+                icon = named["icon"].orEmpty(),
+                buttonItems = buttonItems,
+            )).orEmpty()
         }
         "regex" -> {
             val rule = named["name"] ?: error("请用 name= 指定规则")
@@ -251,6 +291,13 @@ internal class TavernScriptHost(
                     updateWorldActivation = updateWorldActivation,
                     createBoundBook = createBoundBook,
                     notice = notice,
+                    ask = ask,
+                    setTemporaryPersona = setTemporaryPersona,
+                    openTemporaryChat = openTemporaryChat,
+                    builtInThemes = builtInThemes,
+                    builtInContexts = builtInContexts,
+                    builtInInstructs = builtInInstructs,
+                    updateReasoningCollapse = updateReasoningCollapse,
                 )
             }
         }
@@ -335,10 +382,15 @@ internal class TavernScriptHost(
     }
 
     companion object {
-        const val HELP = "/pass · /let · /var · /getvar · /setvar · /addvar · /listvar · /flushvar · /flushglobalvar · /if · /while · /times · /break · /run · " +
+        const val HELP = "/pass · /let · /var · /getvar · /setvar · /addvar · /listvar · /flushvar · /flushglobalvar · /if · /while · /times · /break · /abort · /breakpoint · /fuzzy · /run · " +
+            "/upper · /lower · /trim · /len · /split · /join · /add · /sub · /mul · /div · /mod · /pow · /min · /max · /round · /floor · /ceil · /abs · /rand · " +
             "/replace · /test · /match · /array-wrap · /array-unwrap · " +
+            "/inject · /listinjects · /flushinject · /reasoning-collapse · " +
+            "/persona · /persona-lock · /tempchat · /tag-add · /tag-remove · /tag-exists · /tag-list · " +
+            "/qr-create · /qr-update · /qr-delete · /qr-get · /qr-list · /qrset-create · /qrset-delete · /qrset-list · /qr-arg · " +
+            "/api · /context · /instruct · /tokenizer · /vn · /theme · " +
             "/getchatname · /renamechat · /closechat · /chat-reload · /chat-jump · " +
-            "/echo · /input · /buttons · /send · /sendas · /sys · /sysgen · /comment · /ask · /trigger · /gen · /genraw · /regex · /re-replace · /count · /trimtokens · /setinput · /speak · /translate · /summarize · /db · /sd · /caption · /show-gallery · /bg · /lockbg · /unlockbg · /preset · /char-get · " +
+            "/echo · /popup · /input · /buttons · /send · /sendas · /sys · /sysgen · /comment · /ask · /trigger · /gen · /genraw · /regex · /re-replace · /count · /trimtokens · /setinput · /speak · /translate · /summarize · /db · /sd · /caption · /show-gallery · /bg · /lockbg · /unlockbg · /preset · /char-get · " +
             "/world · /getglobalbooks · /getchatbook · /getcharbook · /getpersonabook · /findentry · /getentryfield · /setentryfield · /createentry · " +
             "/wi-get-book · /wi-list-entries · /wi-get-entry · /wi-set-entry · /wi-create-entry · /wi-delete-entry · " +
             "/tools-register · /tools-list · /tools-invoke · /tools-unregister · /messages · /message-role · /message-name · " +
@@ -346,7 +398,8 @@ internal class TavernScriptHost(
             "/member-get · /member-count · /member-add · /member-remove · /member-enable · /member-disable · /member-up · /member-down · /member-peek · " +
             "/char-find · /char-create · /char-update · /char-duplicate · /char-delete · /model · /profile · /reroll-pick · /? macros"
         const val MACRO_HELP = "{{char}} · {{user}} · {{persona}} · {{group}} · {{groupNotMuted}} · {{description}} · " +
-            "{{scenario}} · {{charFirstMessage::1}} · {{model}} · {{lastUserMessage}} · {{summary}} · {{getvar::name}} · " +
+            "{{scenario}} · {{charFirstMessage::1}} · {{model}} · {{maxContextTokens}} · {{maxResponseTokens}} · " +
+            "{{defaultExpression}} · {{lastExpression}} · {{availableExpressions}} · {{lastUserMessage}} · {{summary}} · {{getvar::name}} · " +
             "{{setvar::name::值}} · {{incvar::计数}} · {{.name ??= 值}} · {{getglobalvar::name}} · " +
             "{{get_message_variable::路径}} · {{stat_data}} · {{random::甲::乙}} · {{pick::甲::乙}} · {{roll::2d6+1}} · {{isodate}} · " +
             "{{newline}} · {{trim}} · {{outlet::名称}}。支持嵌套参数与 {{if .变量}}、{{else}}、{{/if}}。"

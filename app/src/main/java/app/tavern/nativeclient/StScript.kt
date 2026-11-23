@@ -9,6 +9,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.round
 import kotlin.random.Random
 
@@ -25,22 +27,45 @@ internal interface StScriptHost {
     fun quickReply(name: String): String?
     suspend fun command(name: String, named: Map<String, String>, text: String): String?
     fun registerTool(tool: ModelTool) { error("当前脚本环境不支持工具注册") }
+    fun onAbort(message: String) {}
 }
 
-internal class StScript(private val host: StScriptHost, private val random: Random = Random.Default,
-                        private val toolArgumentsAreData: Boolean = false) {
+internal class StScript(
+    private val host: StScriptHost,
+    private val random: Random = Random.Default,
+    private val toolArgumentsAreData: Boolean = false,
+    private val debugger: app.tavern.nativeclient.script.ScriptDebuggerHook? = null,
+) {
+    private class ScriptAbortException(val value: String, val quiet: Boolean) : Exception()
     private sealed interface Value {
         data class Text(val text: String, val literal: Boolean = false) : Value
         data class Closure(val body: String, val frame: Frame) : Value
     }
-    private class Frame(val parent: Frame? = null, val arguments: Map<String, String> = emptyMap()) {
+    private class Frame(val parent: Frame? = null, arguments: Map<String, String> = emptyMap()) {
         val values = mutableMapOf<String, Value>()
+        val arguments = arguments.toMutableMap()
         fun get(name: String): Value? = values[name] ?: parent?.get(name)
         fun set(name: String, value: Value) {
             if (name in values) values[name] = value
             else requireNotNull(parent) { "未声明脚本变量 $name" }.set(name, value)
         }
         fun argument(name: String): String = arguments[name] ?: parent?.argument(name).orEmpty()
+        fun setArgument(name: String, value: String) {
+            arguments[name] = value
+            values[name] = Value.Text(value)
+        }
+        fun snapshot(): Map<String, String> {
+            val result = linkedMapOf<String, String>()
+            parent?.snapshot()?.let(result::putAll)
+            arguments.forEach { (k, v) -> result[k] = v }
+            values.forEach { (k, v) ->
+                result[k] = when (v) {
+                    is Value.Text -> v.text
+                    is Value.Closure -> "{: ${v.body} :}"
+                }
+            }
+            return result
+        }
     }
     private data class Result(val value: Value, val broken: Boolean = false)
     private val empty = Value.Text("")
@@ -48,7 +73,12 @@ internal class StScript(private val host: StScriptHost, private val random: Rand
 
     suspend fun run(source: String, arguments: Map<String, String> = emptyMap()): String {
         steps = 0
-        return program(parseStScript(source), Frame(arguments = arguments), empty, 0).value.text()
+        return try {
+            program(parseStScript(source), Frame(arguments = arguments), empty, 0).value.text()
+        } catch (e: ScriptAbortException) {
+            if (!e.quiet && e.value.isNotBlank()) host.onAbort(e.value)
+            ""
+        }
     }
 
     suspend fun render(source: String): String = expand(source, Frame(), empty)
@@ -63,9 +93,24 @@ internal class StScript(private val host: StScriptHost, private val random: Rand
         parsed.commands.forEachIndexed { i, command ->
             tick()
             val implicit = if (i == 0) empty else pipe
+            if (debugger != null) {
+                val action = debugger.beforeCommand(
+                    line = command.line,
+                    commandText = "/${command.name}${command.source}",
+                    isBreakpoint = command.name == "breakpoint",
+                    pipe = pipe.text(),
+                    frameVariables = frame.snapshot(),
+                    stepCount = steps,
+                )
+                if (action == app.tavern.nativeclient.script.DebugAction.ABORT) {
+                    throw ScriptAbortException("", quiet = true)
+                }
+            }
             val result = try {
                 execute(command, frame, pipe, implicit, depth)
             } catch (e: CancellationException) {
+                throw e
+            } catch (e: ScriptAbortException) {
                 throw e
             } catch (e: Exception) {
                 throw IllegalArgumentException("第 ${command.line} 行 /${command.name} · ${e.localizedMessage}", e)
@@ -137,6 +182,42 @@ internal class StScript(private val host: StScriptHost, private val random: Rand
             }
             name in setOf("pass", "return") -> Result(body(fallback = implicit))
             name == "break" -> Result(body(fallback = pipe), broken = true)
+            name == "abort" -> {
+                val options = args()
+                val quiet = isTrue(options["quiet"])
+                throw ScriptAbortException(body(fallback = empty).text(), quiet)
+            }
+            name == "breakpoint" -> Result(pipe)
+            name == "qr-arg" -> {
+                val options = args()
+                val explicitKey = (options["name"] ?: options["key"])?.trim().orEmpty()
+                val key = explicitKey.ifEmpty { node.args.firstOrNull()?.let { value(it, frame, pipe).text().trim() }.orEmpty() }
+                require(key.isNotBlank()) { "请指定参数名称" }
+                val valueOffset = if (explicitKey.isNotEmpty()) 0 else 1
+                val hasValue = "value" in options || node.args.size > valueOffset
+                if (hasValue) {
+                    val assigned = options["value"] ?: body(valueOffset).text()
+                    frame.setArgument(key, assigned)
+                    text(assigned)
+                } else {
+                    text(frame.argument(key))
+                }
+            }
+            name == "fuzzy" -> {
+                val options = args()
+                val rawList = options["list"]?.takeIf(String::isNotBlank) ?: error("请用 list= 指定候选列表 JSON 数组或变量名")
+                val resolved = frame.get(rawList)?.text()
+                    ?: host.variable(rawList, false)
+                    ?: host.variable(rawList, true)
+                    ?: rawList
+                val candidates = runCatching { JSONArray(resolved).strings() }.getOrElse {
+                    resolved.split(',').map(String::trim).filter(String::isNotEmpty)
+                }
+                val threshold = options["threshold"]?.trim()?.toDoubleOrNull() ?: 0.4
+                val mode = options["mode"]?.trim().orEmpty().ifEmpty { "first" }
+                val query = body(fallback = implicit).text()
+                text(fuzzyMatchList(query, candidates, threshold, mode))
+            }
             name in setOf("let", "var") -> {
                 val options = args()
                 val key = options["key"] ?: node.args.firstOrNull()?.let { value(it, frame, pipe).text() }.orEmpty()
@@ -217,8 +298,9 @@ internal class StScript(private val host: StScriptHost, private val random: Rand
                 delay(wait)
                 text("")
             }
-            name in setOf("add", "sub", "mul", "div", "mod", "pow", "min", "max", "round", "abs") -> {
-                val items = if (node.args.isEmpty()) implicit.text().split(Regex("\\s+")) else node.args.map { value(it, frame, pipe).text() }
+            name in setOf("add", "sub", "mul", "div", "mod", "pow", "min", "max", "round", "abs", "floor", "ceil") -> {
+                val items = if (node.args.isEmpty()) implicit.text().trim().split(Regex("\\s+")).filter(String::isNotEmpty)
+                else node.args.map { value(it, frame, pipe).text() }
                 val numbers = items.map { operand(it).toDoubleOrNull() ?: error("不是数字 $it") }
                 require(numbers.isNotEmpty()) { "需要数值参数" }
                 val a = numbers.first()
@@ -226,16 +308,47 @@ internal class StScript(private val host: StScriptHost, private val random: Rand
                     "add" -> numbers.sum()
                     "sub" -> numbers.reduce(Double::minus)
                     "mul" -> numbers.reduce(Double::times)
-                    "div" -> numbers.reduce(Double::div)
-                    "mod" -> numbers.reduce(Double::rem)
+                    "div" -> numbers.reduce { acc, v -> require(v != 0.0) { "除数不能为 0" }; acc / v }
+                    "mod" -> numbers.reduce { acc, v -> require(v != 0.0) { "除数不能为 0" }; acc % v }
                     "pow" -> numbers.reduce(Math::pow)
                     "min" -> numbers.min()
                     "max" -> numbers.max()
                     "round" -> round(a)
+                    "floor" -> floor(a)
+                    "ceil" -> ceil(a)
                     else -> kotlin.math.abs(a)
                 }
                 text(formatVariableNumber(result))
             }
+            name == "rand" -> {
+                val options = args()
+                val positional = node.args.map { value(it, frame, pipe).text() }
+                val hasBounds = "from" in options || "to" in options || positional.isNotEmpty()
+                val minVal = when {
+                    "from" in options -> operand(options.getValue("from")).toDoubleOrNull() ?: error("无效的 from 数值")
+                    positional.size >= 2 -> operand(positional[0]).toDoubleOrNull() ?: error("不是数字 ${positional[0]}")
+                    else -> 0.0
+                }
+                val maxVal = when {
+                    "to" in options -> operand(options.getValue("to")).toDoubleOrNull() ?: error("无效的 to 数值")
+                    positional.size >= 2 -> operand(positional[1]).toDoubleOrNull() ?: error("不是数字 ${positional[1]}")
+                    positional.size == 1 -> operand(positional[0]).toDoubleOrNull() ?: error("不是数字 ${positional[0]}")
+                    else -> 1.0
+                }
+                val low = minOf(minVal, maxVal)
+                val high = maxOf(minVal, maxVal)
+                val raw = if (!hasBounds) random.nextDouble() else low + random.nextDouble() * (high - low)
+                val rounded = when (options["round"]?.trim()?.lowercase().orEmpty()) {
+                    "round" -> round(raw)
+                    "floor" -> floor(raw)
+                    "ceil" -> ceil(raw)
+                    "" -> raw
+                    else -> error("round 应为 round、floor 或 ceil")
+                }
+                text(formatVariableNumber(rounded))
+            }
+            name in setOf("upper", "uppercase") -> text(body(fallback = implicit).text().uppercase())
+            name in setOf("lower", "lowercase") -> text(body(fallback = implicit).text().lowercase())
             name == "trim" -> text(body(fallback = implicit).text().trim())
             name == "len" -> {
                 val raw = body(fallback = implicit).text()
@@ -243,10 +356,20 @@ internal class StScript(private val host: StScriptHost, private val random: Rand
                     ?: runCatching { JSONObject(raw).length() }.getOrNull() ?: raw.length
                 text(length.toString())
             }
-            name == "split" -> text(JSONArray(body(fallback = implicit).text().split(args()["separator"] ?: ",")).toString())
+            name == "split" -> {
+                val options = args()
+                val sep = options["separator"] ?: options["find"] ?: ","
+                val trimParts = isTrue(options["trim"])
+                val parts = body(fallback = implicit).text().split(sep).let { list ->
+                    if (trimParts) list.map(String::trim) else list
+                }
+                text(JSONArray(parts).toString())
+            }
             name == "join" -> {
+                val options = args()
+                val sep = options["separator"] ?: options["glue"] ?: ","
                 val array = JSONArray(body(fallback = implicit).text())
-                text((0 until array.length()).joinToString(args()["separator"] ?: ",") { array.optString(it) })
+                text((0 until array.length()).joinToString(sep) { array.optString(it) })
             }
             name in scriptTextCommands -> {
                 val input = body(fallback = implicit)

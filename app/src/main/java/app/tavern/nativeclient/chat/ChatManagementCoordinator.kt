@@ -207,6 +207,17 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
     }
 
     fun openTemporaryChat(uri: Uri? = null, title: String = "临时聊天") = host.work {
+        openTemporaryChatNow(uri, title)
+    }
+
+    internal suspend fun openScriptTemporaryChat(title: String = "临时聊天"): String {
+        require(host.current.generation == null) { "请等待当前回复结束再切换聊天" }
+        val clean = title.trim().ifBlank { "临时聊天" }
+        openTemporaryChatNow(null, clean)
+        return clean
+    }
+
+    private suspend fun openTemporaryChatNow(uri: Uri?, title: String) {
         host.generation.stopAuto()
         val media = withContext(Dispatchers.IO) { TemporaryChatMedia(host.app.cacheDir) }
         val chat = try {

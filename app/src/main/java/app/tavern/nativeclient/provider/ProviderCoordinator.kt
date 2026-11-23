@@ -130,6 +130,10 @@ internal class ProviderCoordinator(private val host: CoordinatorHost) {
 
     suspend fun builtInChatThemes(): List<ChatTheme> = withContext(Dispatchers.IO) { shippedThemes }
 
+    suspend fun builtInContexts(): List<TextContextTemplate> = withContext(Dispatchers.IO) { templateCatalog.contexts }
+
+    suspend fun builtInInstructs(): List<InstructTemplate> = withContext(Dispatchers.IO) { templateCatalog.instructs }
+
     fun saveChatTheme(name: String?, existingId: String? = null) = host.work {
         val prefs = host.current.prefs
         val library = prefs.chatThemes

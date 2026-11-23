@@ -15,6 +15,10 @@ internal class ConversationMacros(
     private val firstIncluded: Int? = null,
     private val allowHidden: Boolean = false,
     val variables: MacroVariables = MacroVariables(options.variables, globals),
+    private val maxContextTokens: Int? = null,
+    private val maxResponseTokens: Int? = null,
+    private val lastExpression: String? = null,
+    private val availableExpressions: List<String>? = null,
 ) {
     private val now = ZonedDateTime.now()
     private val mvuState by lazy {
@@ -85,6 +89,22 @@ internal class ConversationMacros(
                 else app.tavern.nativeclient.script.MvuEngine.readPath(mvuState.statData, key).orEmpty()
             "stat_data" -> mvuState.statData.toString()
             "model" -> model
+            "maxcontexttokens" -> (maxContextTokens ?: DEFAULT_CONTEXT_TOKENS).toString()
+            "maxresponsetokens" -> (maxResponseTokens ?: 512).toString()
+            "defaultexpression" -> options.expressions.fallback.let {
+                if (it == EXPRESSION_EMOJI) "neutral" else it.ifBlank { "neutral" }
+            }
+            "lastexpression" -> lastExpression?.takeIf(String::isNotBlank).orEmpty()
+            "availableexpressions" -> {
+                val labels = availableExpressions ?: member?.expressionSprites.orEmpty()
+                    .map(ExpressionSprite::label)
+                    .distinct()
+                    .ifEmpty {
+                        if (options.expressions.fallback == EXPRESSION_EMOJI) expressionEmoji.keys.toList()
+                        else emptyList()
+                    }
+                labels.joinToString(", ")
+            }
             "lastgenerationtype" -> trigger
             "ismobile" -> "true"
             "original", "input" -> ""

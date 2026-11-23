@@ -396,9 +396,10 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                         val started = System.currentTimeMillis()
                         val startedNano = System.nanoTime()
                         var firstText: Long? = null
+                        val promptOptions = host.script.resolvePromptInjections(ongoing.options)
                         val result = ModelService.reply(
                             activePrefs, connection, card, promptHistory, books, scene,
-                            persona, ongoing.options, passAction.trigger, preset,
+                            persona, promptOptions, passAction.trigger, preset,
                             forcedContinuation = replacement,
                             onPrompt = { messages ->
                                 host.mutable.update { it.copy(lastPrompt = PromptCapture(chat.id, connection.model, messages,
@@ -583,9 +584,11 @@ internal class ChatGenerationCoordinator(private val host: CoordinatorHost) {
                             removed.any { it === message }
                         }
                         val savedReply = reply.copy(characterId = card.id, loreEffects = effects)
+                        val cleanedOptions = app.tavern.nativeclient.script.ScriptPromptInjections.withoutEphemeral(latest.options)
                         ongoing = latest.copy(
                             messages = retained + savedReply,
                             updated = System.currentTimeMillis(),
+                            options = cleanedOptions,
                         )
                         withContext(NonCancellable) {
                             host.persist(ongoing, replyGallery = renderedImages.map { GalleryImage(it, content.take(1500)) })

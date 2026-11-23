@@ -530,6 +530,8 @@ internal fun ChatBubble(
     mvuStateJson: String = "{}",
     onRunScript: ((String) -> Unit)? = null,
     autoExpandReasoning: Boolean = false,
+    reasoningExpandedOverride: Boolean? = null,
+    reasoningRevision: Long = 0L,
     loopOpenings: Boolean = false,
     onAction: (MessageAction) -> Unit = {},
 ) {
@@ -563,7 +565,12 @@ internal fun ChatBubble(
         if (repairMarkdown && message.role == "assistant") regexText?.let { repairReplyMarkdown(it, forDisplay = true) } else regexText
     }
     val reasoning = regexDisplay(message.reasoning.orEmpty(), RegexSite.REASONING, regex, depth)
-    var openReasoning by rememberSaveable(autoExpandReasoning) { mutableStateOf(autoExpandReasoning) }
+    var openReasoning by rememberSaveable(autoExpandReasoning) { mutableStateOf(reasoningExpandedOverride ?: autoExpandReasoning) }
+    LaunchedEffect(reasoningRevision, reasoningExpandedOverride) {
+        if (reasoningRevision > 0L && reasoningExpandedOverride != null) {
+            openReasoning = reasoningExpandedOverride
+        }
+    }
     var openTools by rememberSaveable { mutableStateOf(false) }
     val loop = loopOpenings && message.variants.size > 1
     val canPrevious = enabled && (message.index > 0 || loop)
@@ -610,6 +617,7 @@ internal fun ChatBubble(
             contentColor = foreground,
             border = when {
                 highlighted -> BorderStroke(2.dp, scheme.primary)
+                appearance.highContrast -> BorderStroke(1.5.dp, scheme.outline)
                 border != null && !flatMode -> BorderStroke(1.dp, border)
                 documentMode -> BorderStroke(1.dp, scheme.outlineVariant.copy(alpha = 0.6f))
                 else -> null

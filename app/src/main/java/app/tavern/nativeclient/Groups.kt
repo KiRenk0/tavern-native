@@ -30,7 +30,9 @@ internal data class TavernGroup(
     val hideMutedSprites: Boolean = false,
     val favorite: Boolean = false,
     val avatar: GroupAvatar? = null,
+    val worldBookName: String = "",
 ) {
+    fun withWorld(name: String): TavernGroup = copy(worldBookName = name)
     fun members(cards: List<Card>): List<Card> {
         val byId = cards.associateBy(Card::id)
         return memberIds.distinct().mapNotNull(byId::get)
@@ -111,7 +113,9 @@ internal data class TavernGroup(
         "activation_strategy" to order.ordinal, "generation_mode" to promptMode.ordinal, "allow_self_responses" to allowSelf,
         "generation_mode_join_prefix" to prefix, "generation_mode_join_suffix" to suffix,
         "auto_mode_delay" to autoDelaySeconds, "hideMutedSprites" to hideMutedSprites, "fav" to favorite,
-        "avatar_url" to avatar?.dataUrl.orEmpty())
+        "avatar_url" to avatar?.dataUrl.orEmpty()).apply {
+        if (worldBookName.isNotBlank()) put("world", worldBookName)
+    }
 
     companion object {
         fun from(id: String, raw: String): TavernGroup {
@@ -122,7 +126,8 @@ internal data class TavernGroup(
                 GroupPromptMode.entries.getOrElse(value.optInt("generation_mode")) { GroupPromptMode.SWAP },
                 value.optBoolean("allow_self_responses"), value.string("generation_mode_join_prefix"),
                 value.string("generation_mode_join_suffix"), value.optInt("auto_mode_delay", 5).coerceIn(1, 999),
-                value.optBoolean("hideMutedSprites"), value.optBoolean("fav"), GroupAvatar.fromDataUrl(value.string("avatar_url")))
+                value.optBoolean("hideMutedSprites"), value.optBoolean("fav"), GroupAvatar.fromDataUrl(value.string("avatar_url")),
+                value.string("world"))
         }
     }
 }

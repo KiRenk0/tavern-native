@@ -93,3 +93,92 @@ private fun WorldBook.withDisplayOrder(ordered: List<LoreEntry>, stored: List<Lo
     val indexes = ordered.mapIndexed { index, entry -> entry.id to index }.toMap()
     return withEntries(stored.map { it.copy(displayIndex = indexes.getValue(it.id)) })
 }
+
+internal data class WorldBookRelinkResult(
+    val book: WorldBook,
+    val cards: List<Card>,
+    val groups: List<TavernGroup>,
+    val personas: List<PersonaProfile>,
+    val chats: List<Chat>,
+    val relinkedCards: Int,
+    val relinkedGroups: Int,
+    val relinkedPersonas: Int,
+    val relinkedChats: Int,
+) {
+    val totalRelinked get() = relinkedCards + relinkedGroups + relinkedPersonas + relinkedChats
+}
+
+internal fun Chat.relinkWorldBook(bookId: String, oldName: String, newName: String): Chat {
+    val matchesById = options.worldBookId == bookId
+    val matchesByName = options.worldBookId.isBlank() && options.worldBookName == oldName
+    if (!matchesById && !matchesByName) return this
+    val updatedOptions = options.copy(worldBookId = bookId, worldBookName = newName)
+    val updatedHeader = header?.let { raw ->
+        runCatching {
+            val json = JSONObject(raw)
+            val meta = json.optJSONObject("chat_metadata")
+            if (meta != null && (meta.string("tavern_native_world_book") == bookId || meta.string("world_info") == oldName)) {
+                meta.put("tavern_native_world_book", bookId)
+                meta.put("world_info", newName)
+                json.toString()
+            } else raw
+        }.getOrDefault(raw)
+    }
+    return copy(options = updatedOptions, header = updatedHeader)
+}
+
+internal fun relinkWorldBookRename(
+    book: WorldBook,
+    oldName: String,
+    newName: String,
+    cards: List<Card>,
+    groups: List<TavernGroup>,
+    personas: List<PersonaProfile>,
+    chats: List<Chat>,
+): WorldBookRelinkResult {
+    val renamedBook = book.renamed(newName)
+    if (oldName == renamedBook.name) {
+        return WorldBookRelinkResult(renamedBook, cards, groups, personas, chats, 0, 0, 0, 0)
+    }
+    var cardCount = 0
+    val updatedCards = cards.map { card ->
+        var next = card
+        if (next.worldName == oldName) next = next.withWorld(renamedBook.name)
+        if (oldName in next.additionalWorldBookIds) {
+            next = next.withAdditionalWorldBooks(next.additionalWorldBookIds.map { if (it == oldName) book.id else it })
+        }
+        if (next != card) cardCount++
+        next
+    }
+    var groupCount = 0
+    val updatedGroups = groups.map { group ->
+        if (group.worldBookName == oldName) {
+            groupCount++
+            group.withWorld(renamedBook.name)
+        } else group
+    }
+    var personaCount = 0
+    val updatedPersonas = personas.map { persona ->
+        if (persona.worldId == oldName) {
+            personaCount++
+            persona.copy(worldId = book.id)
+        } else persona
+    }
+    var chatCount = 0
+    val updatedChats = chats.map { chat ->
+        val next = chat.relinkWorldBook(book.id, oldName, renamedBook.name)
+        if (next != chat) chatCount++
+        next
+    }
+    return WorldBookRelinkResult(
+        book = renamedBook,
+        cards = updatedCards,
+        groups = updatedGroups,
+        personas = updatedPersonas,
+        chats = updatedChats,
+        relinkedCards = cardCount,
+        relinkedGroups = groupCount,
+        relinkedPersonas = personaCount,
+        relinkedChats = chatCount,
+    )
+}

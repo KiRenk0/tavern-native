@@ -46,6 +46,7 @@ internal data class ChatAppearance(
     val compactInput: Boolean = false,
     val defaultMediaDisplay: MessageMediaDisplay = MessageMediaDisplay.LIST,
     val reducedMotion: Boolean = false,
+    val highContrast: Boolean = false,
     val noticePosition: NoticePosition = NoticePosition.BOTTOM_CENTER,
     val palette: ThemePalette = ThemePalette(),
     val showModelIcon: Boolean = false,
@@ -77,6 +78,7 @@ internal data class ChatAppearance(
         "compactInput" to compactInput,
         "defaultMediaDisplay" to defaultMediaDisplay.wire,
         "reducedMotion" to reducedMotion,
+        "highContrast" to highContrast,
         "noticePosition" to noticePosition.wire,
         "palette" to palette.json(),
         "showModelIcon" to showModelIcon,
@@ -95,6 +97,7 @@ internal data class ChatAppearance(
             .put("compact_input_area", compactInput)
             .put("media_display", defaultMediaDisplay.wire)
             .put("reduced_motion", reducedMotion)
+            .put("high_contrast", highContrast)
             .put("toastr_position", noticePosition.wire)
             .put("timestamps_enabled", showMessageTime)
             .put("timer_enabled", showGenerationTimer)
@@ -123,6 +126,7 @@ internal data class ChatAppearance(
                 compactInput = value.optBoolean("compact_input_area", fallback.compactInput),
                 defaultMediaDisplay = MessageMediaDisplay.from(value.string("media_display")) ?: fallback.defaultMediaDisplay,
                 reducedMotion = value.optBoolean("reduced_motion", fallback.reducedMotion),
+                highContrast = value.optBoolean("high_contrast", fallback.highContrast),
                 noticePosition = NoticePosition.from(value.string("toastr_position")) ?: fallback.noticePosition,
                 showMessageTime = value.optBoolean("timestamps_enabled", fallback.showMessageTime),
                 showGenerationTimer = value.optBoolean("timer_enabled", fallback.showGenerationTimer),
@@ -157,6 +161,7 @@ internal data class ChatAppearance(
                 compactInput = json.optBoolean("compactInput"),
                 defaultMediaDisplay = MessageMediaDisplay.from(json.string("defaultMediaDisplay")) ?: MessageMediaDisplay.LIST,
                 reducedMotion = json.optBoolean("reducedMotion"),
+                highContrast = json.optBoolean("highContrast"),
                 noticePosition = NoticePosition.from(json.string("noticePosition")) ?: NoticePosition.BOTTOM_CENTER,
                 palette = ThemePalette.from(json.optJSONObject("palette")),
                 showModelIcon = json.optBoolean("showModelIcon"),

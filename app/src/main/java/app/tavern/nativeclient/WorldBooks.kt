@@ -133,6 +133,12 @@ internal data class WorldBook(
     fun withSharedMemory(enabled: Boolean): WorldBook = copy(raw = root()
         .put("tavern_native_shared_memory", enabled).toString())
 
+    fun renamed(newName: String): WorldBook {
+        val clean = newName.trim()
+        require(clean.isNotBlank()) { "请输入世界书名称" }
+        return copy(name = clean, raw = root().put("name", clean).toString())
+    }
+
     fun memoryOverridesFor(cardId: String): WorldMemoryOverrides {
         val all = root().optJSONObject("tavern_native_memory_overrides") ?: return WorldMemoryOverrides()
         return WorldMemoryOverrides.fromJson(all.optJSONObject(cardId))

@@ -120,7 +120,12 @@ class MainActivity : ComponentActivity() {
                 "light" -> false
                 else -> systemDark
             }
-            TavernTheme(dark, state.prefs.dynamicColor, state.prefs.chatAppearance.palette) {
+            TavernTheme(
+                dark = dark,
+                dynamic = state.prefs.dynamicColor,
+                palette = state.prefs.chatAppearance.palette,
+                highContrast = state.prefs.chatAppearance.highContrast,
+            ) {
                 val lightBars = MaterialTheme.colorScheme.surface.luminance() >= 0.30f
                 SideEffect {
                     androidx.core.view.WindowCompat.getInsetsController(window, window.decorView).apply {
@@ -128,7 +133,11 @@ class MainActivity : ComponentActivity() {
                         isAppearanceLightNavigationBars = lightBars
                     }
                 }
-                CompositionLocalProvider(LocalSelectInputOnFocus provides state.prefs.chatHandling.selectInputOnFocus) {
+                CompositionLocalProvider(
+                    LocalSelectInputOnFocus provides state.prefs.chatHandling.selectInputOnFocus,
+                    LocalReducedMotion provides state.prefs.chatAppearance.reducedMotion,
+                    LocalHighContrast provides state.prefs.chatAppearance.highContrast,
+                ) {
                     TavernApp(model, state)
                 }
             }
@@ -165,17 +174,24 @@ private val darkPalette = darkColorScheme(
 )
 
 @Composable
-private fun TavernTheme(dark: Boolean, dynamic: Boolean, palette: ThemePalette, content: @Composable () -> Unit) {
+private fun TavernTheme(
+    dark: Boolean,
+    dynamic: Boolean,
+    palette: ThemePalette,
+    highContrast: Boolean = false,
+    content: @Composable () -> Unit,
+) {
     val context = LocalContext.current
     val defaultSurface = if (dark) darkPalette.surface else light.surface
-    val materialDark = palette.color(ThemeColor.PANEL)?.compositeOver(defaultSurface)?.let { it.luminance() < 0.30f } ?: dark
+    val materialDark = if (highContrast) dark
+    else palette.color(ThemeColor.PANEL)?.compositeOver(defaultSurface)?.let { it.luminance() < 0.30f } ?: dark
     val scheme = when {
-        dynamic && Build.VERSION.SDK_INT >= 31 ->
+        !highContrast && dynamic && Build.VERSION.SDK_INT >= 31 ->
             if (materialDark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         materialDark -> darkPalette
         else -> light
     }
-    MaterialTheme(colorScheme = scheme.withThemePalette(palette), content = content)
+    MaterialTheme(colorScheme = scheme.withThemePalette(palette, highContrast = highContrast, dark = materialDark), content = content)
 }
 
 @Composable
@@ -227,6 +243,9 @@ private fun TavernApp(model: TavernViewModel, state: TavernState) {
             else -> ScriptQuestion(dialog, respond)
         }
     } }
+    state.scriptDebug?.let { debugSnapshot ->
+        QuickReplyDebuggerDialog(debugSnapshot, model::stepScriptDebug)
+    }
     state.imageGallery?.let { gallery ->
         ImageGalleryDialog(gallery, model, !busy, model::closeImageGallery,
             setBackground = chat?.let { opened -> { image -> model.setDrawingBackground(opened.id, image) } })

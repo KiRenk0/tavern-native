@@ -810,7 +810,8 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
 
     fun backgroundFile(image: ChatImage) = host.imageStore.file(image).takeIf { it.isFile } ?: host.savedImages.file(image)
 
-    fun importBackgrounds(uris: List<Uri>) = host.utilityWork("正在导入背景图片…") {
+    fun importBackgrounds(uris: List<Uri>, folder: String = "") = host.utilityWork("正在导入背景图片…") {
+        val targetFolder = normalizeBackgroundFolder(folder)
         val (added, failures) = withContext(Dispatchers.IO) {
             val context = currentCoroutineContext()
             var failures = 0
@@ -821,7 +822,7 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
                     val image = requireNotNull(host.resolver.openInputStream(uri)) { "无法打开背景图片" }.use {
                         host.savedImages.import(it.readLimited(MAX_IMAGE_SOURCE), name)
                     }
-                    BackgroundEntry(image)
+                    BackgroundEntry(image, folder = targetFolder)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
@@ -862,6 +863,14 @@ internal class MediaCoordinator(private val host: CoordinatorHost) {
     fun removeLibraryBackground(id: String) = changeBackgroundLibrary { remove(id) }
 
     fun setBackgroundFit(fit: BackgroundFit) = changeBackgroundLibrary { copy(fit = fit) }
+
+    fun createBackgroundFolder(path: String) = changeBackgroundLibrary { createFolder(path) }
+
+    fun moveLibraryBackground(id: String, folder: String) = changeBackgroundLibrary { moveItem(id, folder) }
+
+    fun renameBackgroundFolder(oldPath: String, newName: String) = changeBackgroundLibrary { renameFolder(oldPath, newName) }
+
+    fun deleteBackgroundFolder(path: String) = changeBackgroundLibrary { deleteFolder(path) }
 
     private fun changeBackgroundLibrary(update: BackgroundLibrary.() -> BackgroundLibrary) = host.work {
         val prefs = host.current.prefs

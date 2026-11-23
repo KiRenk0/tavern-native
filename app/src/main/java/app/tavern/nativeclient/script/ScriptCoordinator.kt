@@ -20,6 +20,7 @@ import org.json.JSONObject
 internal class ScriptCoordinator(private val host: CoordinatorHost) {
     private var scriptJob: Job? = null
     private var scriptAnswer: CompletableDeferred<String?>? = null
+    private var activeDebugger: QuickReplyDebuggerSession? = null
     private val pendingTriggers = mutableSetOf<Job>()
     private val customTools = linkedMapOf<String, ModelTool>()
     internal var nativeDrawingToolRemoved = false
@@ -28,10 +29,19 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
     private var quickReplyDepth = 0
 
     fun cancelScript() {
+        activeDebugger?.cancel()
+        activeDebugger = null
         scriptJob?.cancel()
         pendingTriggers.toList().forEach { it.cancel() }
         pendingTriggers.clear()
     }
+
+    fun stepDebugAction(action: DebugAction) {
+        activeDebugger?.resume(action)
+    }
+
+    internal suspend fun resolvePromptInjections(options: ConversationOptions): ConversationOptions =
+        ScriptPromptInjections.resolveForPrompt(options) { scriptHost("") }
 
     internal fun resetNativeDrawingTool() {
         nativeDrawingToolRemoved = false
@@ -146,6 +156,12 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
             updateWorldActivation = ::updateWorldActivation,
             createBoundBook = ::createBoundBook,
             chatAction = host.chats::scriptChatAction,
+            setTemporaryPersona = { id -> host.mutable.update { it.copy(temporaryPersonaId = id) } },
+            openTemporaryChat = host.chats::openScriptTemporaryChat,
+            builtInThemes = host.provider::builtInChatThemes,
+            builtInContexts = host.provider::builtInContexts,
+            builtInInstructs = host.provider::builtInInstructs,
+            updateReasoningCollapse = { collapse -> host.mutable.update { it.copy(reasoningCollapse = collapse) } },
         ) { host.notice(it) }
 
     private suspend fun updateWorldActivation(changes: List<WorldBook>) = withContext(NonCancellable) {
@@ -410,10 +426,35 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
             it.id == AVATAR_COMFY_WORKFLOW && short.equals("Char_Avatar_Comfy_Workflow", true)
     }) { "找不到 ComfyUI 工作流 $name" }
 
-    fun runScript(source: String, input: String = ""): Boolean = launchScript { StScript(scriptHost(input)).run(source) }
+    private fun createDebugger(label: String, source: String, stepMode: Boolean): QuickReplyDebuggerSession =
+        QuickReplyDebuggerSession(
+            label = label,
+            source = source,
+            initialStepMode = stepMode,
+            readChatVariables = { host.current.chat?.options?.variables.orEmpty() },
+            readGlobalVariables = { host.current.prefs.scriptVariables },
+            onStateChanged = { snapshot -> host.mutable.update { it.copy(scriptDebug = snapshot) } },
+        ).also { activeDebugger = it }
+
+    fun runScript(source: String, input: String = ""): Boolean = launchScript {
+        val debugger = if (source.contains("/breakpoint", ignoreCase = true)) {
+            createDebugger("STscript 调试", source, stepMode = false)
+        } else null
+        try {
+            StScript(scriptHost(input), debugger = debugger).run(source)
+        } finally {
+            if (activeDebugger === debugger) {
+                activeDebugger = null
+                host.mutable.update { it.copy(scriptDebug = null) }
+            }
+        }
+    }
 
     fun runQuickReply(set: QuickReplySet, item: QuickReply, input: String): Boolean =
-        launchScript { playQuickReply(set, item, input, automatic = false) }
+        launchScript { playQuickReply(set, item, input, automatic = false, stepDebug = false) }
+
+    fun debugQuickReply(set: QuickReplySet, item: QuickReply, input: String = ""): Boolean =
+        launchScript { playQuickReply(set, item, input, automatic = false, stepDebug = true) }
 
     private fun launchScript(block: suspend () -> Unit): Boolean {
         if (host.current.busy || host.current.generation != null || host.current.scriptRunning) return false
@@ -443,8 +484,12 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
         } catch (e: Exception) {
             host.notice(e.localizedMessage ?: "脚本执行失败")
         } finally {
-            if (scriptJob === job) scriptJob = null
-            host.mutable.update { it.copy(scriptRunning = false, scriptDialog = null) }
+            if (scriptJob === job) {
+                scriptJob = null
+                activeDebugger?.cancel()
+                activeDebugger = null
+            }
+            host.mutable.update { it.copy(scriptRunning = false, scriptDialog = null, scriptDebug = null) }
         }
     }
 
@@ -480,10 +525,19 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
         if (host.current.scriptRunning) play() else trackScript { play() }
     }
 
-    private suspend fun playQuickReply(set: QuickReplySet, item: QuickReply, input: String, automatic: Boolean) {
+    private suspend fun playQuickReply(
+        set: QuickReplySet,
+        item: QuickReply,
+        input: String,
+        automatic: Boolean,
+        stepDebug: Boolean = false,
+    ) {
         val source = if (automatic) item.message else set.textFor(item, input)
         val scriptHost = scriptHost(input)
-        val engine = StScript(scriptHost)
+        val debugger = if (!automatic && (stepDebug || source.contains("/breakpoint", ignoreCase = true))) {
+            createDebugger(item.label.ifBlank { set.name.ifBlank { "快捷回复调试" } }, source, stepMode = stepDebug)
+        } else null
+        val engine = StScript(scriptHost, debugger = debugger)
         if (source.isBlank()) return
         val previous = preventNestedQuickReplies
         preventNestedQuickReplies = previous || item.preventAutoExecute
@@ -505,6 +559,10 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
             }
         } finally {
             preventNestedQuickReplies = previous
+            if (activeDebugger === debugger) {
+                activeDebugger = null
+                host.mutable.update { it.copy(scriptDebug = null) }
+            }
         }
     }
 
@@ -751,8 +809,9 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
         val vectors = host.world.promptVectors(prefs, chat, character, config.persona, config.books, recallHistory)
         val sharedMemory = host.world.promptSharedWorldMemory(chat, character, recallHistory, config.books, config.groups, config.cards)
         val loreCounter = withContext(Dispatchers.Default) { host.chatTokenizers.counterFor(connection) }
+        val promptOptions = resolvePromptInjections(chat.options)
         val result = ModelService.reply(
-            prefs, connection, character, history, config.books, group, config.persona, chat.options,
+            prefs, connection, character, history, config.books, group, config.persona, promptOptions,
             "quiet", preset, onPrompt = ::capture,
             readImage = host.imageStore::bytes, readDocument = host.documentStore::text, vectors = vectors,
             onRetry = { output.clear() }, sharedMemory = sharedMemory, loreCounter = loreCounter,
@@ -765,6 +824,12 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
             effectiveSampling = effective.sampling.copy(maxTokens = settings.length?.toString() ?: effective.sampling.maxTokens),
             quietPrompt = quiet,
         ) { output.append(it) }
+        val flushed = ScriptPromptInjections.withoutEphemeral(chat.options)
+        if (flushed != chat.options) {
+            host.current.chat?.takeIf { it.id == chat.id }?.let { active ->
+                host.persist(active.copy(options = ScriptPromptInjections.withoutEphemeral(active.options)))
+            }
+        }
         result.incomplete?.let(host::notice)
         return output.toString().trim().let { if (settings.trim) trimToCompleteSentence(it) else it }
     }

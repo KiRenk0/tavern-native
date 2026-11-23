@@ -133,6 +133,7 @@ internal data class ConversationOptions(
     val expressions: ExpressionSettings = ExpressionSettings(),
     val pickRerollSeed: String = "",
     val connectionProfileId: String? = null,
+    val scriptInjections: List<app.tavern.nativeclient.script.ScriptPromptInjection> = emptyList(),
 ) {
     val hasWorldBookOverride get() = worldBookId.isNotBlank() || worldBookName.isNotBlank()
 
@@ -173,6 +174,8 @@ internal data class ConversationOptions(
         if (expressions == ExpressionSettings()) metadata.remove(EXPRESSION_EXTENSION) else metadata.put(EXPRESSION_EXTENSION, expressions.json())
         if (connectionProfileId == null) metadata.remove("tavern_native_connection_profile")
         else metadata.put("tavern_native_connection_profile", connectionProfileId)
+        if (scriptInjections.isEmpty()) metadata.remove("tavern_native_script_injections")
+        else metadata.put("tavern_native_script_injections", app.tavern.nativeclient.script.ScriptPromptInjection.toArray(scriptInjections))
     }
 
     fun json() = JSONObject().also(::applyTo).put("variables", JSONObject(variables))
@@ -198,6 +201,7 @@ internal data class ConversationOptions(
             ExpressionSettings.from(value?.optJSONObject(EXPRESSION_EXTENSION)),
             value?.string("pick_reroll_seed").orEmpty(),
             value?.takeUnless { it.isNull("tavern_native_connection_profile") }?.string("tavern_native_connection_profile"),
+            app.tavern.nativeclient.script.ScriptPromptInjection.fromArray(value?.optJSONArray("tavern_native_script_injections")),
         )
     }
 }

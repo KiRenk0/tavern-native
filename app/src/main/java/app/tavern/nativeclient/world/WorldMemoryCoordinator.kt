@@ -21,23 +21,43 @@ internal class WorldMemoryCoordinator(private val host: CoordinatorHost) {
         val value = book.copy(name = book.name.trim())
         require(value.name.isNotBlank()) { "请输入世界书名称" }
         require(host.current.books.none { it.id != value.id && it.name.equals(value.name, true) }) { "世界书名称已存在" }
+        val previous = host.current.books.firstOrNull { it.id == value.id }
+        val renamedFrom = previous?.name?.takeIf { it != value.name }
         val linkedChat = host.current.chat?.takeIf { chat ->
             !chat.isTemporary && chat.options.hasWorldBookOverride &&
                 chat.options.worldBook(host.current.books)?.let { it.id == value.id && it.name != value.name } == true
         }
-        val (books, cards, chat) = withContext(Dispatchers.IO) {
+        val (books, cards, groups, chat) = withContext(Dispatchers.IO) {
             host.store.save(value)
-            Triple(host.store.books(), host.store.cards(), linkedChat?.let { host.store.chat(it.id) })
+            Quad(host.store.books(), host.store.cards(), host.store.groups(), linkedChat?.let { host.store.chat(it.id) })
         }
-        host.mutable.update {
-            it.copy(
+        if (renamedFrom != null) {
+            val prefs = host.current.prefs
+            val relinkedPersonas = prefs.personas.map { persona ->
+                if (persona.worldId == renamedFrom) persona.copy(worldId = value.id) else persona
+            }
+            if (relinkedPersonas != prefs.personas) {
+                host.persistPreferences(prefs.copy(personas = relinkedPersonas))
+            }
+        }
+        host.mutable.update { current ->
+            val updatedChat = when {
+                chat != null && chat.id == current.chat?.id -> chat
+                renamedFrom != null && current.chat?.isTemporary == true ->
+                    current.chat.relinkWorldBook(value.id, renamedFrom, value.name)
+                else -> current.chat
+            }
+            current.copy(
                 books = books,
                 cards = cards,
-                chat = chat?.takeIf { saved -> saved.id == it.chat?.id } ?: it.chat,
+                groups = groups,
+                chat = updatedChat,
             )
         }
         done()
     }
+
+    private data class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
     fun deleteBook(book: WorldBook) = host.work {
         val (books, cards) = withContext(Dispatchers.IO) { host.store.deleteBook(book); host.store.books() to host.store.cards() }
