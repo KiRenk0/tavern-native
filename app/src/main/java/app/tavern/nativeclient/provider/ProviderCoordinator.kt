@@ -400,7 +400,7 @@ internal class ProviderCoordinator(private val host: CoordinatorHost) {
     }
 
     fun loadModels(provider: Provider, persistCatalog: Boolean = false) = host.work {
-        require(!provider.requiresApiKey || provider.apiKey.isNotBlank()) { "请填写 API Key" }
+        require(!provider.requiresApiKey || provider.hasAnyApiKey) { "请填写 API Key" }
         val discovered = ModelService.discoverModels(provider)
         if (persistCatalog) {
             val prefs = host.current.prefs

@@ -50,7 +50,7 @@ internal data class ChatCompletionPreset(
 
 internal val Provider.hasChatNameField: Boolean
     get() = !usesTextCompletion && template != ProviderTemplate.GOOGLE &&
-        protocol in setOf(ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER)
+        protocol in setOf(ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER, ApiProtocol.AZURE_OPENAI)
 
 internal val Provider.acceptsChatContinuation: Boolean
     get() = !usesTextCompletion && template != ProviderTemplate.GOOGLE &&

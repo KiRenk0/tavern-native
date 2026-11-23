@@ -19,6 +19,13 @@ internal enum class TextTokenizer(val label: String, val encoding: EncodingType?
     P50K("p50k_base", EncodingType.P50K_BASE),
     P50K_EDIT("p50k_edit", EncodingType.P50K_EDIT),
     R50K("r50k_base（GPT-2）", EncodingType.R50K_BASE),
+    MISTRAL_NEMO("Mistral / Nemo (Tekken)"),
+    QWEN("Qwen (2 / 2.5 / 3)"),
+    GEMMA("Gemma (2 / 3)"),
+    CLAUDE("Claude"),
+    COMMAND_R("Command-R / Command-A"),
+    LLAMA_1_2("Llama 1 / 2"),
+    YI("Yi (1.5 / Large)"),
     ESTIMATE("本机估算");
 
     companion object {
@@ -31,6 +38,7 @@ internal data class TokenPreview(val source: String, val count: Int, val pieces:
 
 internal val ModelConnection.supportsRemoteTokenCount get() =
     provider.protocol == ApiProtocol.KOBOLD_TEXT || provider.protocol == ApiProtocol.GEMINI_NATIVE ||
+        AdditionalTextBackends.specFor(provider.protocol)?.supportsRemoteTokenCount == true ||
         provider.protocol == ApiProtocol.OPENAI_COMPATIBLE && provider.template == ProviderTemplate.GOOGLE &&
         provider.endpoint.trimEnd('/') == ProviderTemplate.GOOGLE.endpoint
 
@@ -86,6 +94,7 @@ internal class ChatTokenizers(private val open: (String) -> InputStream) {
             val label = "${mode.label} 本机分词"
             return TextTokenCounter(label, delegate::count) { text -> delegate.preview(text, label) }
         }
+        AdditionalTokenizers.counterFor(mode)?.let { return it }
         val type = mode.encoding ?: return estimatedTokens
         val encoder = OpenAiTokenizers.encoding(type)
         val label = "${type.name.lowercase(Locale.ROOT)} 本机分词"
@@ -122,8 +131,10 @@ internal class ChatTokenizers(private val open: (String) -> InputStream) {
             provider.template == ProviderTemplate.DEEPSEEK && id in setOf("deepseek-flash", "deepseek-pro")) {
             return TextTokenizer.DEEPSEEK_41
         }
-        val encoding = OpenAiTokenizers.forModel(model) ?: return TextTokenizer.ESTIMATE
-        return TextTokenizer.entries.first { it.encoding == encoding }
+        OpenAiTokenizers.forModel(model)?.let { encoding ->
+            return TextTokenizer.entries.first { it.encoding == encoding }
+        }
+        return AdditionalTokenizers.forModel(model) ?: TextTokenizer.ESTIMATE
     }
 }
 

@@ -633,8 +633,20 @@ internal object ModelService {
                                          token: (String) -> Unit, acceptTools: Boolean, onRetry: () -> Unit,
                                          textPrompt: TextCompletionPrompt?, stops: List<String>, sendStops: Boolean,
                                          sendProbabilities: Boolean, requestOptions: CompiledProviderRequest,
-                                         onRequest: (JSONArray) -> Unit, onQueueProgress: (String) -> Unit): CompletionAccumulator {
-        if (provider.protocol !in setOf(ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER)) {
+                                         onRequest: (JSONArray) -> Unit, onQueueProgress: (String) -> Unit): CompletionAccumulator =
+        MultiKeyManager.executeWithRotation(provider) { activeProvider, _ ->
+            completeExchangeOnce(activeProvider, payload, onReasoning, token, acceptTools, onRetry, textPrompt,
+                stops, sendStops, sendProbabilities, requestOptions, onRequest, onQueueProgress)
+        }
+
+    private suspend fun completeExchangeOnce(provider: Provider, payload: JSONObject, onReasoning: (String) -> Unit,
+                                             token: (String) -> Unit, acceptTools: Boolean, onRetry: () -> Unit,
+                                             textPrompt: TextCompletionPrompt?, stops: List<String>, sendStops: Boolean,
+                                             sendProbabilities: Boolean, requestOptions: CompiledProviderRequest,
+                                             onRequest: (JSONArray) -> Unit, onQueueProgress: (String) -> Unit): CompletionAccumulator {
+        val openAiMainPath = provider.protocol in setOf(ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER, ApiProtocol.AZURE_OPENAI) ||
+            (provider.protocol == ApiProtocol.VERTEX_AI && VertexAiAdapter.isOpenAiCompatEndpoint(provider.endpoint))
+        if (!openAiMainPath) {
             onRequest(payload.optJSONArray("messages") ?: JSONArray())
             return ProviderProtocols.completeProtocol(provider, payload, onReasoning, token, acceptTools, onRetry, textPrompt,
                 stops, sendStops, onQueueProgress)
@@ -699,7 +711,7 @@ internal object ModelService {
                                        readFullStream: Boolean, stops: List<String>, requestOptions: CompiledProviderRequest): CompletionAccumulator {
         val result = CompletionAccumulator(stops)
         if (payload.has("logprobs")) result.tokenCollector = ReplyTokenCollector()
-        fun redact(detail: String) = requestOptions.redact(detail.redactValue(provider.apiKey.trim()))
+        fun redact(detail: String) = requestOptions.redact(detail.redactProviderSecrets(provider))
         fun appendResponse(json: JSONObject, streaming: Boolean) {
             val detail = json.optJSONObject("error")?.string("message") ?: (json.opt("error") as? String).orEmpty()
             if (detail.isNotBlank()) {
@@ -731,14 +743,24 @@ internal object ModelService {
         var streamOpened = false
         var streamConsumed = false
         try {
-            val endpoint = base(provider).let { root ->
-                val rows = payload.optJSONArray("messages")
-                val beta = provider.template == ProviderTemplate.DEEPSEEK &&
-                    rows?.optJSONObject(rows.length() - 1)?.optBoolean("prefix") == true
-                if (beta && !root.endsWith("/beta")) "$root/beta" else root
+            val url = if (provider.protocol == ApiProtocol.AZURE_OPENAI) {
+                AzureOpenAiAdapter.buildChatCompletionsUrl(provider, payload.string("model"))
+            } else {
+                val endpoint = base(provider).let { root ->
+                    val rows = payload.optJSONArray("messages")
+                    val beta = provider.template == ProviderTemplate.DEEPSEEK &&
+                        rows?.optJSONObject(rows.length() - 1)?.optBoolean("prefix") == true
+                    if (beta && !root.endsWith("/beta")) "$root/beta" else root
+                }
+                "$endpoint/chat/completions"
             }
-            val headers = requestOptions.headersWith(ProviderProtocols.buildOpenAiHeaders(provider))
-            request("$endpoint/chat/completions", payload, headers,
+            val baseHeaders = when (provider.protocol) {
+                ApiProtocol.AZURE_OPENAI -> AzureOpenAiAdapter.buildHeaders(provider)
+                ApiProtocol.VERTEX_AI -> VertexAiAdapter.buildHeaders(provider.apiKey)
+                else -> ProviderProtocols.buildOpenAiHeaders(provider)
+            }
+            val headers = requestOptions.headersWith(baseHeaders)
+            request(url, payload, headers,
                 readTimeout = if (payload.has("modalities")) 180_000 else 90_000, redactError = ::redact) { input, type ->
                 if (!type.contains("text/event-stream", ignoreCase = true)) {
                     appendResponse(JSONObject(input.readLimited().toString(Charsets.UTF_8)), streaming = false)

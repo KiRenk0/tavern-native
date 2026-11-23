@@ -8,8 +8,19 @@ internal enum class ApiProtocol(val wire: String, val label: String) {
     ANTHROPIC("anthropic", "Anthropic Claude 原生"),
     GEMINI_NATIVE("gemini", "Google Gemini 原生"),
     OPENROUTER("openrouter", "OpenRouter"),
+    AZURE_OPENAI("azure_openai", "Azure OpenAI"),
+    VERTEX_AI("vertex_ai", "Google Vertex AI"),
     OLLAMA("ollama", "Ollama 本地"),
     KOBOLD_TEXT("kobold", "KoboldCPP / llama.cpp 文本补全"),
+    TABBY_TEXT("tabby", "TabbyAPI 文本补全"),
+    VLLM_TEXT("vllm", "vLLM 文本补全"),
+    APHRODITE_TEXT("aphrodite", "Aphrodite 文本补全"),
+    OOBABOOGA_TEXT("textgenerationwebui", "Oobabooga (text-generation-webui)"),
+    FEATHERLESS_TEXT("featherless", "Featherless AI 文本补全"),
+    INFERMATIC_TEXT("infermatic", "Infermatic 文本补全"),
+    DREAMGEN_TEXT("dreamgen", "DreamGen 文本补全"),
+    MANCER_TEXT("mancer", "Mancer 文本补全"),
+    HUGGINGFACE_TEXT("huggingface", "HuggingFace 文本推理"),
     NOVELAI_TEXT("novelai", "NovelAI 文本补全"),
     HORDE_TEXT("horde", "AI Horde");
 
@@ -97,24 +108,30 @@ internal data class Provider(
     val textTokenizer: TextTokenizer = TextTokenizer.MODEL,
     val novelAi: NovelAiSettings = NovelAiSettings(),
     val horde: HordeSettings = HordeSettings(),
+    val multiKeys: MultiKeyConfig = MultiKeyConfig(),
+    val azureConfig: AzureOpenAiConfig = AzureOpenAiConfig(),
 ) {
     val requiresApiKey get() = template != null || protocol == ApiProtocol.NOVELAI_TEXT
-    val ready get() = endpoint.isNotBlank() && defaultModel.isNotBlank() && (!requiresApiKey || apiKey.isNotBlank())
+    val ready get() = endpoint.isNotBlank() && defaultModel.isNotBlank() && (!requiresApiKey || hasAnyApiKey)
     val choices get() = (listOf(defaultModel) + models).filter(String::isNotBlank).distinct()
     val defaultSelection get() = ModelSelection(id, defaultModel)
     val usesTextCompletion get() = protocol in setOf(ApiProtocol.KOBOLD_TEXT, ApiProtocol.NOVELAI_TEXT, ApiProtocol.HORDE_TEXT) ||
+        protocol.isAdditionalTextBackend ||
         protocol == ApiProtocol.OLLAMA && textCompletion
-    val supportsTextSampling get() = protocol in setOf(ApiProtocol.KOBOLD_TEXT, ApiProtocol.OLLAMA, ApiProtocol.HORDE_TEXT)
+    val supportsTextSampling get() = protocol in setOf(ApiProtocol.KOBOLD_TEXT, ApiProtocol.OLLAMA, ApiProtocol.HORDE_TEXT) ||
+        protocol.isAdditionalTextBackend
 
     fun validated(): Provider {
         val profile = template?.profile()
         val resolvedProtocol = if (template != null && protocol !in template.allowedProtocols()) {
             template.defaultProtocol()
         } else protocol
+        val cleanMultiKeys = multiKeys.validated()
+        val resolvedApiKey = apiKey.trim().ifBlank { cleanMultiKeys.enabledKeys.firstOrNull()?.secret.orEmpty() }
         val clean = copy(
             name = profile?.name ?: name.trim(),
             endpoint = profile?.endpoint ?: endpoint.trim(),
-            apiKey = apiKey.trim(),
+            apiKey = resolvedApiKey,
             defaultModel = defaultModel.trim().ifBlank { profile?.defaultModel.orEmpty() },
             models = models.map(String::trim).filter(String::isNotBlank).distinct(),
             protocol = resolvedProtocol,
@@ -123,10 +140,12 @@ internal data class Provider(
             openRouterReasoningEffort = openRouterReasoningEffort.trim().lowercase().takeIf { it in setOf("low", "medium", "high") }.orEmpty(),
             instruct = instruct?.validated(),
             textContext = textContext?.validated(),
+            multiKeys = cleanMultiKeys,
+            azureConfig = azureConfig.validated(),
         )
         require(clean.name.isNotBlank()) { "请填写提供商名称" }
         require(clean.defaultModel.isNotBlank()) { "请填写默认模型 ID" }
-        require(!clean.requiresApiKey || clean.apiKey.isNotBlank()) { "请填写 API Key" }
+        require(!clean.requiresApiKey || clean.hasAnyApiKey) { "请填写 API Key" }
         if (clean.protocol == ApiProtocol.NOVELAI_TEXT) {
             require(NovelAiModel.from(clean.defaultModel) != null && clean.models.all { NovelAiModel.from(it) != null }) {
                 "请选择 NovelAI 的模型 ID。可使用「读取模型列表」查看。"
@@ -163,6 +182,8 @@ internal data class Provider(
         "textTokenizer" to textTokenizer.name.takeUnless { textTokenizer == TextTokenizer.MODEL },
         "novelAi" to novelAi.takeUnless { it == NovelAiSettings() }?.json(),
         "horde" to horde.takeUnless { it == HordeSettings() }?.json(),
+        "multiKeys" to multiKeys.takeUnless { it.isEmpty }?.storageJson(seal),
+        "azureConfig" to azureConfig.takeUnless { it == AzureOpenAiConfig() }?.json(),
     )
 
     companion object {
@@ -203,6 +224,8 @@ internal data class Provider(
                 textTokenizer = TextTokenizer.from(json.string("textTokenizer")),
                 novelAi = NovelAiSettings.read(json.optJSONObject("novelAi")),
                 horde = HordeSettings.read(json.optJSONObject("horde")),
+                multiKeys = MultiKeyConfig.fromJson(json.optJSONObject("multiKeys"), unseal),
+                azureConfig = AzureOpenAiConfig.read(json.optJSONObject("azureConfig")),
             )
         }
 

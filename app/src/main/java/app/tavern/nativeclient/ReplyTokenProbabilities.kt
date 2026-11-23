@@ -125,8 +125,8 @@ private fun decodeTokens(tokens: List<ReplyTokenCandidate>): String? {
 internal val Provider.canRequestTokenProbabilities: Boolean
     get() = when (protocol) {
         ApiProtocol.OPENAI_COMPATIBLE -> template != ProviderTemplate.GOOGLE
-        ApiProtocol.OPENROUTER, ApiProtocol.KOBOLD_TEXT -> true
-        else -> false
+        ApiProtocol.OPENROUTER, ApiProtocol.AZURE_OPENAI, ApiProtocol.KOBOLD_TEXT -> true
+        else -> AdditionalTextBackends.specFor(protocol)?.supportsLogprobs == true
     }
 
 internal val Provider.canRerollToken: Boolean get() = canRequestTokenProbabilities &&

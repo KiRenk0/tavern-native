@@ -159,7 +159,8 @@ internal fun originalBiasText(text: String, textCompletion: Boolean): String {
 }
 
 internal val Provider.supportsTokenBias get() = template == null &&
-    protocol in setOf(ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER, ApiProtocol.KOBOLD_TEXT)
+    (protocol in setOf(ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER, ApiProtocol.AZURE_OPENAI, ApiProtocol.KOBOLD_TEXT) ||
+        AdditionalTextBackends.specFor(protocol)?.supportsLogitBias == true)
 
 internal fun defaultBiasTokenizer(connection: ModelConnection): BiasTokenizer {
     if (connection.provider.protocol == ApiProtocol.KOBOLD_TEXT) {

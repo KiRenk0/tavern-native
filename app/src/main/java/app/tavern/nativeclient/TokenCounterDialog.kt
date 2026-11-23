@@ -63,6 +63,13 @@ internal fun TokenCounterDialog(
             Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 SelectField("分词器", selection, TextTokenizer.entries, TextTokenizer::label) { selection = it }
+                AdditionalTokenizers.profileInfo(selection)?.let { info ->
+                    Text(
+                        "${info.algorithm} · 词表 ${info.vocabSize} · ${info.summary}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Field("要分词的文本", text, { text = it }, lines = 4)
                 if (selection == TextTokenizer.MODEL && connection?.supportsRemoteTokenCount == true) {
                     OutlinedButton({ remoteAttempt++ }, modifier = Modifier.fillMaxWidth(),

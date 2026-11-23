@@ -26,15 +26,31 @@ internal object ProviderProtocols {
             .removeSuffix("/chat/completions")
             .removeSuffix("/messages")
 
-    suspend fun discoverModels(provider: Provider): DiscoveredModels {
+    suspend fun discoverModels(provider: Provider): DiscoveredModels =
+        MultiKeyManager.executeWithRotation(provider) { active, _ ->
+            discoverModelsDirect(active)
+        }
+
+    private suspend fun discoverModelsDirect(provider: Provider): DiscoveredModels {
         val base = baseAddress(provider)
         return when (provider.protocol) {
             ApiProtocol.ANTHROPIC -> discoverAnthropicModels(base, provider.apiKey.trim())
             ApiProtocol.GEMINI_NATIVE -> discoverGeminiNativeModels(base, provider.apiKey.trim())
+            ApiProtocol.AZURE_OPENAI -> AzureOpenAiAdapter.discoverModels(provider)
+            ApiProtocol.VERTEX_AI -> VertexAiAdapter.discoverModels(provider)
             ApiProtocol.OLLAMA -> discoverOllamaModels(base)
             ApiProtocol.KOBOLD_TEXT -> discoverKoboldModels(base, provider.apiKey.trim())
             ApiProtocol.NOVELAI_TEXT -> NovelAi.discover(provider, base)
             ApiProtocol.HORDE_TEXT -> Horde(provider).textModels()
+            ApiProtocol.TABBY_TEXT,
+            ApiProtocol.VLLM_TEXT,
+            ApiProtocol.APHRODITE_TEXT,
+            ApiProtocol.OOBABOOGA_TEXT,
+            ApiProtocol.FEATHERLESS_TEXT,
+            ApiProtocol.INFERMATIC_TEXT,
+            ApiProtocol.DREAMGEN_TEXT,
+            ApiProtocol.MANCER_TEXT,
+            ApiProtocol.HUGGINGFACE_TEXT -> AdditionalTextBackends.discoverModels(provider, base)
             ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER -> {
                 if (provider.template == ProviderTemplate.GOOGLE &&
                     base == "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -51,7 +67,7 @@ internal object ProviderProtocols {
                 val overrides = provider.compiledRequestOptions()
                 val headers = overrides.headersWith(buildOpenAiHeaders(provider))
                 request("$base/models", headers = headers, redactError = {
-                    overrides.redact(it.redactValue(provider.apiKey.trim()))
+                    overrides.redact(it.redactProviderSecrets(provider))
                 }) { input, _ ->
                     DiscoveredModels.read(
                         JSONObject(input.readLimited().decodeToString()),
@@ -172,6 +188,9 @@ internal object ProviderProtocols {
     suspend fun inspectRemoteTokens(connection: ModelConnection, text: String): TokenPreview {
         require(connection.supportsRemoteTokenCount) { "当前连接没有可用的服务端分词接口" }
         val provider = connection.provider
+        if (AdditionalTextBackends.specFor(provider.protocol)?.supportsRemoteTokenCount == true) {
+            return AdditionalTextBackends.inspectRemoteTokens(connection, text)
+        }
         if (provider.protocol != ApiProtocol.KOBOLD_TEXT) {
             val root = geminiApiRoot(baseAddress(provider))
             val id = URLEncoder.encode(connection.model.removePrefix("models/"), "UTF-8")
@@ -269,15 +288,25 @@ internal object ProviderProtocols {
     ): CompletionAccumulator = when (provider.protocol) {
         ApiProtocol.ANTHROPIC -> completeAnthropic(provider, payload, onReasoning, token, acceptTools, customStops)
         ApiProtocol.GEMINI_NATIVE -> completeGeminiNative(provider, payload, onReasoning, token, acceptTools, onRetry, customStops)
+        ApiProtocol.VERTEX_AI -> VertexAiAdapter.complete(provider, payload, onReasoning, token, acceptTools, customStops)
         ApiProtocol.OLLAMA -> completeOllama(provider, payload, onReasoning, token, textPrompt, customStops, sendStops)
         ApiProtocol.KOBOLD_TEXT -> completeKobold(provider, payload, token, textPrompt, customStops, sendStops)
+        ApiProtocol.TABBY_TEXT,
+        ApiProtocol.VLLM_TEXT,
+        ApiProtocol.APHRODITE_TEXT,
+        ApiProtocol.OOBABOOGA_TEXT,
+        ApiProtocol.FEATHERLESS_TEXT,
+        ApiProtocol.INFERMATIC_TEXT,
+        ApiProtocol.DREAMGEN_TEXT,
+        ApiProtocol.MANCER_TEXT,
+        ApiProtocol.HUGGINGFACE_TEXT -> AdditionalTextBackends.complete(provider, payload, token, textPrompt, customStops, sendStops)
         ApiProtocol.NOVELAI_TEXT -> NovelAi.complete(provider, baseAddress(provider), payload, textPrompt, customStops, token, onRetry)
         ApiProtocol.HORDE_TEXT -> try {
             Horde(provider).complete(payload, textPrompt, customStops, sendStops, onQueueProgress, token)
         } finally {
             onQueueProgress("")
         }
-        ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER -> error("OpenAI 兼容协议由主路径处理")
+        ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER, ApiProtocol.AZURE_OPENAI -> error("OpenAI 兼容协议由主路径处理")
     }
 
     // --- Anthropic Claude Native (/v1/messages) ---
@@ -827,6 +856,20 @@ internal object ProviderProtocols {
         val url = if (streaming) "$apiRoot/models/$modelName:streamGenerateContent?alt=sse"
         else "$apiRoot/models/$modelName:generateContent"
         val headers = mapOf("x-goog-api-key" to key)
+        return executeGeminiUrlRequest(url, headers, key, body, onReasoning, token, acceptTools, customStops)
+    }
+
+    internal suspend fun executeGeminiUrlRequest(
+        url: String,
+        headers: Map<String, String>,
+        keyForRedaction: String,
+        body: JSONObject,
+        onReasoning: (String) -> Unit,
+        token: (String) -> Unit,
+        acceptTools: Boolean,
+        customStops: List<String>,
+    ): CompletionAccumulator {
+        val key = keyForRedaction
         val imageMode = body.optJSONObject("generationConfig")?.optJSONArray("responseModalities").strings().contains("IMAGE")
         val grounding = body.optJSONArray("tools")?.objects()?.any { it.has("googleSearch") } == true
         val result = CompletionAccumulator(customStops, captureGeminiParts = imageMode,
@@ -1170,19 +1213,22 @@ internal object ProviderProtocols {
         return result.also { it.finishText(token) }
     }
 
-    private suspend fun executeOpenAiTextCompletion(
+    internal suspend fun executeOpenAiTextCompletion(
         url: String,
         body: JSONObject,
         headers: Map<String, String>,
         token: (String) -> Unit,
         stops: List<String>,
+        provider: Provider? = null,
     ): CompletionAccumulator {
         val result = CompletionAccumulator(stops)
         if (body.has("logprobs")) result.tokenCollector = ReplyTokenCollector()
         var streamOpened = false
         var streamConsumed = false
         try {
-            request(url, body, headers) { input, type ->
+            request(url, body, headers, redactError = { detail ->
+                if (provider != null) detail.redactProviderSecrets(provider) else detail
+            }) { input, type ->
                 if (!type.contains("text/event-stream", ignoreCase = true)) {
                     val json = JSONObject(input.readLimited().toString(Charsets.UTF_8))
                     result.usage = result.usage.update(ResponseTokens.openAi(json))

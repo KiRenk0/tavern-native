@@ -183,6 +183,8 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
     val prefs = state.prefs
     var editor by rememberSaveable { mutableStateOf<String?>(null) }
     var draftId by rememberSaveable { mutableStateOf("") }
+    var presetPickerOpen by rememberSaveable { mutableStateOf(false) }
+    var presetDraft by remember { mutableStateOf<Provider?>(null) }
     var personaSettings by rememberSaveable { mutableStateOf(false) }
     var promptSettings by rememberSaveable { mutableStateOf(false) }
     var formattingSettings by rememberSaveable { mutableStateOf(false) }
@@ -275,8 +277,9 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
     }
     if (selected != null) {
         val saved = prefs.providers.firstOrNull { it.id == selected }
-        val draft = saved ?: ProviderTemplate.builtIn.firstOrNull { it.id == selected }?.profile() ?: Provider(draftId)
-        fun close() { model.clearModels(); editor = null }
+        val draft = saved ?: presetDraft?.takeIf { it.id == selected }
+            ?: ProviderTemplate.builtIn.firstOrNull { it.id == selected }?.profile() ?: Provider(draftId)
+        fun close() { model.clearModels(); presetDraft = null; editor = null }
         androidx.activity.compose.BackHandler { if (!state.busy) close() }
         key(selected) {
             ProviderEditor(draft, saved != null, state, model, ::close)
@@ -295,8 +298,21 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
             ProviderRow(provider, true, defaults?.provider?.id == provider.id, state.busy,
                 open = { editor = provider.id }, makeDefault = { model.setDefaultProvider(provider) })
         }
-        OutlinedButton(onClick = { draftId = newId(); editor = draftId }, enabled = !state.busy) {
-            Icon(Icons.Outlined.Add, null); Spacer(Modifier.width(8.dp)); Text("添加自定义提供商")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { presetPickerOpen = true },
+                enabled = !state.busy,
+                modifier = Modifier.weight(1f),
+            ) {
+                Icon(Icons.Outlined.AutoAwesome, null); Spacer(Modifier.width(6.dp)); Text("从预设模板添加")
+            }
+            OutlinedButton(
+                onClick = { draftId = newId(); presetDraft = null; editor = draftId },
+                enabled = !state.busy,
+                modifier = Modifier.weight(1f),
+            ) {
+                Icon(Icons.Outlined.Add, null); Spacer(Modifier.width(6.dp)); Text("自定义提供商")
+            }
         }
         OutlinedButton(onClick = { profileSettings = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
             Icon(Icons.Outlined.Tune, null)
@@ -608,6 +624,14 @@ internal fun SettingsScreen(state: TavernState, model: TavernViewModel) {
     if (backgroundLibrary) BackgroundLibraryDialog(state, model, null) { backgroundLibrary = false }
     if (conversationStats) ConversationStatisticsDialog("全部聊天统计", model) { conversationStats = false }
     if (comfyWorkflows) ComfyWorkflowDialog(state, model, close = { comfyWorkflows = false })
+    if (presetPickerOpen) {
+        ProviderPresetPickerDialog(onDismiss = { presetPickerOpen = false }) { picked ->
+            presetDraft = picked
+            draftId = picked.id
+            editor = picked.id
+            presetPickerOpen = false
+        }
+    }
 }
 
 @Composable
@@ -673,6 +697,11 @@ private fun ProviderEditor(provider: Provider, saved: Boolean, state: TavernStat
     var editingNovelAi by remember { mutableStateOf(false) }
     var horde by remember { mutableStateOf(provider.horde) }
     var hordeCatalogTrust by remember { mutableStateOf(provider.horde.trustedOnly) }
+    var multiKeys by remember { mutableStateOf(provider.multiKeys) }
+    var editingMultiKeys by rememberSaveable { mutableStateOf(false) }
+    var azureDeployment by rememberSaveable { mutableStateOf(provider.azureConfig.deployment) }
+    var azureApiVersion by rememberSaveable { mutableStateOf(provider.azureConfig.apiVersion) }
+    var tabbyControlOpen by rememberSaveable { mutableStateOf(false) }
     var formattingRoute by remember { mutableStateOf(Triple(provider.endpoint.trim(), provider.protocol, provider.apiKey.trim().hashCode())) }
     var advanced by rememberSaveable { mutableStateOf(false) }
     var remove by remember { mutableStateOf(false) }
@@ -729,6 +758,8 @@ private fun ProviderEditor(provider: Provider, saved: Boolean, state: TavernStat
         horde = horde.copy(modelOutputs = horde.modelOutputs.takeIf {
             endpoint.trim() == contextEndpoint && horde.trustedOnly == hordeCatalogTrust
         }.orEmpty()),
+        multiKeys = multiKeys,
+        azureConfig = AzureOpenAiConfig(azureDeployment, azureApiVersion),
     )
     if (editingNovelAi) {
         NovelAiSettingsScreen(novelAi, NovelAiModel.from(defaultModel.trim()), { editingNovelAi = false }) {
@@ -767,9 +798,10 @@ private fun ProviderEditor(provider: Provider, saved: Boolean, state: TavernStat
         return
     }
     val needsKey = template != null || protocol == ApiProtocol.NOVELAI_TEXT
+    val hasAnyKey = apiKey.isNotBlank() || multiKeys.enabledKeys.isNotEmpty()
     val canSave = if (template == null) name.isNotBlank() && endpoint.isNotBlank() && defaultModel.isNotBlank() &&
-        (!needsKey || apiKey.isNotBlank())
-        else apiKey.isNotBlank()
+        (!needsKey || hasAnyKey)
+        else hasAnyKey
     Form {
         TextButton(close, enabled = !state.busy) { Text("返回提供商列表") }
         FormHeading(if (template != null) template.label else if (saved) "编辑自定义提供商" else "添加自定义提供商",
@@ -787,22 +819,59 @@ private fun ProviderEditor(provider: Provider, saved: Boolean, state: TavernStat
                     if (defaultModel.isBlank()) defaultModel = HORDE_AUTO_MODEL
                     streaming = false
                 }
+                if (choice == ApiProtocol.AZURE_OPENAI) {
+                    if (endpoint.isBlank()) endpoint = ChatProviderPreset.AZURE_OPENAI.baseUrl
+                    if (defaultModel.isBlank()) defaultModel = ChatProviderPreset.AZURE_OPENAI.defaultModel
+                }
+                if (choice == ApiProtocol.VERTEX_AI) {
+                    if (endpoint.isBlank()) endpoint = ChatProviderPreset.VERTEX_AI.baseUrl
+                    if (defaultModel.isBlank()) defaultModel = ChatProviderPreset.VERTEX_AI.defaultModel
+                }
+                AdditionalTextBackends.specFor(choice)?.let { spec ->
+                    if (endpoint.isBlank()) endpoint = spec.defaultEndpoint
+                    if (defaultModel.isBlank()) defaultModel = spec.defaultModel
+                }
             }
             Field("API 地址", endpoint, { endpoint = it }, placeholder = when (protocol) {
                 ApiProtocol.ANTHROPIC -> "https://api.anthropic.com"
                 ApiProtocol.GEMINI_NATIVE -> "https://generativelanguage.googleapis.com/v1beta"
+                ApiProtocol.AZURE_OPENAI -> ChatProviderPreset.AZURE_OPENAI.baseUrl
+                ApiProtocol.VERTEX_AI -> ChatProviderPreset.VERTEX_AI.baseUrl
                 ApiProtocol.OLLAMA -> "http://127.0.0.1:11434"
                 ApiProtocol.KOBOLD_TEXT -> "http://127.0.0.1:5001"
                 ApiProtocol.NOVELAI_TEXT -> NOVEL_AI_ENDPOINT
                 ApiProtocol.HORDE_TEXT -> HORDE_ENDPOINT
-                else -> "https://api.example.com/v1"
+                else -> AdditionalTextBackends.defaultEndpoint(protocol) ?: "https://api.example.com/v1"
             }, enabled = !state.busy, type = KeyboardType.Uri)
         } else if (template.allowedProtocols().size > 1) {
             SelectField("通信协议", protocol, template.allowedProtocols(), ApiProtocol::label, !state.busy) { protocol = it }
         }
         Field(if (needsKey) "API Key" else "API Key（可选）",
             apiKey, { apiKey = it }, secret = true, enabled = !state.busy)
-        if (template == null && protocol in setOf(ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER)) {
+        OutlinedButton({ editingMultiKeys = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Outlined.Key, null); Spacer(Modifier.width(8.dp))
+            Text(
+                if (multiKeys.enabledKeys.isEmpty()) "多密钥轮换 / 故障切换"
+                else "多密钥轮换 · ${multiKeys.enabledKeys.size} 个启用 Key",
+            )
+        }
+        if (protocol == ApiProtocol.AZURE_OPENAI) {
+            Field("Azure 部署名 (Deployment)", azureDeployment, { azureDeployment = it }, enabled = !state.busy,
+                placeholder = "留空默认使用模型 ID")
+            Field("Azure API 版本 (api-version)", azureApiVersion, { azureApiVersion = it }, enabled = !state.busy,
+                placeholder = DEFAULT_AZURE_API_VERSION)
+        }
+        if (protocol == ApiProtocol.TABBY_TEXT) {
+            OutlinedButton(
+                { tabbyControlOpen = true },
+                enabled = !state.busy && endpoint.isNotBlank(),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.Outlined.Memory, null); Spacer(Modifier.width(8.dp))
+                Text("TabbyAPI 模型加载 / 卸载")
+            }
+        }
+        if (template == null && protocol in setOf(ApiProtocol.OPENAI_COMPATIBLE, ApiProtocol.OPENROUTER, ApiProtocol.AZURE_OPENAI)) {
             OutlinedButton({ editingRequestOptions = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
                 Text(if (requestOptions.isEmpty) "附加请求参数" else "附加请求参数 · 已配置")
             }
@@ -815,7 +884,7 @@ private fun ProviderEditor(provider: Provider, saved: Boolean, state: TavernStat
         if (template == null || advanced) {
             Field("默认模型 ID", defaultModel, { defaultModel = it }, enabled = !state.busy)
             OutlinedButton({ model.loadModels(draft()) },
-                enabled = !state.busy && endpoint.isNotBlank() && (!needsKey || apiKey.isNotBlank())) {
+                enabled = !state.busy && endpoint.isNotBlank() && (!needsKey || hasAnyKey)) {
                 Icon(Icons.Outlined.Refresh, null); Spacer(Modifier.width(8.dp)); Text("读取模型列表")
             }
             Field("快捷切换的模型（每行一个）", knownModels, { knownModels = it }, lines = 3, enabled = !state.busy)
@@ -919,6 +988,40 @@ private fun ProviderEditor(provider: Provider, saved: Boolean, state: TavernStat
     if (remove) Confirm("移除提供商？", "使用该提供商的对话会改用应用默认模型。", { remove = false }) {
         remove = false
         model.deleteProvider(provider, close)
+    }
+    if (editingMultiKeys) {
+        MultiKeyManagerDialog(
+            provider = draft(),
+            initialConfig = multiKeys,
+            primaryApiKey = apiKey,
+            onDismiss = { editingMultiKeys = false },
+            onSave = { updated ->
+                multiKeys = updated
+                if (apiKey.isBlank()) {
+                    updated.enabledKeys.firstOrNull()?.secret?.let { apiKey = it }
+                }
+                editingMultiKeys = false
+            },
+        )
+    }
+    if (tabbyControlOpen) {
+        TabbyModelControlDialog(
+            provider = draft(),
+            onDismiss = { tabbyControlOpen = false },
+            onModelLoaded = { loadedName, maxSeq ->
+                if (loadedName.isNotBlank()) {
+                    defaultModel = loadedName
+                    val updatedKnown = (knownModels.lineSequence().map(String::trim).filter(String::isNotBlank).toList() + loadedName).distinct()
+                    knownModels = updatedKnown.joinToString("\n")
+                    if (maxSeq != null && maxSeq in 1..MAX_CONTEXT_TOKENS) {
+                        val copy = HashMap(contexts)
+                        copy[loadedName] = maxSeq
+                        contexts = copy
+                        contextEndpoint = endpoint.trim()
+                    }
+                }
+            },
+        )
     }
 }
 
