@@ -162,7 +162,6 @@ class LongChatAndMigrationStressTest {
                     keywords = listOf("obsidian key", "observatory"),
                     content = "The observatory overlooks the frozen bay.",
                     depth = 4,
-                    enabled = true,
                 ),
             ),
         )
@@ -203,7 +202,8 @@ class LongChatAndMigrationStressTest {
         val dropTable = Regex("""(?is)^\s*DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)\s*$""")
         val createIndex = Regex("""(?is)^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)\s*\(""")
         val createTrigger = Regex("""(?is)^\s*CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+(?:BEFORE|AFTER|INSTEAD\s+OF)\s+\w+(?:\s+OF\s+[\w,\s]+)?\s+ON\s+(\w+)\b""")
-        val insertInto = Regex("""(?is)^\s*INSERT\s+INTO\s+(\w+)\b.*\bFROM\s+(\w+)\b""")
+        val insertIntoSelect = Regex("""(?is)^\s*INSERT\s+(?:OR\s+\w+\s+)?INTO\s+(\w+)\b.*\bFROM\s+(\w+)\b""")
+        val insertIntoValues = Regex("""(?is)^\s*INSERT\s+(?:OR\s+\w+\s+)?INTO\s+(\w+)\b.*\bVALUES\b""")
 
         for (raw in statements) {
             val sql = raw.trim()
@@ -245,12 +245,17 @@ class LongChatAndMigrationStressTest {
                     assertTrue("$label: TRIGGER $trg references missing table $table", table in state.tables)
                     assertTrue("$label: duplicate TRIGGER $trg", state.triggers.add(trg))
                 }
-                insertInto.containsMatchIn(sql) -> {
-                    val m = insertInto.find(sql)!!
+                insertIntoSelect.containsMatchIn(sql) -> {
+                    val m = insertIntoSelect.find(sql)!!
                     val dst = m.groupValues[1].lowercase()
                     val src = m.groupValues[2].lowercase()
                     assertTrue("$label: INSERT target $dst missing", dst in state.tables)
                     assertTrue("$label: INSERT source $src missing", src in state.tables)
+                }
+                insertIntoValues.containsMatchIn(sql) -> {
+                    val m = insertIntoValues.find(sql)!!
+                    val dst = m.groupValues[1].lowercase()
+                    assertTrue("$label: INSERT target $dst missing", dst in state.tables)
                 }
                 else -> error("$label: unrecognized DDL statement: $sql")
             }

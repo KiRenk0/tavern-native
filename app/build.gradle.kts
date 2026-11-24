@@ -11,8 +11,8 @@ android {
         applicationId = "app.tavern.nativeclient"
         minSdk = 26
         targetSdk = 36
-        versionCode = 85
-        versionName = "0.83.0"
+        versionCode = 100
+        versionName = "1.0.0"
     }
 
     buildFeatures { compose = true }

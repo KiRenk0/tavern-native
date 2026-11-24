@@ -1,12 +1,12 @@
 # Tavern Native
 
-Tavern Native 使用 Kotlin、Jetpack Compose 和 Material 3 重写 SillyTavern 的 Android 界面和运行逻辑。当前原生移植对照 [SillyTavern 1.19.1](https://github.com/SillyTavern/SillyTavern/releases/tag/1.19.1)（`82b64a45`）。安装包支持 Android 8.0（API 26）及以上。
+Tavern Native 1.0.0 使用 Kotlin、Jetpack Compose 和 Material 3 完整原生重写 SillyTavern 的 Android 客户端界面、协议层与运行引擎，全面对标 [SillyTavern 1.19.1](https://github.com/SillyTavern/SillyTavern/releases/tag/1.19.1)（`82b64a45`），并深度融合 Android 平台原生能力（前台后台保活服务、系统分享菜单导入、本地 ONNX 推理与 Keystore 加密存储）。安装包支持 Android 8.0（API 26）及以上。
 
 ## 安装与迁移
 
-- 0.83.0 的 `-legacy-key-arm64-v8a.apk` 和 `-legacy-key-universal.apk` 沿用 0.82.0 的签名，可覆盖同签名版本并保留本机数据。0.82.0 已在运行 HyperOS 4.0.4.0 的小米 15 Pro 上完成从 0.78.0 覆盖升级和冷启动验证。工作区现有 0.48.0 安装包使用另一张证书，从它覆盖升级需要同一证书的签名包。
-- 在原版账户设置下载备份后，在「角色库 → SillyTavern 数据迁移 → 导入原版账户备份 ZIP」直接选择 ZIP。可恢复角色、单聊、群聊、世界书、人设、提示词预设、世界书规则、快捷回复、消息图片、锁定背景、图库和随包保存的文本资料。也识别压缩包里的 `data/<账户>/` 目录。重复导入按账户和源文件去重。连接凭证在原生应用的提供商设置里配置。 [SillyTavern 账户备份说明](https://docs.sillytavern.app/usage/user-settings/)
-- 从同一页面点「导出本机账户备份 ZIP」可备份上述内容，以及标签、作者注释、聊天分支和角色表情。原生版可以直接重新导入 ZIP。原版格式的数据位于压缩包内的 `data/tavern-native/`，包含标准角色 PNG、聊天 JSONL 和世界书 JSON。提供商 API Key 和连接密码在迁移后单独配置。
+- **版本升级与签名证书说明**：发布构建（`:app:assembleRelease`）默认生成未签名安装包（`arm64-v8a` 与 `universal`），需使用与已安装版本一致的证书签名后方可覆盖升级并保留本机数据；仓库先前交付的 0.78.0–0.83.0（`-legacy-key-*.apk`）共用 `CN=Tavern Native` 证书（SHA-256 `57ef0b9a...`），而早期 0.48.0 安装包使用独立证书，跨证书安装前请先通过「导出本机账户备份 ZIP」或「设置快照」备份数据再卸载重装。详见 [CHANGELOG.md](CHANGELOG.md)。
+- 在原版账户设置下载备份后，在「角色库 → SillyTavern 数据迁移 → 导入原版账户备份 ZIP」直接选择 ZIP。可恢复角色、单聊、群聊、世界书、人设（含 `User Avatars/` 人设头像）、提示词预设、世界书规则、快捷回复、消息图片、锁定背景、图库、自定义媒体资产、扩展中心配置和随包保存的文本资料。也识别压缩包里的 `data/<账户>/` 目录，并在导入时应用 SillyTavern 1.19.1 级别的路径遍历与符号链接安全校验。重复导入按账户和源文件去重。连接凭证在原生应用的提供商设置里配置。 [SillyTavern 账户备份说明](https://docs.sillytavern.app/usage/user-settings/)
+- 从同一页面点「导出本机账户备份 ZIP」可备份上述内容，以及标签、作者注释、聊天分支、角色表情、人设头像与便携扩展配置（自动剥离敏感密钥）。原生版可以直接重新导入 ZIP。原版格式的数据位于压缩包内的 `data/tavern-native/`，包含标准角色 PNG、聊天 JSONL 和世界书 JSON。提供商 API Key 和连接密码在迁移后单独配置。
 - 如果在 0.3.0 内置引擎预览版使用了本机酒馆，在「角色库」的右上角打开「SillyTavern 数据迁移」，点「导入本机预览版酒馆数据」。应用会复制默认账号的角色卡、单人聊天、群组、群聊、世界书、人设和提示词预设。重复导入会补充新记录。
 - 可通过角色 PNG / JSON、聊天 JSONL 和世界书 JSON 在客户端与原版间迁移数据。原生客户端也可从已有 SillyTavern 实例复制角色和单人聊天。
 
@@ -299,13 +299,32 @@ Tavern Native 使用 Kotlin、Jetpack Compose 和 Material 3 重写 SillyTavern 
 - 「朗读引擎」可连接 VITS、Style-Bert-VITS2、XTTSv2、Silero 和 CosyVoice 的自建服务。填写手机可访问的服务地址，可读取音色、试听，并设为默认音色或角色、人设专属音色。各引擎分别保存地址、可选 API Key 和音色。VITS 还识别 W2V2-VITS、BERT-VITS2，Style-Bert-VITS2 可以为每个说话人选择风格，XTTSv2 可以选语言并调节采样参数。 [SillyTavern 1.19.1 朗读后端](https://github.com/SillyTavern/SillyTavern/tree/1.19.1/public/scripts/extensions/tts)
 - 点聊天输入框旁的麦克风开始识别，再点一次可结束录音。语音输入支持系统识别与 OpenAI 兼容 Whisper STT（16 kHz PCM16 录音上传至 `/audio/transcriptions`）。识别结果支持追加、替换或直接发送。语音快捷词每行用 `短语 = 预设文字或斜杠命令` 配置。
 
-## 跨设备同步与生态扩展（0.48.0 新增）
+## 扩展生态、多后端与跨设备同步
 
-- **多协议模型与连接配置档案**：除 OpenAI 兼容协议外，原生支持 Anthropic Claude（Prompt Caching、Extended Thinking、Assistant Prefill）、Google Gemini 原生接口（安全阈值、Context Caching、Thinking Budget）、OpenRouter（Provider 路由与 Reasoning Effort）、Ollama 与 KoboldCPP Text Completion；可通过「设置 → 连接配置档案」一键绑定模型、提示词预设与采样参数并按对话切换。
-- **NovelAI 绘图**：绘图弹窗与 `/sd source=novelai` 支持 NovelAI Image API ZIP 解包出图。
-- **WebDAV 与局域网 SillyTavern 双向增量同步**：在「设置 → 对话与同步 → WebDAV 云同步与跨设备联动」可配置坚果云、Nextcloud、AList、NAS 等 WebDAV 服务（原生长连接 Socket 实现 `PROPFIND`/`MKCOL` 增量同步角色卡 PNG、世界书、提示词预设与单聊 JSONL，支持冲突策略与密码加密保存）；也可在 Server 页或同步页与桌面端 SillyTavern 进行角色与聊天双向增量同步。
-- **同世界书跨聊记忆 2.0**：结合关键词与本地 ONNX 向量（BGE/Jina）混合召回跨聊经历，支持在对话菜单打开「跨聊记忆面板」查看、置顶、编辑、屏蔽召回记忆或一键沉淀为世界书条目。
-- **STscript 扩展与 MVU 状态引擎**：新增 `/wi-get-book`、`/wi-list-entries`、`/wi-get-entry`、`/wi-set-entry`、`/wi-create-entry`、`/wi-delete-entry`、`/preset`、`/bg`、`/char-get`、`/listvar`、`/flushvar`、`/flushglobalvar`、`/re-replace`、`/trimtokens`；原生解析角色回复里的 `<UpdateVariable>`（`_.set` / `_.add` / `_.assign` / `_.unset` 与 JSON Patch，支持 Swipe/编辑/删除时确定性回滚重算），隐藏源码并渲染可展开状态变更标签，提供 `{{get_message_variable::路径}}` 与 `{{stat_data}}` 宏；并在设置提供可选开启的离线零网络 `TavernHelper` 沙盒桥接容器。
+- **多协议文本与聊天模型后端**：
+  - 聊天补全内置提供商模板覆盖 DeepSeek、Google Gemini、Mistral、Cohere、Vertex AI（Express API Key 与 GCP OAuth Bearer）、Azure OpenAI（Deployment / `api-version`）、xAI（Grok）、Groq、Perplexity、Moonshot、Zhipu（GLM）与 NanoGPT，以及自定义 OpenAI 兼容、Anthropic Claude 原生（Prompt Caching、Extended Thinking、Assistant Prefill）和 OpenRouter。
+  - 文本补全协议完整支持 TabbyAPI（含 `/v1/model/load` 与 `/v1/model/unload` 模型加载控制面板）、vLLM、Aphrodite、text-generation-webui（Oobabooga）、Featherless、Infermatic、DreamGen、Mancer、HuggingFace / TGI、KoboldCPP、Ollama、NovelAI 与 AI Horde。
+  - **多 Key 轮询与故障切换**：每个提供商支持在 Android Keystore 中加密保存多把 API Key，支持轮询（Round-Robin）与错误自动故障切换（HTTP 401/402/403/429 及配额错误冷却重试），可在提供商编辑界面增删、排序、标注、隐藏与测试。
+  - **多模型原生分词器**：除 DeepSeek V4.1 与 GPT（jtokkit）外，内置校准的 Mistral / Nemo、Qwen、Gemma、Claude、Command-R、Llama 1/2 与 Yi 原生分词配置，按模型 ID 自动匹配并支持在 Token 计数器与预算控制中切换。
+  - **连接配置档案**：可通过「设置 → 连接配置档案」一键绑定模型、提示词预设与采样参数并按对话切换。
+- **扩展绘图、语音与资料来源**：
+  - 绘图与 `/sd source=...` 新增 Pollinations、Stability AI、Draw Things、SD.Next、Together AI、Imagen / Vertex、xAI、NanoGPT 与 HuggingFace Inference 后端（并保留 Gemini、OpenAI 兼容、A1111/Forge、ComfyUI/RunPod、NovelAI 与 AI Horde）。
+  - 语音朗读新增 **Azure Speech TTS**、**AllTalk TTS** 与 **Kokoro TTS**，并支持自托管 **RVC 语音转换**后处理（模型选择、变调、Index Rate、Filter Radius）；语音输入新增基于 ONNX Runtime 的**本机离线 Whisper STT**。
+  - 资料库（Data Bank）新增 **YouTube 字幕提取**、**Fandom Wiki** 与 **MediaWiki**（含 Wikipedia 及自定义 Wiki）导入器。
+- **SillyTavern 1.19.x 完整特性与 STscript / 快捷回复调试器**：
+  - 新增 `{{maxContextTokens}}`、`{{maxResponseTokens}}`、`{{defaultExpression}}`、`{{lastExpression}}`、`{{availableExpressions}}` 宏；新增 `/reasoning-collapse` 推理折叠控制；`/input`、`/popup`、`/buttons` 支持 `placeholder`、`tooltip` 与 `icon` 命名参数。
+  - 背景库支持虚拟文件夹、网格/列表切换、面包屑导航与移动整理；外观设置支持原生高对比度（WCAG AAA）与减弱动态效果无障碍选项；重命名世界书时自动重连所有角色、群组、人设与对话引用。
+  - 补齐 STscript 提示词注入（`/inject`、`/listinjects`、`/flushinject`，支持 `ephemeral`/`scan`/`filter`/`outlet`）、流程与匹配（`/abort`、`/fuzzy`、`/breakpoint` + 快捷回复单步调试器与 STscript 编辑器语法高亮）、人设/标签/临时聊天（`/persona`、`/persona-lock`、`/tempchat`、`/tag-add`/`-remove`/`-exists`/`-list`）、快捷回复 CRUD（`/qr-create`/`-update`/`-delete`/`-get`/`-list`、`/qrset-*`、`/qr-arg`）、配置与界面命令（`/api`、`/context`、`/instruct`、`/tokenizer`、`/vn`、`/theme`）以及全套字符串与数学工具命令。
+- **TavernHelper、事件总线、MVU 引擎与内置扩展中心**：
+  - 原生事件总线 `TavernEventBus` 覆盖 `MESSAGE_SENT`、`MESSAGE_RECEIVED`、`MESSAGE_EDITED`、`MESSAGE_DELETED`、`MESSAGE_SWIPED`、`GENERATION_STARTED`、`GENERATION_ENDED`、`CHAT_CHANGED`、`WORLDINFO_UPDATED` 与 `CHARACTER_EDITED`。
+  - 完整 `window.TavernHelper` 沙盒桥接（变量 CRUD、消息 CRUD、世界书 CRUD、生成触发、事件订阅），默认零网络离线隔离并支持按角色卡配置权限与域名白名单，以及严格限定在卡片容器内的 CSS 作用域与 `<style>` 安全加固。
+  - 独立 `MvuEngine` 支持 `[InitVar]` 初始化、`MvuSchema` 校验、`<UpdateVariable>`（`_.set`/`_.add`/`_.assign`/`_.unset` 与完整 JSON Patch）及 Swipe/编辑/删除确定性回滚重算。
+  - 「设置 → 扩展中心」统一管理快捷提示词开关、对话状态变量检查器、角色设定助手、独立**联网搜索扩展**（SearXNG、Tavily、SerpApi、DuckDuckGo、Brave Search + `/websearch`）、**动态音频引擎**（BGM 与环境音效双通道循环/淡入淡出/关键词与表情自动切歌 + `/bgm`、`/ambient`）及**官方素材下载器**（带 HTTPS 主机白名单与 SHA-256 校验），所有扩展配置支持便携 JSON 导入导出并与设置快照和账户备份同步。
+- **Android 平台原生增强与跨设备同步**：
+  - **后台保活前台服务**：长时 LLM/绘图/视频生成通过前台服务通知保活并支持通知栏一键停止。
+  - **系统分享菜单导入**：支持从其他应用通过 Android Share Sheet（`ACTION_SEND` / `ACTION_SEND_MULTIPLE`）直接导入 `.png`、`.json`、`.charx`、`.byaf` 角色卡。
+  - **WebDAV 与局域网 SillyTavern 双向增量同步**：支持坚果云、Nextcloud、AList、NAS 等 WebDAV 服务双向增量同步角色卡、世界书、提示词预设与单聊记录，并支持局域网同步桌面端 SillyTavern。
+  - **同世界书跨聊记忆 2.0**：结合关键词与本地 ONNX 向量（BGE/Jina）混合召回跨聊经历，支持在跨聊记忆面板置顶、编辑、屏蔽或一键沉淀为世界书条目。
 
 ## 对话翻译和摘要记忆
 
@@ -341,7 +360,7 @@ Tavern Native 使用 Kotlin、Jetpack Compose 和 Material 3 重写 SillyTavern 
 - 模型请求会把附件文本放在对应消息内。每次请求最多加入 64,000 字符附件正文，优先处理最近的消息。可在「设置 → 向量检索」开启大文档片段检索，按相关性选取片段，再按文档内的原顺序发送。「对话设置 → 向量索引」可提前建立索引。
 - 聊天及附件 ZIP 可保存本机文档文本与图片。从已有 SillyTavern 实例导入新聊天时，应用也会尝试从同一服务器读取标准文档路径。原版 JSONL 自带的内嵌文档文本可单独导入。
 
-全量原生重写仍在进行。通用扩展、更多 STscript 命令、更多资料来源、其他摘要和绘图后端、更多语音后端和语音转换、原版其他媒体文件迁移与更多模型的精确分词仍待移植。
+Tavern Native 1.0.0 已达成 SillyTavern 1.19.1 核心功能、后端协议、STscript、多媒体语音、资料来源与内置扩展生态的全量 Android 原生覆盖，并通过 10,000+ 消息长对话分页与全链路数据库迁移压力测试验收。更新记录详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 从源码构建
 
