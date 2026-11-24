@@ -54,6 +54,7 @@ internal class WorldMemoryCoordinator(private val host: CoordinatorHost) {
                 chat = updatedChat,
             )
         }
+        host.eventBus.emit(TavernCoreEvent.WORLDINFO_UPDATED, jsonOf("book_id" to value.id, "book_name" to value.name))
         done()
     }
 

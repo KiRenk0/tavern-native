@@ -437,6 +437,9 @@ internal class EmbeddedLibrary(
         val tags = importedTags?.preferences ?: prefs.library
         val library = tags.copy(favorites = groupFavorites + tags.favorites,
             folders = tags.folders || prefs.library == LibraryPreferences() && power?.optBoolean("bogus_folders") == true)
+        val importedExtensions = oldExtensions?.optJSONObject("tavern_native_extensions")?.let { extJson ->
+            runCatching { ExtensionHubConfig.importPortableJson(extJson.toString(), prefs.extensions) }.getOrNull()
+        } ?: prefs.extensions
         if (profiles != prefs.personas || links != prefs.personaConnections || (defaultNote != null && prefs.defaultAuthorNote == AuthorNote()) ||
             (importedLore != null && importedLore != prefs.loreSettings) || defaultPreset != prefs.defaultPresetId ||
             regex != prefs.regex || quickReplies != quick || scriptVariables != prefs.scriptVariables ||
@@ -445,7 +448,8 @@ internal class EmbeddedLibrary(
             swipeGestures != prefs.swipeGestures || showGroupQueue != prefs.showGroupQueue || chatHandling != prefs.chatHandling ||
             characterLibrary != prefs.characterLibrary || textSystem != prefs.textSystem ||
             tokenProbabilities != prefs.requestTokenProbabilities ||
-            profilesImported != prefs.connectionProfiles || activeProfileImported != prefs.activeProfileId || backgrounds != prefs.backgrounds) {
+            profilesImported != prefs.connectionProfiles || activeProfileImported != prefs.activeProfileId || backgrounds != prefs.backgrounds ||
+            importedExtensions != prefs.extensions) {
             store.save(prefs.copy(personas = profiles, personaConnections = links,
                 defaultPersonaId = sourceDefaultId.takeIf { useSourceDefaults } ?: prefs.defaultPersonaId,
                 defaultAuthorNote = defaultNote?.takeIf { prefs.defaultAuthorNote == AuthorNote() } ?: prefs.defaultAuthorNote,
@@ -457,7 +461,8 @@ internal class EmbeddedLibrary(
                 chatHandling = chatHandling,
                 characterLibrary = characterLibrary,
                 textSystem = textSystem,
-                connectionProfiles = profilesImported, activeProfileId = activeProfileImported, backgrounds = backgrounds))
+                connectionProfiles = profilesImported, activeProfileId = activeProfileImported, backgrounds = backgrounds,
+                extensions = importedExtensions))
         }
         return "已读取 ${avatars.size} 个角色、$groupCount 个群组、新增 $chatCount 个聊天、$bookCount 本世界书、" +
             "${profiles.size - prefs.personas.size} 个人设、$addedPresets 个提示词预设和 $addedQuickSets 个快捷回复集" +

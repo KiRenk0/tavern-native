@@ -153,6 +153,7 @@ internal class LibraryCoordinator(private val host: CoordinatorHost) {
             val cards = withContext(Dispatchers.IO) { host.store.save(card); host.store.cards() }
             host.mutable.update { it.copy(cards = cards) }
         } }
+        host.eventBus.emit(TavernCoreEvent.CHARACTER_EDITED, jsonOf("card_id" to card.id, "name" to card.name))
         done()
     }
 

@@ -173,6 +173,9 @@ internal val stScriptCatalog: List<AutocompleteItem> = listOf(
     AutocompleteItem("/div ", "/div", "对一组数值依次相除", AutocompleteKind.COMMAND),
     AutocompleteItem("/mod ", "/mod", "计算取模余数", AutocompleteKind.COMMAND),
     AutocompleteItem("/pow ", "/pow", "计算幂次方", AutocompleteKind.COMMAND),
+    AutocompleteItem("/websearch ", "/websearch", "使用扩展搜索引擎（SearXNG/Tavily/Brave/DDG/SerpApi）检索网页", AutocompleteKind.COMMAND),
+    AutocompleteItem("/bgm ", "/bgm", "控制背景音乐（play/stop/volume/track）", AutocompleteKind.COMMAND),
+    AutocompleteItem("/ambient ", "/ambient", "控制环境音效（play/stop/volume/track）", AutocompleteKind.COMMAND),
     AutocompleteItem("/help", "/help", "查看命令帮助", AutocompleteKind.COMMAND),
 )
 

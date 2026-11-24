@@ -267,7 +267,8 @@ private class OriginalBackupWriter(
             "preset_allowed_regex" to jsonOf("openai" to JSONArray(prefs.regex.allowedPresets.mapNotNull(presetNames::get))),
             "variables" to jsonOf("global" to JSONObject(prefs.scriptVariables)),
             "quickReplyV2" to jsonOf("isEnabled" to prefs.quickReplies.enabled,
-                "config" to quickConfig(prefs.quickReplies.active.mapNotNull(quickNames::get))))
+                "config" to quickConfig(prefs.quickReplies.active.mapNotNull(quickNames::get))),
+            "tavern_native_extensions" to prefs.extensions.exportPortableJson())
         val defaultPersona = personaFiles[prefs.defaultPersonaId].orEmpty()
         return jsonOf(NATIVE_BACKUP_KEY to 1, "user_avatar" to defaultPersona, "swipes" to prefs.chatHandling.showSwipes,
             "power_user" to jsonOf("personas" to personas, "persona_descriptions" to descriptions,

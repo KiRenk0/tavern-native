@@ -158,6 +158,9 @@ internal class ScriptCoordinator(private val host: CoordinatorHost) {
             chatAction = host.chats::scriptChatAction,
             setTemporaryPersona = { id -> host.mutable.update { it.copy(temporaryPersonaId = id) } },
             openTemporaryChat = host.chats::openScriptTemporaryChat,
+            audioCommand = { cmd, arg, named ->
+                host.audioEngine.handleSlashCommand(cmd, arg, named, host.current.prefs.extensions.dynamicAudio)
+            },
             builtInThemes = host.provider::builtInChatThemes,
             builtInContexts = host.provider::builtInContexts,
             builtInInstructs = host.provider::builtInInstructs,

@@ -49,6 +49,8 @@ internal class TavernScriptHost(
     private val builtInContexts: suspend () -> List<TextContextTemplate> = { emptyList() },
     private val builtInInstructs: suspend () -> List<InstructTemplate> = { emptyList() },
     private val updateReasoningCollapse: (app.tavern.nativeclient.script.ReasoningCollapseState) -> Unit = {},
+    private val audioCommand: ((String, String, Map<String, String>) -> String)? = null,
+    private val webSearchCommand: (suspend (String) -> String)? = null,
     private val notice: (String) -> Unit,
 ) : StScriptHost {
     private val state get() = snapshot()
@@ -298,6 +300,8 @@ internal class TavernScriptHost(
                     builtInContexts = builtInContexts,
                     builtInInstructs = builtInInstructs,
                     updateReasoningCollapse = updateReasoningCollapse,
+                    audioCommand = audioCommand,
+                    webSearchCommand = webSearchCommand,
                 )
             }
         }

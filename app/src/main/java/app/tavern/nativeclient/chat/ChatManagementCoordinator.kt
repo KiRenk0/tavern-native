@@ -195,6 +195,7 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
             opened to host.store.chats(opened.cardId, opened.groupId)
         }
         host.showChat(chat, history, resetPersona = true)
+        host.eventBus.emit(TavernCoreEvent.CHAT_CHANGED, jsonOf("chat_id" to chat.id, "title" to chat.title))
         if (hit?.match != null) {
             val position = if (hit.chat.updated == chat.updated) hit.match.index
                 else withContext(Dispatchers.Default) { ChatArchiveQuery(query).match(chat.messages)?.index }
@@ -523,6 +524,7 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
         val active = host.current.chat?.takeIf { it.id == chat.id } ?: return@work
         val message = active.messages.getOrNull(index) ?: return@work
         updateMessage(active, index, editedMessage(active, message, text))
+        host.eventBus.emit(TavernCoreEvent.MESSAGE_EDITED, jsonOf("chat_id" to active.id, "message_id" to index))
     }
 
     private suspend fun editedMessage(chat: Chat, message: Message, text: String): Message {
@@ -554,10 +556,13 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
 
     internal suspend fun removeMessages(chat: Chat, indices: Set<Int>, includeTools: Boolean) {
         val removed = chat.messages.deletionIndices(indices, includeTools)
-        if (removed.isNotEmpty()) host.persist(chat.copy(
-            messages = chat.messages.filterIndexed { index, _ -> index !in removed },
-            updated = System.currentTimeMillis(),
-        ))
+        if (removed.isNotEmpty()) {
+            host.persist(chat.copy(
+                messages = chat.messages.filterIndexed { index, _ -> index !in removed },
+                updated = System.currentTimeMillis(),
+            ))
+            host.eventBus.emit(TavernCoreEvent.MESSAGE_DELETED, jsonOf("chat_id" to chat.id, "count" to removed.size))
+        }
     }
 
     fun duplicateMessage(chat: Chat, index: Int, draft: String? = null, done: () -> Unit = {}) = host.work(completed = done) {
@@ -587,6 +592,7 @@ internal class ChatManagementCoordinator(private val host: CoordinatorHost) {
         if (option !in message.variants.indices || option == message.index) return@work
         host.generation.stopAuto()
         updateMessage(active, messageIndex, message.select(option))
+        host.eventBus.emit(TavernCoreEvent.MESSAGE_SWIPED, jsonOf("chat_id" to active.id, "message_id" to messageIndex, "swipe_id" to option))
     }
 
     fun removeReplyAlternative(chatId: String, messageIndex: Int, option: Int) = host.work {
